@@ -6,6 +6,7 @@ edition.workspace      = true
 rust-version.workspace = true
 
 [dependencies]
-serde   = { workspace = true }
+serde     = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+tracing   = { workspace = true }
+tokio     = { workspace = true }

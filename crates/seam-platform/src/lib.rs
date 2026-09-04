@@ -5,14 +5,15 @@
 //! concrete types get used is decided by `cfg` here and nowhere else, so
 //! `seam-app` never needs to write a `#[cfg]` of its own.
 //!
-//! Empty stubs for now — Windows capture/inject lands in M1, macOS in M5.
-//! See `documentation/kvm-app-build-guide.md`.
+//! Windows `InputCapture`/`InputSink`/`ScreenInfo` are implemented as of
+//! M1; macOS stays an empty stub until M5. See
+//! `documentation/kvm-app-build-guide.md`.
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 #[cfg(windows)]
-mod windows;
+pub mod windows;

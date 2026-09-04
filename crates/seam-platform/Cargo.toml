@@ -8,3 +8,19 @@ rust-version.workspace = true
 [dependencies]
 seam-core = { path = "../seam-core" }
 tracing   = { workspace = true }
+tokio     = { workspace = true }
+
+# Windows — see Tier 5.4 of the build guide. Kept minimal for M1 (capture,
+# inject, screens); clipboard/HiDPI extras land with later milestones.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",    # SetWindowsHookEx, message pump
+    "Win32_UI_Input_KeyboardAndMouse", # SendInput, VK codes
+    "Win32_Graphics_Gdi",              # EnumDisplayMonitors
+    "Win32_UI_HiDpi",                  # per-monitor DPI awareness
+    "Win32_System_Threading",          # GetCurrentThreadId, for stop()'s WM_QUIT
+] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
