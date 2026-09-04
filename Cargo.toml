@@ -21,6 +21,7 @@ mdns-sd             = "0.13"
 arboard             = "3"
 toml                = "0.8"
 directories         = "6"
+uuid                = { version = "1", features = ["v4", "serde"] }
 
 [workspace.package]
 edition      = "2024"
