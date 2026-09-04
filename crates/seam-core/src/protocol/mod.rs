@@ -1,11 +1,16 @@
-//! Wire protocol and local event types.
-//!
-//! `messages.rs` currently holds the types needed by the platform trait
-//! boundary (`InputEvent`, `KeyCode`, `Modifiers`, `ClipboardEvent`). The
-//! full wire protocol — `ControlMessage`, `BulkMessage`, framing, version
-//! negotiation — lands in M3 (Tier 6 of `documentation/kvm-app-build-guide.md`)
-//! and will build on these same types rather than redefine them.
+//! Wire protocol: message types, framing, and version negotiation
+//! (Tier 6 of the build guide).
 
+pub mod codec;
 mod messages;
+mod version;
 
-pub use messages::{ClipboardEvent, InputEvent, KeyCode, Modifiers, MouseButton};
+pub use codec::{
+    BULK_MAX_FRAME, CONTROL_MAX_FRAME, ProtocolError, bulk_codec, control_codec, decode_frame,
+    encode_frame,
+};
+pub use messages::{
+    BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, FileManifest, Handshake,
+    InputEvent, KeyCode, Modifiers, MouseButton, OsKind, TransferId,
+};
+pub use version::PROTOCOL_VERSION;
