@@ -8,9 +8,9 @@
 //! `#[cfg(windows)]` or `#[cfg(target_os = "macos")]` ever seems necessary
 //! in this crate, the abstraction belongs behind a trait instead.
 //!
-//! The handoff state machine (`state.rs`), screen topology
-//! (`topology.rs`), and the wire protocol + control channel (`protocol`,
-//! `net`) are implemented as of M3. See
+//! `session.rs` wires the handoff state machine (`state.rs`), the control
+//! channel (`net`), and the platform traits (`traits.rs`) together into a
+//! runnable session — the M4 milestone. See
 //! `documentation/kvm-app-build-guide.md`.
 
 #![warn(missing_docs)]
@@ -19,6 +19,7 @@
 pub mod error;
 pub mod net;
 pub mod protocol;
+pub mod session;
 pub mod state;
 pub mod topology;
 pub mod traits;

@@ -165,6 +165,21 @@ impl StateMachine {
         self.state
     }
 
+    /// The local machine's virtual-desktop bounds, as given to `new`. A
+    /// caller driving this state machine (e.g. `Session`) needs this to
+    /// normalize/denormalize coordinates for messages that cross the wire.
+    #[must_use]
+    pub fn local_bounds(&self) -> Rect {
+        self.local_bounds
+    }
+
+    /// Which modifier keys are currently physically held, as tracked by
+    /// `track_modifier`.
+    #[must_use]
+    pub fn held_modifiers(&self) -> Modifiers {
+        self.held_modifiers
+    }
+
     /// Jumps directly to `state` without going through a transition,
     /// bypassing whatever invariants a real transition would set up (which
     /// peer is active, cursor history, etc). Test-only, for setting up a
