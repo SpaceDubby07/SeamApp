@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
+profile = "default"

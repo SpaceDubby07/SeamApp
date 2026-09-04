@@ -1,0 +1,11 @@
+[package]
+name         = "seam-core"
+description  = "Portable core logic for Seam — zero OS-specific code."
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+serde   = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

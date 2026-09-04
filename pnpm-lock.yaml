@@ -7,6 +7,12 @@ settings:
 importers:
 
   .:
+    devDependencies:
+      '@tauri-apps/cli':
+        specifier: ^2
+        version: 2.11.4
+
+  ui:
     dependencies:
       '@tauri-apps/api':
         specifier: ^2
@@ -21,9 +27,6 @@ importers:
         specifier: ^19.1.0
         version: 19.2.8(react@19.2.8)
     devDependencies:
-      '@tauri-apps/cli':
-        specifier: ^2
-        version: 2.11.4
       '@types/react':
         specifier: ^19.1.8
         version: 19.2.18

@@ -1,0 +1,10 @@
+[package]
+name         = "seam-platform"
+description  = "OS-specific implementations of the seam-core platform traits."
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+seam-core = { path = "../seam-core" }
+tracing   = { workspace = true }
