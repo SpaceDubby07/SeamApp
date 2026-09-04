@@ -1,6 +1,6 @@
 //! Portable core logic for Seam: the handoff state machine, screen topology,
-//! wire protocol, networking, transfer engine, and the platform trait
-//! boundary.
+//! wire protocol, networking, transfer engine, modifier remapping, config
+//! persistence, and the platform trait boundary.
 //!
 //! This crate must compile and pass its full test suite on *any* platform,
 //! with zero `#[cfg]` attributes. Every OS-specific capability is expressed
@@ -16,9 +16,11 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 
+pub mod config;
 pub mod error;
 pub mod net;
 pub mod protocol;
+pub mod remap;
 pub mod session;
 pub mod state;
 pub mod topology;

@@ -25,6 +25,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::error::PlatformError;
 use crate::net::control::{ControlChannel, now_micros};
 use crate::protocol::{ControlMessage, KeyCode, Modifiers, ProtocolError};
+use crate::remap::RemapTable;
 use crate::state::{Action, Input, State, StateMachine};
 use crate::topology::{Point, Rect};
 use crate::traits::{InputCapture, InputSink};
@@ -64,6 +65,10 @@ pub struct Session {
     /// `ModifierState` to know which keys to inject. Deliberately excludes
     /// Caps Lock; see `sync_injected_modifiers`.
     injected_modifiers: Modifiers,
+    /// This machine's own remap table (Tier 7.3): applied to everything we
+    /// inject on the peer's behalf, never to what we send. Each machine
+    /// owns its own rules, so this is never synced over the wire.
+    remap: RemapTable,
     ping_seq: u64,
 }
 
@@ -75,6 +80,10 @@ impl Session {
     /// (`Handshake::Hello`/`HelloAck`) has already succeeded — that IS
     /// this state machine's `PeerHandshakeOk` trigger.
     ///
+    /// `remap` is this machine's own modifier remap table and scroll
+    /// inversion (Tier 7.3) — applied to everything injected locally on the
+    /// peer's behalf. Pass [`RemapTable::default`] for no remapping.
+    ///
     /// # Errors
     /// Returns an error if `capture` fails to start (e.g. a missing OS
     /// permission).
@@ -83,6 +92,7 @@ impl Session {
         control: ControlChannel,
         mut capture: Box<dyn InputCapture>,
         sink: Box<dyn InputSink>,
+        remap: RemapTable,
     ) -> Result<Self, PlatformError> {
         let (tx, capture_rx) = tokio::sync::mpsc::unbounded_channel();
         capture.start(tx)?;
@@ -107,6 +117,7 @@ impl Session {
             capture_rx,
             local_bounds,
             injected_modifiers: Modifiers::default(),
+            remap,
             ping_seq: 0,
         })
     }
@@ -303,12 +314,17 @@ impl Session {
     /// we've told it we're being driven, so seeing one outside that state
     /// means either a stale/reordered message or a protocol violation,
     /// neither of which should crash the session.
+    ///
+    /// Our own `remap` table (Tier 7.3) is applied here, right before
+    /// injection — the one place this machine's key-swap/scroll-inversion
+    /// rules take effect, since the peer sent us unmodified physical codes.
     fn inject_relayed_input(&mut self, msg: &ControlMessage) -> Result<(), SessionError> {
         if self.state_machine.state() != State::BeingDriven {
             tracing::warn!(?msg, "ignoring relayed input while not BeingDriven");
             return Ok(());
         }
         if let Some(event) = control_message_to_input_event(msg, self.local_bounds) {
+            let event = self.remap.apply(event);
             self.sink.inject(&event)?;
         }
         Ok(())
@@ -329,7 +345,10 @@ impl Session {
     /// The `Left*` variant is used for every synthesized key, since
     /// `Modifiers` doesn't preserve which physical side was held — a
     /// simplification inherent to the wire format itself (Tier 6.3), not
-    /// something this function chooses.
+    /// something this function chooses. Each base code is passed through
+    /// our own `remap` table before injecting (Tier 7.3) — this is what
+    /// makes a modifier already held at the moment of handoff come out
+    /// correctly swapped too, not just fresh `KeyDown`/`KeyUp` events.
     fn sync_injected_modifiers(&mut self, mods: Modifiers) -> Result<(), SessionError> {
         let diffs = [
             (
@@ -343,6 +362,7 @@ impl Session {
         ];
         for (was_down, now_down, code) in diffs {
             if was_down != now_down {
+                let code = self.remap.remap_key(code);
                 let event = if now_down {
                     InputEvent::KeyDown {
                         code,
@@ -472,6 +492,7 @@ mod tests {
     use crate::error::PlatformError;
     use crate::net::control::ControlChannel;
     use crate::protocol::{ControlMessage, KeyCode, Modifiers, MouseButton, OsKind};
+    use crate::remap::RemapTable;
     use crate::state::{State, StateMachine};
     use crate::topology::{Layout, NodeId, Rect};
     use crate::traits::{ClipboardProvider, InputCapture, InputSink, ScreenInfo};
@@ -581,14 +602,29 @@ mod tests {
         local: NodeId,
         layout: Layout,
     ) -> (Session, RecordingSink, Arc<Mutex<Vec<bool>>>) {
+        session_with_remap(control, local, layout, RemapTable::default())
+    }
+
+    fn session_with_remap(
+        control: ControlChannel,
+        local: NodeId,
+        layout: Layout,
+        remap: RemapTable,
+    ) -> (Session, RecordingSink, Arc<Mutex<Vec<bool>>>) {
         let sm = StateMachine::new(local, bounds(), layout);
         let suppressed = Arc::new(Mutex::new(Vec::new()));
         let capture = NoopCapture {
             suppressed: suppressed.clone(),
         };
         let sink = RecordingSink::default();
-        let session = Session::new(sm, control, Box::new(capture), Box::new(sink.clone()))
-            .expect("session construction");
+        let session = Session::new(
+            sm,
+            control,
+            Box::new(capture),
+            Box::new(sink.clone()),
+            remap,
+        )
+        .expect("session construction");
         (session, sink, suppressed)
     }
 
@@ -753,6 +789,126 @@ mod tests {
             .expect("handle");
 
         assert!(sink.injected.lock().expect("mutex poisoned").is_empty());
+    }
+
+    /// The M6 demo (Tier 13): a relayed Ctrl keystroke, injected by a
+    /// session configured with the `windows_keyboard_on_mac` preset, must
+    /// come out as Cmd — never the raw physical code the peer sent.
+    #[tokio::test]
+    async fn relayed_keys_are_remapped_before_injection() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, sink, _suppressed) = session_with_remap(
+            a_control,
+            a_node,
+            layout,
+            RemapTable::windows_keyboard_on_mac(),
+        );
+        let _b_control = b_control;
+
+        // Force BeingDriven directly (bypassing a real handoff) — this test
+        // is only about what the remap table does to an already-relayed
+        // message, not about the handoff transition itself.
+        session
+            .handle_control_message(ControlMessage::Handoff {
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            })
+            .await
+            .expect("handoff");
+        assert_eq!(session.state(), State::BeingDriven);
+
+        session
+            .handle_control_message(ControlMessage::KeyDown {
+                code: KeyCode::LeftCtrl,
+                repeat: false,
+            })
+            .await
+            .expect("relayed keydown");
+
+        assert_eq!(
+            *sink.injected.lock().expect("mutex poisoned"),
+            vec![InputEvent::KeyDown {
+                code: KeyCode::LeftMeta,
+                repeat: false,
+            }]
+        );
+    }
+
+    /// A modifier already held at the moment of handoff generates no fresh
+    /// `KeyDown` of its own — it only shows up in the `ModifierState`
+    /// snapshot's diff against "nothing held yet". That diff-driven
+    /// synthetic key must be remapped too, or a Windows keyboard's Ctrl
+    /// held across a handoff would stick as Ctrl on the Mac instead of Cmd.
+    #[tokio::test]
+    async fn modifier_state_sync_remaps_the_synthesized_key() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, sink, _suppressed) = session_with_remap(
+            a_control,
+            a_node,
+            layout,
+            RemapTable::windows_keyboard_on_mac(),
+        );
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::ModifierState {
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            })
+            .await
+            .expect("modifier sync");
+
+        assert_eq!(
+            *sink.injected.lock().expect("mutex poisoned"),
+            vec![InputEvent::KeyDown {
+                code: KeyCode::LeftMeta,
+                repeat: false,
+            }]
+        );
+    }
+
+    /// Scroll inversion (Tier 7.3) applies at the same injection point as
+    /// key remapping.
+    #[tokio::test]
+    async fn relayed_scroll_is_inverted_per_the_remap_table() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let table = RemapTable {
+            invert_scroll_y: true,
+            ..RemapTable::default()
+        };
+        let (mut session, sink, _suppressed) = session_with_remap(a_control, a_node, layout, table);
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::Handoff {
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            })
+            .await
+            .expect("handoff");
+
+        session
+            .handle_control_message(ControlMessage::Scroll {
+                dx: 2,
+                dy: 5,
+                precise: false,
+            })
+            .await
+            .expect("relayed scroll");
+
+        assert_eq!(
+            *sink.injected.lock().expect("mutex poisoned"),
+            vec![InputEvent::Scroll { dx: 2, dy: -5 }]
+        );
     }
 
     // Compile-time proof that ClipboardProvider/ScreenInfo mocks still

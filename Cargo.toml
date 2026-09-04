@@ -25,6 +25,7 @@ uuid                = { version = "1", features = ["v4", "serde"] }
 tokio-util          = { version = "0.7", features = ["codec"] }
 bytes               = "1"
 futures-util        = { version = "0.3", features = ["sink"] }
+tempfile            = "3"
 
 [workspace.package]
 edition      = "2024"

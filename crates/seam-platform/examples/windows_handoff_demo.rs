@@ -22,14 +22,20 @@
 //! Push your cursor to the shared edge (A's right / B's left) to hand
 //! off. Ctrl+Alt+Shift+Escape forces control back to whichever machine
 //! you press it on, regardless of who's currently driving.
+//!
+//! Append `--remap windows-on-mac` to either invocation to load the
+//! Ctrl<->Cmd remap preset for that run (M6, Tier 7.3) — mostly useful for
+//! poking at the remap table's config persistence with two Windows boxes,
+//! since the real Ctrl<->Cmd swap only matters once one side is a Mac.
 
 #[cfg(windows)]
 fn main() {
+    use seam_core::config::Config;
     use seam_core::net::control::ControlChannel;
     use seam_core::protocol::OsKind;
     use seam_core::session::Session;
     use seam_core::state::StateMachine;
-    use seam_core::topology::{Layout, NodeId, Rect};
+    use seam_core::topology::{Layout, Rect};
     use seam_core::traits::ScreenInfo;
     use seam_platform::windows::{Capture, Screens, Sink};
 
@@ -39,6 +45,19 @@ fn main() {
     let role = args.get(1).cloned();
     let peer_arg = args.get(2).cloned();
 
+    // M6: node identity, display name, and the remap table now come from
+    // persisted config rather than being regenerated every run — pass
+    // `--remap windows-on-mac` to load the Ctrl<->Cmd preset when this
+    // Windows machine is driving a Mac peer.
+    let config_path = Config::default_path().expect("could not determine config directory");
+    let mut config = Config::load_or_create(&config_path).expect("failed to load config");
+    if args.get(3).map(String::as_str) == Some("--remap")
+        && args.get(4).map(String::as_str) == Some("windows-on-mac")
+    {
+        config.remap = seam_core::remap::RemapTable::windows_keyboard_on_mac();
+        println!("Using the windows-keyboard-on-mac remap preset for this run.");
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     rt.block_on(async move {
         let role = role.as_deref();
@@ -46,7 +65,7 @@ fn main() {
         let local_bounds = screens.virtual_bounds();
         println!("Local virtual desktop bounds: {local_bounds:?}");
 
-        let local_node = NodeId::new();
+        let local_node = config.node_id;
 
         let (control, peer_on_right) = match role {
             Some("listen") => {
@@ -55,10 +74,14 @@ fn main() {
                     .await
                     .expect("failed to bind — is port 24800 already in use?");
                 println!("Listening on {addr}. Waiting for the peer to connect...");
-                let control =
-                    ControlChannel::accept(&listener, local_node, &hostname(), OsKind::Windows)
-                        .await
-                        .expect("handshake failed");
+                let control = ControlChannel::accept(
+                    &listener,
+                    local_node,
+                    &config.display_name,
+                    OsKind::Windows,
+                )
+                .await
+                .expect("handshake failed");
                 (control, true)
             }
             Some("connect") => {
@@ -69,10 +92,14 @@ fn main() {
                     format!("{target}:24800")
                 };
                 println!("Connecting to {target}...");
-                let control =
-                    ControlChannel::connect(target, local_node, &hostname(), OsKind::Windows)
-                        .await
-                        .expect("handshake failed");
+                let control = ControlChannel::connect(
+                    target,
+                    local_node,
+                    &config.display_name,
+                    OsKind::Windows,
+                )
+                .await
+                .expect("handshake failed");
                 (control, false)
             }
             _ => {
@@ -105,7 +132,7 @@ fn main() {
         let capture = Box::new(Capture::new());
         let sink = Box::new(Sink::new());
 
-        let session = Session::new(state_machine, control, capture, sink).expect(
+        let session = Session::new(state_machine, control, capture, sink, config.remap).expect(
             "failed to start input capture — run this interactively, not as a scheduled task",
         );
 
@@ -116,11 +143,6 @@ fn main() {
             eprintln!("session ended: {e}");
         }
     });
-}
-
-#[cfg(windows)]
-fn hostname() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "seam-node".to_string())
 }
 
 #[cfg(not(windows))]
