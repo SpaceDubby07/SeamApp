@@ -36,10 +36,12 @@ fn main() {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let role = args.get(1).map(String::as_str);
+    let role = args.get(1).cloned();
+    let peer_arg = args.get(2).cloned();
 
     let rt = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     rt.block_on(async move {
+        let role = role.as_deref();
         let screens = Screens::new();
         let local_bounds = screens.virtual_bounds();
         println!("Local virtual desktop bounds: {local_bounds:?}");
@@ -60,9 +62,9 @@ fn main() {
                 (control, true)
             }
             Some("connect") => {
-                let target = args.get(2).expect("usage: connect <peer-ip>[:24800]");
+                let target = peer_arg.expect("usage: connect <peer-ip>[:24800]");
                 let target = if target.contains(':') {
-                    target.clone()
+                    target
                 } else {
                     format!("{target}:24800")
                 };
