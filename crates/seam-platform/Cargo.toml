@@ -24,3 +24,16 @@ windows = { version = "0.60", features = [
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+
+# macOS — see Tier 5.4 of the build guide. No objc2 crates needed for M5:
+# CGEventTap/CGEventPost/display enumeration/the Accessibility check all
+# go through direct `extern "C"` FFI against
+# CoreGraphics/CoreFoundation/ApplicationServices (`cg_ffi.rs`) rather
+# than objc2-core-graphics — those C ABIs have been stable for decades
+# and are more reliably gotten right from memory than a newer wrapper
+# crate's exact Rust-side shape. Using CGDisplayBounds/CGDisplayPixelsWide
+# instead of NSScreen also sidesteps a real gotcha: NSScreen's coordinate
+# space has its origin at the bottom-left with Y increasing upward, while
+# CGEventTap/CGWarpMouseCursorPosition use a top-left origin with Y
+# increasing downward — mixing the two silently flips Y. objc2/objc2-app-kit
+# will likely return for M7 (NSPasteboard clipboard access).

@@ -2,7 +2,7 @@
 
 use std::mem::size_of;
 
-use seam_core::topology::{Display, DisplayId, Rect};
+use seam_core::topology::{Display, DisplayId, Rect, union_of_display_bounds};
 use seam_core::traits::ScreenInfo;
 
 use windows::Win32::Foundation::{LPARAM, RECT};
@@ -38,7 +38,7 @@ impl ScreenInfo for Screens {
     }
 
     fn virtual_bounds(&self) -> Rect {
-        union_bounds(&enumerate_displays())
+        union_of_display_bounds(&enumerate_displays())
     }
 
     fn scale_factor(&self, display_id: DisplayId) -> f64 {
@@ -109,37 +109,4 @@ unsafe extern "system" fn monitor_enum_proc(
     }
 
     BOOL(1) // Non-zero: keep enumerating.
-}
-
-/// The bounding box of every display's `bounds`, i.e. the whole virtual
-/// desktop. Displays are typically packed with no gaps, but this makes no
-/// such assumption — it just takes the outer extent.
-fn union_bounds(displays: &[Display]) -> Rect {
-    let Some(first) = displays.first() else {
-        return Rect {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        };
-    };
-
-    let mut min_x = first.bounds.x;
-    let mut min_y = first.bounds.y;
-    let mut max_x = first.bounds.x + first.bounds.width.cast_signed();
-    let mut max_y = first.bounds.y + first.bounds.height.cast_signed();
-
-    for d in &displays[1..] {
-        min_x = min_x.min(d.bounds.x);
-        min_y = min_y.min(d.bounds.y);
-        max_x = max_x.max(d.bounds.x + d.bounds.width.cast_signed());
-        max_y = max_y.max(d.bounds.y + d.bounds.height.cast_signed());
-    }
-
-    Rect {
-        x: min_x,
-        y: min_y,
-        width: (max_x - min_x).cast_unsigned(),
-        height: (max_y - min_y).cast_unsigned(),
-    }
 }

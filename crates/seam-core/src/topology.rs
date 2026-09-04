@@ -84,6 +84,44 @@ pub struct Display {
     pub is_primary: bool,
 }
 
+/// The bounding box of every display's `bounds` — i.e. the whole virtual
+/// desktop. Displays are typically packed with no gaps, but this makes no
+/// such assumption; it just takes the outer extent.
+///
+/// Shared by every platform's `ScreenInfo::virtual_bounds()` — this is
+/// pure geometry with no OS dependency, so each platform's `screens.rs`
+/// calls this rather than reimplementing it.
+#[must_use]
+pub fn union_of_display_bounds(displays: &[Display]) -> Rect {
+    let Some(first) = displays.first() else {
+        return Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    };
+
+    let mut min_x = first.bounds.x;
+    let mut min_y = first.bounds.y;
+    let mut max_x = first.bounds.x + first.bounds.width.cast_signed();
+    let mut max_y = first.bounds.y + first.bounds.height.cast_signed();
+
+    for d in &displays[1..] {
+        min_x = min_x.min(d.bounds.x);
+        min_y = min_y.min(d.bounds.y);
+        max_x = max_x.max(d.bounds.x + d.bounds.width.cast_signed());
+        max_y = max_y.max(d.bounds.y + d.bounds.height.cast_signed());
+    }
+
+    Rect {
+        x: min_x,
+        y: min_y,
+        width: (max_x - min_x).cast_unsigned(),
+        height: (max_y - min_y).cast_unsigned(),
+    }
+}
+
 /// One of the four sides of a rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Edge {
@@ -277,8 +315,8 @@ fn horizontally_overlaps(a: Rect, b: Rect) -> bool {
 )]
 mod tests {
     use super::{
-        Edge, Layout, NodeId, Point, Rect, compute_entry_point, detect_edge_crossing,
-        detect_edge_reclaim,
+        Display, DisplayId, Edge, Layout, NodeId, Point, Rect, compute_entry_point,
+        detect_edge_crossing, detect_edge_reclaim, union_of_display_bounds,
     };
 
     fn rect(x: i32, y: i32, width: u32, height: u32) -> Rect {
@@ -472,5 +510,29 @@ mod tests {
     fn unplaced_node_has_no_neighbors() {
         let layout = Layout::new();
         assert_eq!(layout.neighbor(NodeId::new(), Edge::Right), None);
+    }
+
+    fn display(id: u32, bounds: Rect) -> Display {
+        Display {
+            id: DisplayId(id),
+            bounds,
+            scale_factor: 1.0,
+            is_primary: id == 0,
+        }
+    }
+
+    #[test]
+    fn union_of_display_bounds_covers_every_display() {
+        let displays = [
+            display(0, rect(0, 0, 1920, 1080)),
+            display(1, rect(1920, -200, 2560, 1440)),
+        ];
+        let union = union_of_display_bounds(&displays);
+        assert_eq!(union, rect(0, -200, 4480, 1440));
+    }
+
+    #[test]
+    fn union_of_display_bounds_of_empty_slice_is_zeroed() {
+        assert_eq!(union_of_display_bounds(&[]), rect(0, 0, 0, 0));
     }
 }
