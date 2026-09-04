@@ -5,11 +5,13 @@ use std::mem::size_of;
 use seam_core::topology::{Display, DisplayId, Rect};
 use seam_core::traits::ScreenInfo;
 
-use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MONITORINFOF_PRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+use windows::core::BOOL;
 
 /// Windows implementation of [`seam_core::traits::ScreenInfo`].
 pub struct Screens;
@@ -74,7 +76,8 @@ unsafe extern "system" fn monitor_enum_proc(
     let displays = unsafe { &mut *(lparam.0 as *mut Vec<Display>) };
 
     let mut info = MONITORINFOEXW::default();
-    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    info.monitorInfo.cbSize =
+        u32::try_from(size_of::<MONITORINFOEXW>()).expect("MONITORINFOEXW size fits in u32");
     // SAFETY: `info.monitorInfo.cbSize` is set as `GetMonitorInfoW`
     // requires (it uses this to distinguish `MONITORINFO` from the larger
     // `MONITORINFOEXW`), and `monitor` is the handle the OS just supplied
@@ -85,7 +88,8 @@ unsafe extern "system" fn monitor_enum_proc(
         let mut dpi_y = 96u32;
         // SAFETY: `monitor` is valid for the duration of this callback;
         // `dpi_x`/`dpi_y` are valid, exclusively-owned out-params.
-        let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+        let _ =
+            unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) };
 
         let rc = info.monitorInfo.rcMonitor;
         displays.push(Display {
@@ -96,8 +100,8 @@ unsafe extern "system" fn monitor_enum_proc(
             bounds: Rect {
                 x: rc.left,
                 y: rc.top,
-                width: (rc.right - rc.left) as u32,
-                height: (rc.bottom - rc.top) as u32,
+                width: (rc.right - rc.left).cast_unsigned(),
+                height: (rc.bottom - rc.top).cast_unsigned(),
             },
             scale_factor: f64::from(dpi_x) / 96.0,
             is_primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
@@ -122,20 +126,20 @@ fn union_bounds(displays: &[Display]) -> Rect {
 
     let mut min_x = first.bounds.x;
     let mut min_y = first.bounds.y;
-    let mut max_x = first.bounds.x + first.bounds.width as i32;
-    let mut max_y = first.bounds.y + first.bounds.height as i32;
+    let mut max_x = first.bounds.x + first.bounds.width.cast_signed();
+    let mut max_y = first.bounds.y + first.bounds.height.cast_signed();
 
     for d in &displays[1..] {
         min_x = min_x.min(d.bounds.x);
         min_y = min_y.min(d.bounds.y);
-        max_x = max_x.max(d.bounds.x + d.bounds.width as i32);
-        max_y = max_y.max(d.bounds.y + d.bounds.height as i32);
+        max_x = max_x.max(d.bounds.x + d.bounds.width.cast_signed());
+        max_y = max_y.max(d.bounds.y + d.bounds.height.cast_signed());
     }
 
     Rect {
         x: min_x,
         y: min_y,
-        width: (max_x - min_x) as u32,
-        height: (max_y - min_y) as u32,
+        width: (max_x - min_x).cast_unsigned(),
+        height: (max_y - min_y).cast_unsigned(),
     }
 }

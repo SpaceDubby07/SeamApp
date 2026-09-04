@@ -18,7 +18,6 @@
 //! laterality before calling in here.
 
 use seam_core::protocol::KeyCode;
-use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 
 /// Converts a Win32 virtual-key code into our normalized `KeyCode`.
 ///
@@ -32,6 +31,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 /// generally still forward these rather than silently dropping them, since
 /// `Unknown` round-trips.
 #[must_use]
+// This is a flat 1:1 mapping table; splitting it up or naming every VK_*
+// import individually would only make it harder to scan against the Win32
+// header it mirrors.
+#[allow(clippy::too_many_lines, clippy::wildcard_imports)]
 pub fn vk_to_keycode(vk: u16) -> KeyCode {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
@@ -161,6 +164,9 @@ pub fn vk_to_keycode(vk: u16) -> KeyCode {
 /// by the extended-key flag at the injection site instead — see
 /// `inject.rs`) or an unrecognized `Unknown` code.
 #[must_use]
+// See the matching allow on `vk_to_keycode` above: same flat mapping table,
+// just inverted.
+#[allow(clippy::too_many_lines, clippy::wildcard_imports)]
 pub fn keycode_to_vk(code: KeyCode) -> Option<u16> {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
 

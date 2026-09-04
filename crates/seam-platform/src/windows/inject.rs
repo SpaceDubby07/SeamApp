@@ -11,9 +11,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, SetCursorPos, VIRTUAL_KEY, XBUTTON1,
-    XBUTTON2,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
+use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
 
 use super::keycodes::keycode_to_vk;
 
@@ -84,7 +84,12 @@ fn send_one(input: INPUT) -> Result<(), PlatformError> {
     // SAFETY: `input` is a single, fully-initialized `INPUT` whose union
     // tag (`r#type`) matches the populated union field, which is the
     // contract `SendInput` requires.
-    let sent = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            &[input],
+            i32::try_from(size_of::<INPUT>()).expect("INPUT size fits in i32"),
+        )
+    };
     if sent == 0 {
         return Err(PlatformError::InjectionRejected);
     }
@@ -98,7 +103,7 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: i32, flags: MOUSE_EVENT_FLAGS) -> I
             mi: MOUSEINPUT {
                 dx,
                 dy,
-                mouseData: mouse_data as u32,
+                mouseData: mouse_data.cast_unsigned(),
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -115,10 +120,10 @@ fn mouse_button_input(button: MouseButton, down: bool) -> INPUT {
         (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
         (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
         (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
-        (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON1.0)),
-        (MouseButton::X1, false) => (MOUSEEVENTF_XUP, i32::from(XBUTTON1.0)),
-        (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON2.0)),
-        (MouseButton::X2, false) => (MOUSEEVENTF_XUP, i32::from(XBUTTON2.0)),
+        (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON1)),
+        (MouseButton::X1, false) => (MOUSEEVENTF_XUP, i32::from(XBUTTON1)),
+        (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON2)),
+        (MouseButton::X2, false) => (MOUSEEVENTF_XUP, i32::from(XBUTTON2)),
     };
     mouse_input(0, 0, mouse_data, flags)
 }

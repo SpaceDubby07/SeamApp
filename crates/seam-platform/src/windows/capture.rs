@@ -102,6 +102,7 @@ impl InputCapture for Capture {
                 // WH_MOUSE_LL/WH_KEYBOARD_LL.
                 let mouse_hook =
                     unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) };
+                // SAFETY: same reasoning as the mouse hook above.
                 let keyboard_hook =
                     unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
 
@@ -142,11 +143,11 @@ impl InputCapture for Capture {
                 // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
                 // fills in; `None, 0, 0` means "any message for this
                 // thread".
-                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+                while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
                     // SAFETY: `msg` was just populated by GetMessageW above.
                     unsafe {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
+                        let _ = TranslateMessage(&raw const msg);
+                        DispatchMessageW(&raw const msg);
                     }
                 }
 
@@ -222,7 +223,7 @@ fn xbutton(mouse_data: u32) -> MouseButton {
 /// Unpacks a wheel delta from `MSLLHOOKSTRUCT`'s packed `mouseData` field:
 /// a signed 16-bit value in the high word, in units of `WHEEL_DELTA` (120).
 fn wheel_delta(mouse_data: u32) -> i32 {
-    let raw = ((mouse_data >> 16) & 0xFFFF) as u16 as i16;
+    let raw = (((mouse_data >> 16) & 0xFFFF) as u16).cast_signed();
     i32::from(raw) / 120
 }
 
@@ -244,10 +245,12 @@ fn forward(event: InputEvent) {
 /// `ncode == HC_ACTION`, which MSDN documents as the condition under which
 /// that pointer is valid.
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if ncode == HC_ACTION as i32 {
+    if ncode == HC_ACTION.cast_signed() {
         // SAFETY: see function-level SAFETY comment above.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        let msg = wparam.0 as u32;
+        // The hook's wParam carries a WM_* message id, always small enough
+        // to fit u32 even though it's widened to usize on 64-bit targets.
+        let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
         let event = match msg {
             WM_MOUSEMOVE => Some(InputEvent::MouseMoveAbs {
                 x: info.pt.x,
@@ -292,7 +295,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         }
     }
 
-    if ncode == HC_ACTION as i32 && SUPPRESS.load(Ordering::SeqCst) {
+    if ncode == HC_ACTION.cast_signed() && SUPPRESS.load(Ordering::SeqCst) {
         // Non-zero return swallows the event: it never reaches the rest of
         // the hook chain or the target window. This is what makes the
         // local cursor "disappear" during a remote handoff.
@@ -309,7 +312,8 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 /// module docs on `keycodes.rs`.
 fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
     let extended = (info.flags.0 & LLKHF_EXTENDED.0) != 0;
-    let vk = info.vkCode as u16;
+    // VK codes are always 8-bit despite `vkCode`'s u32 field type.
+    let vk = u16::try_from(info.vkCode).unwrap_or(0);
 
     if vk == VK_CONTROL.0 {
         return if extended {
@@ -346,10 +350,12 @@ fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
 /// Called by the OS per the `WH_KEYBOARD_LL` contract; see `mouse_proc`'s
 /// SAFETY comment — the same reasoning applies to `KBDLLHOOKSTRUCT` here.
 unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if ncode == HC_ACTION as i32 {
+    if ncode == HC_ACTION.cast_signed() {
         // SAFETY: see function-level SAFETY comment above.
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        let msg = wparam.0 as u32;
+        // The hook's wParam carries a WM_* message id, always small enough
+        // to fit u32 even though it's widened to usize on 64-bit targets.
+        let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
         let code = resolve_keycode(info);
 
         match msg {
@@ -367,7 +373,7 @@ unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
         }
     }
 
-    if ncode == HC_ACTION as i32 && SUPPRESS.load(Ordering::SeqCst) {
+    if ncode == HC_ACTION.cast_signed() && SUPPRESS.load(Ordering::SeqCst) {
         return LRESULT(1);
     }
     // SAFETY: same reasoning as the equivalent call in `mouse_proc`.
