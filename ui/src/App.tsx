@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { LayoutCanvas } from "./components/LayoutCanvas";
+import { LogPanel } from "./components/LogPanel";
 import * as ipc from "./lib/ipc";
 import type {
   Config,
@@ -79,6 +80,7 @@ function App() {
           onPeerBoundsChange={handleLayoutDrag}
         />
       )}
+      <LogPanel />
     </main>
   );
 }

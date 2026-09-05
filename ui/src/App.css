@@ -179,10 +179,110 @@ button.primary:hover:not(:disabled) {
   opacity: 0.85;
 }
 
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.log-head h2 {
+  font-size: 1.1rem;
+}
+
+.log-controls {
+  margin: 0.5rem 0 0.75rem;
+  flex-wrap: wrap;
+}
+
+.log-controls select,
+.log-controls button {
+  flex: 0 0 auto;
+}
+
+.log-exported {
+  margin: 0 0 0.6rem;
+  word-break: break-all;
+}
+
+.log-exported code {
+  font-size: 0.8em;
+}
+
+.link-btn {
+  padding: 0.1em 0.5em;
+  font-size: 0.85em;
+}
+
+.log-scroll {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid #e2e2e2;
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  background: #fbfbfb;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #333;
+}
+
+.log-line.log-debug {
+  color: #6a6a6a;
+}
+
+.log-line.log-trace {
+  color: #9a9a9a;
+}
+
+.log-line.log-warn {
+  color: #b06a00;
+}
+
+.log-line.log-error {
+  color: #c0392b;
+  font-weight: 600;
+}
+
+.log-jump {
+  margin-top: 0.5rem;
+  font-size: 0.85em;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
     background-color: #1e1e1e;
+  }
+
+  .log-scroll {
+    background: #1a1a1a;
+    border-color: #3a3a3a;
+  }
+
+  .log-line {
+    color: #cfcfcf;
+  }
+
+  .log-line.log-debug {
+    color: #9a9a9a;
+  }
+
+  .log-line.log-trace {
+    color: #767676;
+  }
+
+  .log-line.log-warn {
+    color: #e0a44a;
+  }
+
+  .log-line.log-error {
+    color: #ff6b5e;
   }
 
   .panel {

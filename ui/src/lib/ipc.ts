@@ -4,11 +4,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
   Config,
   ConnectedInfo,
   DiscoveredPeer,
   Display,
+  LogLine,
   Rect,
   SessionEvent,
 } from "./types";
@@ -34,6 +36,15 @@ export const sendFile = (path: string) => invoke<void>("send_file", { path });
 export const respondToOffer = (transferId: string, accept: boolean) =>
   invoke<void>("respond_to_offer", { transferId, accept });
 export const disconnect = () => invoke<void>("disconnect");
+
+// ── Logs ──
+export const getLogs = (afterSeq?: number) =>
+  invoke<LogLine[]>("get_logs", { afterSeq: afterSeq ?? null });
+export const clearLogs = () => invoke<void>("clear_logs");
+/** Writes the log buffer to a .txt file and returns its full path. */
+export const exportLogs = () => invoke<string>("export_logs");
+/** Opens the OS file manager with `path` selected. */
+export const revealPath = (path: string) => revealItemInDir(path);
 
 // ── Events (Rust -> UI) ──
 export const onPeersChanged = (

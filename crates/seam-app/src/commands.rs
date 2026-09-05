@@ -9,6 +9,7 @@ use seam_core::session::SessionCommand;
 use seam_core::topology::{Display, Rect};
 
 use crate::connect::{Role, finish_connection};
+use crate::logbuf::{self, LogLine};
 use crate::state::{AppState, CURRENT_OS};
 
 /// Returns this machine's current settings.
@@ -195,4 +196,37 @@ pub fn disconnect(state: State<'_, AppState>, app: AppHandle) {
     }
     *state.session_command_tx.lock().expect("mutex poisoned") = None;
     let _ = app.emit("disconnected", ());
+}
+
+/// Recent log lines for the frontend's Log panel. Pass the highest `seq`
+/// already displayed as `after_seq` to fetch only what's new; omit it for
+/// the whole buffer.
+#[tauri::command]
+pub fn get_logs(after_seq: Option<u64>) -> Vec<LogLine> {
+    logbuf::snapshot(after_seq)
+}
+
+/// Empties the in-memory log buffer (does not touch the on-disk log file).
+#[tauri::command]
+pub fn clear_logs() {
+    logbuf::clear();
+}
+
+/// Writes the current log buffer to `<log dir>/seam-logs-<unix>.txt` and
+/// returns the full path, for the "Export" button.
+///
+/// # Errors
+/// Returns an error string if the file can't be created or written.
+#[tauri::command]
+pub fn export_logs() -> Result<String, String> {
+    let dir = crate::log_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let path = dir.join(format!("seam-logs-{stamp}.txt"));
+    std::fs::write(&path, logbuf::render_text())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
 }

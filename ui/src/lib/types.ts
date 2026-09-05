@@ -81,3 +81,14 @@ export type SessionEvent =
 export interface ConnectedInfo {
   peer_display_name: string;
 }
+
+// Mirrors seam_app_lib::logbuf::LogLine.
+export type LogLevel = "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+export interface LogLine {
+  seq: number;
+  ts_millis: number;
+  level: LogLevel;
+  target: string;
+  message: string;
+}

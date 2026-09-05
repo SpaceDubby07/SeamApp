@@ -383,6 +383,44 @@ fn resolve_flags_changed(event: CGEventRef) -> Option<InputEvent> {
     })
 }
 
+/// Handles a mouse-moved / -dragged event: forwards the raw HID delta and,
+/// while suppressed, warps the (hidden) cursor straight back to `ANCHOR_*`
+/// so it never actually moves. Returns the absolute-position event for the
+/// caller to forward too.
+///
+/// The delta comes straight from the HID report (Tier 7.2) — independent
+/// of cursor position, so it keeps flowing in every direction while
+/// driving. `CGWarpMouseCursorPosition` posts no event, so the warp-back
+/// doesn't feed back into the tap.
+#[allow(clippy::cast_possible_truncation)]
+fn handle_mouse_moved(event: CGEventRef) -> InputEvent {
+    // SAFETY: `event` is valid for the duration of the tap callback that
+    // called us; the three CG reads below all rely on that one guarantee.
+    let CGPoint { x, y } = unsafe { CGEventGetLocation(event) };
+    // SAFETY: as above.
+    let dx = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_X) };
+    // SAFETY: as above.
+    let dy = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_Y) };
+    if dx != 0 || dy != 0 {
+        forward(InputEvent::MouseDelta {
+            dx: clamp_to_i32(dx),
+            dy: clamp_to_i32(dy),
+        });
+    }
+
+    if SUPPRESS.load(Ordering::SeqCst) {
+        warp_cursor_to(
+            ANCHOR_X.load(Ordering::SeqCst),
+            ANCHOR_Y.load(Ordering::SeqCst),
+        );
+    }
+
+    InputEvent::MouseMoveAbs {
+        x: x as i32,
+        y: y as i32,
+    }
+}
+
 /// # Safety
 /// Called by the OS per the `CGEventTapCallBack` contract: `event` is a
 /// valid `CGEventRef` for the duration of this call, and returning it
@@ -411,43 +449,7 @@ unsafe extern "C" fn tap_callback(
         K_CG_EVENT_MOUSE_MOVED
         | K_CG_EVENT_LEFT_MOUSE_DRAGGED
         | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
-        | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let CGPoint { x, y } = unsafe { CGEventGetLocation(event) };
-
-            // Tier 7.2: the raw per-event delta, straight from the HID
-            // report — independent of cursor position, so it keeps
-            // flowing in every direction while `RemoteActive` pins our own
-            // (hidden) cursor at `ANCHOR_*`. This is what carries the
-            // peer's motion over the wire while driving.
-            // SAFETY: same as above.
-            let dx = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_X) };
-            // SAFETY: same as above.
-            let dy = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_Y) };
-            if dx != 0 || dy != 0 {
-                forward(InputEvent::MouseDelta {
-                    dx: clamp_to_i32(dx),
-                    dy: clamp_to_i32(dy),
-                });
-            }
-
-            // Keep the suppressed cursor from actually moving: warp it
-            // straight back to the anchor. Done after reading the delta
-            // (which is unaffected), and `CGWarpMouseCursorPosition` posts
-            // no event, so this doesn't feed back into the tap.
-            if SUPPRESS.load(Ordering::SeqCst) {
-                warp_cursor_to(
-                    ANCHOR_X.load(Ordering::SeqCst),
-                    ANCHOR_Y.load(Ordering::SeqCst),
-                );
-            }
-
-            #[allow(clippy::cast_possible_truncation)]
-            Some(InputEvent::MouseMoveAbs {
-                x: x as i32,
-                y: y as i32,
-            })
-        }
+        | K_CG_EVENT_OTHER_MOUSE_DRAGGED => Some(handle_mouse_moved(event)),
         K_CG_EVENT_LEFT_MOUSE_DOWN => Some(InputEvent::MouseDown {
             button: MouseButton::Left,
         }),

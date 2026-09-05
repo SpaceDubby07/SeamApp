@@ -6,6 +6,7 @@
 
 mod commands;
 mod connect;
+mod logbuf;
 mod state;
 
 use std::collections::HashMap;
@@ -22,8 +23,9 @@ use seam_core::net::tls::NodeIdentity;
 use state::{AppState, CURRENT_OS};
 
 /// Directory logs are written to: `<app data dir>/logs`, falling back to the
-/// working directory if the OS won't tell us where app data belongs.
-fn log_dir() -> std::path::PathBuf {
+/// working directory if the OS won't tell us where app data belongs. Also
+/// where `commands::export_logs` drops its `.txt` snapshots.
+pub(crate) fn log_dir() -> std::path::PathBuf {
     ProjectDirs::from("com", "zach", "seam")
         .map(|dirs| dirs.data_dir().join("logs"))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -43,6 +45,9 @@ fn init_logging() {
         }))
         .with(fmt::layer().with_writer(file_appender).json())
         .with(fmt::layer().with_writer(std::io::stdout).pretty())
+        // Mirror everything the filter lets through into the in-memory
+        // ring buffer the frontend's Log panel reads.
+        .with(logbuf::layer())
         .init();
 }
 
@@ -140,6 +145,9 @@ pub fn run() {
             commands::send_file,
             commands::respond_to_offer,
             commands::disconnect,
+            commands::get_logs,
+            commands::clear_logs,
+            commands::export_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
