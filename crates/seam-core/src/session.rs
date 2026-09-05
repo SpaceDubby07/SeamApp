@@ -8,8 +8,6 @@
 //! Windows so far (M1) and macOS lands in M5.
 //!
 //! # What's deliberately NOT here yet
-//! - Dynamic `ScreenConfig` handling on resolution change — not scheduled
-//!   to a specific milestone yet.
 //! - Reconnect on disconnect — M12. `Action::StartReconnect` currently
 //!   just ends the session; the caller decides whether to retry.
 //! - Missed-heartbeat dead-peer detection (Tier 7.7) — M12's "health
@@ -32,12 +30,10 @@ use crate::protocol::{
 };
 use crate::remap::RemapTable;
 use crate::state::{Action, Input, State, StateMachine};
-use crate::topology::{Point, Rect};
+use crate::topology::{Display, Point, Rect};
 use crate::traits::{ClipboardProvider, InputCapture, InputSink};
 use crate::transfer::manifest::{build_manifest, sanitize_file_name};
-use crate::transfer::{
-    AcceptPolicy, CHUNK_SIZE, IncomingTransfer, OutgoingTransfer, SessionCommand, TransferEvent,
-};
+use crate::transfer::{AcceptPolicy, CHUNK_SIZE, IncomingTransfer, OutgoingTransfer};
 
 pub use crate::protocol::InputEvent;
 
@@ -161,7 +157,111 @@ pub struct Session {
     commands_open: bool,
     /// Where transfer progress/completion/offers are reported to whatever
     /// is driving this session.
-    event_tx: UnboundedSender<TransferEvent>,
+    event_tx: UnboundedSender<SessionEvent>,
+}
+
+/// Reported out of a running [`Session`] to whatever's driving it (a CLI
+/// demo today; a Tauri command layer eventually) — nothing in `session` or
+/// `transfer` does UI work of its own (Tier 4.5: channels over shared
+/// mutexes, applied to the session/UI boundary too).
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    /// The peer told us its screens (Tier 8.1's layout canvas needs real
+    /// aspect ratios/resolutions to render tiles to scale) — sent once
+    /// right after connecting; see [`Session::send_screen_config`].
+    PeerScreenConfig {
+        /// The peer's current displays.
+        displays: Vec<Display>,
+        /// The peer's current virtual desktop bounds, in the PEER's own
+        /// coordinate space — meaningless as a local pixel position, but
+        /// its width/height are what a layout canvas tile should be
+        /// drawn at scale.
+        virtual_bounds: Rect,
+    },
+    /// The shared layout changed — either the local user rearranged the
+    /// canvas (Tier 8.1's drag-and-snap tiles) or the peer did and told us
+    /// via `ControlMessage::LayoutUpdate`. `peer_bounds` is in OUR OWN
+    /// coordinate space (already translated, regardless of which side
+    /// this came from), ready to compare against `local_bounds` for
+    /// rendering.
+    LayoutChanged {
+        /// Where the peer now sits, in our own coordinate space.
+        peer_bounds: Rect,
+    },
+    /// An incoming offer needs a human decision — only sent under
+    /// [`AcceptPolicy::Ask`]. Answer with
+    /// [`SessionCommand::RespondToOffer`].
+    OfferReceived {
+        /// Which transfer this offer is for.
+        transfer_id: TransferId,
+        /// The offered file's metadata.
+        manifest: FileManifest,
+    },
+    /// Bytes sent (outgoing) or received (incoming) so far, for a progress
+    /// bar. Emitted at most once per chunk.
+    Progress {
+        /// Which transfer this is progress for.
+        transfer_id: TransferId,
+        /// Bytes transferred so far.
+        bytes_done: u64,
+        /// Total size of the file being transferred.
+        total: u64,
+    },
+    /// The peer rejected a transfer we offered.
+    Rejected {
+        /// Which transfer was rejected.
+        transfer_id: TransferId,
+        /// The peer's human-readable reason.
+        reason: String,
+    },
+    /// A transfer finished and (for an incoming one) was verified. `path`
+    /// is the final destination path for an incoming transfer, or the
+    /// original source path for an outgoing one.
+    Completed {
+        /// Which transfer completed.
+        transfer_id: TransferId,
+        /// Where the file ended up (incoming) or was read from (outgoing).
+        path: PathBuf,
+    },
+    /// A transfer failed: a local I/O error, a hash mismatch on receive,
+    /// or a peer-initiated cancel.
+    Failed {
+        /// Which transfer failed.
+        transfer_id: TransferId,
+        /// Human-readable reason, for logging/display.
+        reason: String,
+    },
+}
+
+/// Commands a driver sends INTO a running [`Session`] — the other half of
+/// [`SessionEvent`], since `Session::run` owns the only handle to the live
+/// channels and can't be reached by a direct method call once it's
+/// running.
+#[derive(Debug, Clone)]
+pub enum SessionCommand {
+    /// Rearranges the shared layout canvas (Tier 8.1): places the peer at
+    /// `peer_bounds`, in OUR OWN coordinate space, and tells the peer
+    /// about it via `ControlMessage::LayoutUpdate`.
+    UpdateLayout {
+        /// Where to place the peer, in our own coordinate space.
+        peer_bounds: Rect,
+    },
+    /// Offer `path` to the peer. Queued if a send is already in progress —
+    /// v1 sends at most one file at a time (Tier 15's single-peer spirit
+    /// applied to transfers too; nothing about the wire protocol prevents
+    /// more later).
+    SendFile(PathBuf),
+    /// Answer a [`SessionEvent::OfferReceived`]. Ignored if `transfer_id`
+    /// doesn't match a pending offer (e.g. it already timed out or was
+    /// cancelled).
+    RespondToOffer {
+        /// Which offer this answers.
+        transfer_id: TransferId,
+        /// Whether to accept it.
+        accept: bool,
+    },
+    /// Cancels a transfer, sent or received.
+    CancelTransfer(TransferId),
 }
 
 /// The other end of a running [`Session`]'s command/event channels —
@@ -171,8 +271,8 @@ pub struct Session {
 pub struct SessionHandle {
     /// Send [`SessionCommand`]s into the running session.
     pub command_tx: UnboundedSender<SessionCommand>,
-    /// Receive [`TransferEvent`]s from the running session.
-    pub event_rx: UnboundedReceiver<TransferEvent>,
+    /// Receive [`SessionEvent`]s from the running session.
+    pub event_rx: UnboundedReceiver<SessionEvent>,
 }
 
 impl Session {
@@ -273,6 +373,15 @@ impl Session {
     #[must_use]
     pub fn state(&self) -> State {
         self.state_machine.state()
+    }
+
+    /// The peer's current bounds on the shared layout canvas (Tier 8.1),
+    /// in our own coordinate space — `None` until either side has placed
+    /// it (the initial `Session::new` layout, `SessionCommand::
+    /// UpdateLayout`, or the peer's own `ControlMessage::LayoutUpdate`).
+    #[must_use]
+    pub fn peer_bounds(&self) -> Option<Rect> {
+        self.state_machine.peer_bounds()
     }
 
     /// Runs the session until the connection ends or an unrecoverable
@@ -528,8 +637,17 @@ impl Session {
             ControlMessage::TransferComplete { transfer_id, hash } => {
                 self.handle_transfer_complete(transfer_id, hash).await?;
             }
-            ControlMessage::ScreenConfig { .. } => {
-                tracing::debug!("dynamic screen config updates not implemented yet");
+            ControlMessage::ScreenConfig {
+                displays,
+                virtual_bounds,
+            } => {
+                self.handle_peer_screen_config(displays, virtual_bounds);
+            }
+            ControlMessage::LayoutUpdate {
+                sender_bounds,
+                peer_bounds,
+            } => {
+                self.handle_layout_update(sender_bounds, peer_bounds);
             }
             ControlMessage::Goodbye { reason } => {
                 tracing::info!(reason, "peer sent goodbye");
@@ -718,6 +836,71 @@ impl Session {
         Ok(())
     }
 
+    /// Sends this machine's own screens to the peer (Tier 8.1's layout
+    /// canvas needs both sides' real resolutions to draw tiles to scale).
+    /// Meant to be called once, right after a session starts — there's no
+    /// milestone yet for re-sending on a live resolution change (module
+    /// docs' "what's deliberately not here").
+    ///
+    /// # Errors
+    /// Returns an error if the send fails.
+    pub async fn send_screen_config(
+        &mut self,
+        displays: Vec<Display>,
+        virtual_bounds: Rect,
+    ) -> Result<(), SessionError> {
+        self.control
+            .send(&ControlMessage::ScreenConfig {
+                displays,
+                virtual_bounds,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Forwards the peer's `ControlMessage::ScreenConfig` to the driver —
+    /// nothing here needs it, it's purely so a layout canvas can render
+    /// the peer's tile at its real resolution.
+    fn handle_peer_screen_config(&mut self, displays: Vec<Display>, virtual_bounds: Rect) {
+        let _ = self.event_tx.send(SessionEvent::PeerScreenConfig {
+            displays,
+            virtual_bounds,
+        });
+    }
+
+    /// Handles the peer's `ControlMessage::LayoutUpdate`: re-expresses
+    /// where it placed us into OUR OWN coordinate space and updates our
+    /// layout to match, so both sides agree on the shared edge regardless
+    /// of who dragged the canvas.
+    ///
+    /// # The math
+    /// `sender_bounds` and `peer_bounds` (which is US, from the sender's
+    /// point of view) are both in the SENDER's coordinate space, which we
+    /// can't assume matches ours — a multi-monitor virtual desktop can
+    /// have a negative-origin display, so "place the peer at these exact
+    /// coordinates" would be wrong. What's frame-independent is the
+    /// OFFSET between the two origins: `peer_bounds.origin -
+    /// sender_bounds.origin` is the vector from the sender's origin to
+    /// where it placed us, and that same vector applies however you look
+    /// at it. So the sender sits at `our_origin - offset` in our own
+    /// space, sized to `sender_bounds`' width/height (its real screen
+    /// size, unaffected by whichever frame we're computing in).
+    fn handle_layout_update(&mut self, sender_bounds: Rect, peer_bounds: Rect) {
+        let offset_x = peer_bounds.x - sender_bounds.x;
+        let offset_y = peer_bounds.y - sender_bounds.y;
+        let sender_bounds_here = Rect {
+            x: self.local_bounds.x - offset_x,
+            y: self.local_bounds.y - offset_y,
+            width: sender_bounds.width,
+            height: sender_bounds.height,
+        };
+        self.state_machine
+            .set_peer_placement(self.control.peer_node_id, sender_bounds_here);
+        let _ = self.event_tx.send(SessionEvent::LayoutChanged {
+            peer_bounds: sender_bounds_here,
+        });
+    }
+
     /// Handles a `TransferOffer` from the peer, per `accept_policy` (Tier
     /// 7.5): auto-reject, auto-accept, or park it in `pending_offers` and
     /// tell the driver to ask the user.
@@ -736,7 +919,7 @@ impl Session {
                     .await?;
             }
             AcceptPolicy::Ask => {
-                let _ = self.event_tx.send(TransferEvent::OfferReceived {
+                let _ = self.event_tx.send(SessionEvent::OfferReceived {
                     transfer_id,
                     manifest: manifest.clone(),
                 });
@@ -781,7 +964,7 @@ impl Session {
                         reason: format!("receiver I/O error: {e}"),
                     })
                     .await?;
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -804,7 +987,7 @@ impl Session {
             .is_some_and(|t| t.transfer_id == transfer_id)
         {
             self.current_outgoing = None;
-            let _ = self.event_tx.send(TransferEvent::Rejected {
+            let _ = self.event_tx.send(SessionEvent::Rejected {
                 transfer_id,
                 reason,
             });
@@ -829,7 +1012,7 @@ impl Session {
             self.current_outgoing = None;
         }
         if was_incoming || was_outgoing {
-            let _ = self.event_tx.send(TransferEvent::Failed {
+            let _ = self.event_tx.send(SessionEvent::Failed {
                 transfer_id,
                 reason: "cancelled by peer".to_string(),
             });
@@ -850,7 +1033,7 @@ impl Session {
             if let Err(e) = outgoing.accept(resume_from).await {
                 tracing::warn!(?transfer_id, error = %e, "failed to seek outgoing transfer to resume_from");
                 self.current_outgoing = None;
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -888,7 +1071,7 @@ impl Session {
                     .current_outgoing
                     .as_ref()
                     .map_or(total, |t| t.bytes_sent);
-                let _ = self.event_tx.send(TransferEvent::Progress {
+                let _ = self.event_tx.send(SessionEvent::Progress {
                     transfer_id,
                     bytes_done,
                     total,
@@ -903,13 +1086,13 @@ impl Session {
                     .await?;
                 let _ = self
                     .event_tx
-                    .send(TransferEvent::Completed { transfer_id, path });
+                    .send(SessionEvent::Completed { transfer_id, path });
                 self.start_next_pending_send().await?;
             }
             Err(e) => {
                 tracing::warn!(?transfer_id, error = %e, "outgoing transfer read failed");
                 self.current_outgoing = None;
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -931,7 +1114,7 @@ impl Session {
             Ok(manifest) => manifest,
             Err(e) => {
                 tracing::warn!(?path, error = %e, "failed to read file to send");
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -949,7 +1132,7 @@ impl Session {
                     .await?;
             }
             Err(e) => {
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -962,6 +1145,16 @@ impl Session {
     /// boundary between `Session` and whatever's running it).
     async fn handle_session_command(&mut self, cmd: SessionCommand) -> Result<(), SessionError> {
         match cmd {
+            SessionCommand::UpdateLayout { peer_bounds } => {
+                self.state_machine
+                    .set_peer_placement(self.control.peer_node_id, peer_bounds);
+                self.control
+                    .send(&ControlMessage::LayoutUpdate {
+                        sender_bounds: self.local_bounds,
+                        peer_bounds,
+                    })
+                    .await?;
+            }
             SessionCommand::SendFile(path) => {
                 self.pending_sends.push_back(path);
                 if self.current_outgoing.is_none() {
@@ -1027,14 +1220,14 @@ impl Session {
         if let Err(e) = incoming.write_chunk(offset, &data).await {
             tracing::warn!(?transfer_id, error = %e, "failed to write incoming chunk");
             self.incoming_transfers.remove(&transfer_id);
-            let _ = self.event_tx.send(TransferEvent::Failed {
+            let _ = self.event_tx.send(SessionEvent::Failed {
                 transfer_id,
                 reason: e.to_string(),
             });
             return Ok(());
         }
         let bytes_done = self.incoming_transfers[&transfer_id].bytes_received;
-        let _ = self.event_tx.send(TransferEvent::Progress {
+        let _ = self.event_tx.send(SessionEvent::Progress {
             transfer_id,
             bytes_done,
             total,
@@ -1078,11 +1271,11 @@ impl Session {
             Ok(path) => {
                 let _ = self
                     .event_tx
-                    .send(TransferEvent::Completed { transfer_id, path });
+                    .send(SessionEvent::Completed { transfer_id, path });
             }
             Err(e) => {
                 tracing::warn!(?transfer_id, error = %e, "transfer failed verification");
-                let _ = self.event_tx.send(TransferEvent::Failed {
+                let _ = self.event_tx.send(SessionEvent::Failed {
                     transfer_id,
                     reason: e.to_string(),
                 });
@@ -1251,7 +1444,7 @@ fn clamp_i16(v: i32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputEvent, Session};
+    use super::{InputEvent, Session, SessionCommand, SessionEvent};
     use crate::config::Config;
     use crate::error::PlatformError;
     use crate::net::bulk::BulkChannel;
@@ -1265,7 +1458,7 @@ mod tests {
     use crate::state::{State, StateMachine};
     use crate::topology::{Layout, NodeId, Rect};
     use crate::traits::{ClipboardProvider, InputCapture, InputSink, ScreenInfo};
-    use crate::transfer::{AcceptPolicy, SessionCommand, TransferEvent};
+    use crate::transfer::AcceptPolicy;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -1726,6 +1919,109 @@ mod tests {
         assert_eq!(
             *suppressed.lock().expect("mutex poisoned"),
             vec![true, false]
+        );
+    }
+
+    /// Tier 8.1: dragging the peer's tile on the layout canvas both
+    /// updates our own state machine and tells the peer where we've put
+    /// it, so both sides agree on the shared edge regardless of which one
+    /// dragged.
+    #[tokio::test]
+    async fn update_layout_command_places_peer_and_notifies_them() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        // Deliberately NOT adjacent yet — that's the point of dragging.
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, ..) = session_with(a_control, a_node, layout).await;
+
+        let new_peer_bounds = Rect {
+            x: 3840,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        session
+            .handle_session_command(SessionCommand::UpdateLayout {
+                peer_bounds: new_peer_bounds,
+            })
+            .await
+            .expect("update layout");
+
+        assert_eq!(session.peer_bounds(), Some(new_peer_bounds));
+
+        let msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            msg,
+            ControlMessage::LayoutUpdate {
+                sender_bounds: bounds(),
+                peer_bounds: new_peer_bounds,
+            }
+        );
+    }
+
+    /// The receiving side of the same feature: the peer's `LayoutUpdate`
+    /// must be re-expressed in OUR OWN coordinate space, not applied
+    /// verbatim — proven here with a local origin that ISN'T (0, 0),
+    /// which is exactly the multi-monitor case (a display to the left of
+    /// primary reports negative x) that would silently misplace the peer
+    /// if the raw sender-side coordinates were used directly.
+    #[tokio::test]
+    async fn incoming_layout_update_is_translated_into_our_own_coordinate_space() {
+        let (a_control, a_node, b_node) = {
+            let (a, a_node, _b, b_node) = loopback_pair().await;
+            (a, a_node, b_node)
+        };
+        let layout = adjacent_layout(a_node, b_node, true);
+        let mut local_bounds = bounds();
+        local_bounds.x = -500;
+        local_bounds.y = 200;
+        let sm = StateMachine::new(a_node, local_bounds, layout);
+        let capture = NoopCapture {
+            suppressed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (bulk, _peer_bulk) = bulk_loopback_pair().await;
+        let (mut session, _handle) = Session::new(
+            sm,
+            a_control,
+            bulk,
+            Box::new(capture),
+            Box::new(RecordingSink::default()),
+            Box::new(RecordingClipboard::default()),
+            &Config::new_default(),
+        )
+        .expect("session construction");
+
+        // The peer placed us at (2000, 0) in ITS OWN frame, where its own
+        // bounds start at (0, 0) — i.e. we're 2000px to its right. From
+        // our side (whose own origin is -500, 200, not 0,0), the peer
+        // must land exactly `2000`px to our left, at the SAME y as our
+        // own origin (zero relative vertical offset), not at some
+        // coordinate derived from the sender's raw numbers.
+        session
+            .handle_control_message(ControlMessage::LayoutUpdate {
+                sender_bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                peer_bounds: Rect {
+                    x: 2000,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            })
+            .await
+            .expect("handle layout update");
+
+        assert_eq!(
+            session.peer_bounds(),
+            Some(Rect {
+                x: local_bounds.x - 2000,
+                y: local_bounds.y,
+                width: 1920,
+                height: 1080,
+            })
         );
     }
 
@@ -2301,14 +2597,17 @@ mod tests {
                             );
                         };
                         match event {
-                            TransferEvent::Completed { path, .. } => return path,
-                            TransferEvent::Failed { reason, .. } => {
+                            SessionEvent::Completed { path, .. } => return path,
+                            SessionEvent::Failed { reason, .. } => {
                                 panic!("transfer failed: {reason}")
                             }
-                            TransferEvent::Rejected { reason, .. } => {
+                            SessionEvent::Rejected { reason, .. } => {
                                 panic!("transfer rejected: {reason}")
                             }
-                            TransferEvent::Progress { .. } | TransferEvent::OfferReceived { .. } => {}
+                            SessionEvent::Progress { .. }
+                            | SessionEvent::OfferReceived { .. }
+                            | SessionEvent::PeerScreenConfig { .. }
+                            | SessionEvent::LayoutChanged { .. } => {}
                         }
                     }
                 }

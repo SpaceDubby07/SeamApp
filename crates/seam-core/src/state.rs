@@ -173,6 +173,23 @@ impl StateMachine {
         self.local_bounds
     }
 
+    /// Updates where `peer` sits on the shared layout canvas (Tier 8.1's
+    /// drag-and-snap tiles, M11) — after the local user rearranges it, or
+    /// after the peer sends its own arrangement via
+    /// `ControlMessage::LayoutUpdate`. Takes effect on the next crossing/
+    /// reclaim check; doesn't touch whichever state we're already in, so
+    /// rearranging mid-session is safe (if momentarily surprising if you
+    /// move a shared edge out from under an active handoff).
+    pub fn set_peer_placement(&mut self, peer: NodeId, bounds: Rect) {
+        self.layout.set_placement(peer, bounds);
+    }
+
+    /// The peer's current bounds on the shared layout canvas, if placed.
+    #[must_use]
+    pub fn peer_bounds(&self) -> Option<Rect> {
+        self.peer.and_then(|peer| self.layout.bounds_of(peer))
+    }
+
     /// Which modifier keys are currently physically held, as tracked by
     /// `track_modifier`.
     #[must_use]

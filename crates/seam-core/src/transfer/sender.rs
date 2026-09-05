@@ -21,7 +21,7 @@ pub struct OutgoingTransfer {
     pub transfer_id: TransferId,
     /// The manifest already sent in the `TransferOffer`.
     pub manifest: FileManifest,
-    /// The file's original path, for `TransferEvent::Completed`.
+    /// The file's original path, for `SessionEvent::Completed`.
     pub original_path: PathBuf,
     file: tokio::fs::File,
     /// How many bytes have been sent (or, before `accept`, resumed from).

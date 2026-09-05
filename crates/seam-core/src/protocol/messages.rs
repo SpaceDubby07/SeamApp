@@ -523,6 +523,20 @@ pub enum ControlMessage {
         /// Human-readable reason, for logging.
         reason: String,
     },
+    /// The sender has (re)arranged the shared layout canvas (Tier 8.1's
+    /// drag-and-snap tiles, M11). Both `Rect`s are in the SENDER's own
+    /// coordinate space, which the receiver can't assume matches its own
+    /// (a multi-monitor virtual desktop can have a negative-origin
+    /// display) — carrying both lets the receiver derive the pure
+    /// origin-to-origin offset and re-express it in its own space. See
+    /// `Session::handle_layout_update`'s doc comment for the exact math.
+    LayoutUpdate {
+        /// The sender's own bounds, in the sender's coordinate space.
+        sender_bounds: Rect,
+        /// Where the sender has placed the RECEIVER, also in the
+        /// sender's coordinate space.
+        peer_bounds: Rect,
+    },
 }
 
 /// Messages that cross the bulk channel: file chunks and large clipboard

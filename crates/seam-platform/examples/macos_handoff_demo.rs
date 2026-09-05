@@ -65,10 +65,11 @@ fn main() {
     use seam_core::net::tls::{NodeIdentity, Trust};
     use seam_core::protocol::OsKind;
     use seam_core::session::Session;
+    use seam_core::session::{SessionCommand, SessionEvent};
     use seam_core::state::StateMachine;
     use seam_core::topology::{Layout, Rect};
     use seam_core::traits::{PermissionGate, ScreenInfo};
-    use seam_core::transfer::{AcceptPolicy, SessionCommand, TransferEvent};
+    use seam_core::transfer::AcceptPolicy;
     use seam_platform::macos::{Capture, Clipboard, Permissions, Screens, Sink};
 
     tracing_subscriber::fmt::init();
@@ -295,7 +296,7 @@ fn main() {
         let sink = Box::new(Sink::new());
         let clipboard = Box::new(Clipboard::new());
 
-        let (session, handle) = Session::new(
+        let (mut session, handle) = Session::new(
             state_machine,
             control,
             bulk,
@@ -308,6 +309,13 @@ fn main() {
             "failed to start input capture/clipboard watch — run this interactively, not \
                  as a scheduled task",
         );
+
+        // M11: tells the peer our real screens once connected, so its
+        // layout canvas can draw our tile to scale (Tier 8.1).
+        session
+            .send_screen_config(screens.displays(), local_bounds)
+            .await
+            .expect("failed to send screen config");
         let seam_core::session::SessionHandle {
             command_tx,
             mut event_rx,
@@ -328,7 +336,7 @@ fn main() {
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
-                    TransferEvent::OfferReceived {
+                    SessionEvent::OfferReceived {
                         transfer_id,
                         manifest,
                     } => {
@@ -341,19 +349,31 @@ fn main() {
                             accept: true,
                         });
                     }
-                    TransferEvent::Progress {
+                    SessionEvent::Progress {
                         bytes_done, total, ..
                     } => {
                         println!("transfer progress: {bytes_done}/{total} bytes");
                     }
-                    TransferEvent::Rejected { reason, .. } => {
+                    SessionEvent::Rejected { reason, .. } => {
                         println!("transfer rejected: {reason}");
                     }
-                    TransferEvent::Completed { path, .. } => {
+                    SessionEvent::Completed { path, .. } => {
                         println!("transfer complete: {}", path.display());
                     }
-                    TransferEvent::Failed { reason, .. } => {
+                    SessionEvent::Failed { reason, .. } => {
                         println!("transfer failed: {reason}");
+                    }
+                    SessionEvent::PeerScreenConfig {
+                        displays,
+                        virtual_bounds,
+                    } => {
+                        println!(
+                            "Peer screens: {} display(s), virtual bounds {virtual_bounds:?}",
+                            displays.len()
+                        );
+                    }
+                    SessionEvent::LayoutChanged { peer_bounds } => {
+                        println!("Layout changed: peer is now at {peer_bounds:?}");
                     }
                 }
             }
