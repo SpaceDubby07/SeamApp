@@ -578,7 +578,9 @@ impl Session {
                 let actions = self
                     .state_machine
                     .handle(Input::ReceivedHandoff { from: peer, entry }, now);
-                tracing::info!("peer handed off control to us");
+                // `entry.edge` is the edge on OUR screen the cursor enters
+                // (and must be pushed back out of to hand control back).
+                tracing::info!(entry_edge = ?entry.edge, "peer handed off control to us");
                 self.execute_actions(actions).await?;
             }
             ControlMessage::Reclaim => {
@@ -707,6 +709,10 @@ impl Session {
             return Ok(());
         }
         let Some(mut pos) = self.driven_cursor else {
+            // Reached BeingDriven but the entry warp never seeded the
+            // cursor — reclaim tracking is dead until the next handoff.
+            // Logged (not silent) because it disables the only way back.
+            tracing::warn!("BeingDriven with no driven_cursor; back-out reclaim is disabled");
             return Ok(());
         };
         match *msg {
@@ -722,9 +728,16 @@ impl Session {
             _ => return Ok(()),
         }
         self.driven_cursor = Some(pos);
+        let armed_before = self.state_machine.driven_backout_state().map(|(_, a)| a);
         let actions = self
             .state_machine
             .handle(Input::DrivenCursorMoved(pos), now);
+        let driven = self.state_machine.driven_backout_state();
+        if driven.map(|(_, a)| a) != armed_before {
+            tracing::debug!(?pos, ?driven, "driven back-out detector armed");
+        }
+        // Per-move; only visible under `RUST_LOG=seam_core=trace`.
+        tracing::trace!(?pos, ?driven, bounds = ?self.local_bounds, "driven cursor moved");
         self.execute_actions(actions).await?;
         if self.state_machine.state() != State::BeingDriven {
             self.driven_cursor = None;

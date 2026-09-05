@@ -239,6 +239,16 @@ impl StateMachine {
         self.held_modifiers
     }
 
+    /// Diagnostics only: while `BeingDriven`, the edge the peer's cursor
+    /// entered through and whether the back-out detector has armed yet
+    /// (see [`Self::on_driven_cursor_moved`]). `None` in every other
+    /// state. Used by `Session` to log why a reclaim is or isn't firing.
+    #[must_use]
+    pub fn driven_backout_state(&self) -> Option<(Edge, bool)> {
+        self.driven_entry_edge
+            .map(|edge| (edge, self.driven_backout_armed))
+    }
+
     /// Jumps directly to `state` without going through a transition,
     /// bypassing whatever invariants a real transition would set up (which
     /// peer is active, cursor history, etc). Test-only, for setting up a

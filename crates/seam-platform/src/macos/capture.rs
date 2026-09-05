@@ -25,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
@@ -38,9 +38,9 @@ use seam_core::traits::InputCapture;
 use super::cg_ffi::{
     CFMachPortCreateRunLoopSource, CFMachPortInvalidate, CFMachPortRef, CFRelease,
     CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRun, CFRunLoopStop,
-    CGAssociateMouseAndMouseCursorPosition, CGDisplayHideCursor, CGDisplayShowCursor,
-    CGEventGetIntegerValueField, CGEventGetLocation, CGEventRef, CGEventTapCreate,
-    CGEventTapEnable, CGEventTapProxy, CGMainDisplayID, CGPoint, K_CG_EVENT_FLAGS_CHANGED,
+    CGDisplayBounds, CGDisplayHideCursor, CGDisplayShowCursor, CGEventGetIntegerValueField,
+    CGEventGetLocation, CGEventRef, CGEventTapCreate, CGEventTapEnable, CGEventTapProxy,
+    CGMainDisplayID, CGPoint, CGWarpMouseCursorPosition, K_CG_EVENT_FLAGS_CHANGED,
     K_CG_EVENT_KEY_DOWN, K_CG_EVENT_KEY_UP, K_CG_EVENT_LEFT_MOUSE_DOWN,
     K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED,
     K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP,
@@ -58,6 +58,17 @@ use super::keycodes::cgkeycode_to_keycode;
 /// suppression flag, since there's only ever one active capture instance
 /// (`current_platform()` constructs exactly one `Platform` bundle).
 static SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// Where the tap callback warps the (hidden) cursor back to on every move
+/// while suppressed — set to the main display's centre by
+/// `set_suppression`. Pinning it there (rather than
+/// `CGAssociateMouseAndMouseCursorPosition(false)`) keeps the window server
+/// from drifting the cursor off-screen, which on a sustained one-direction
+/// drag would starve `kCGMouseEventDeltaX/Y` and freeze the peer's cursor
+/// — the "moves onto Windows fine but can't come back" bug. `CGWarpMouse…`
+/// generates no event, so the warp never re-enters this tap.
+static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
+static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 
 thread_local! {
     // The tap callback runs on the thread that created it (CGEventTap
@@ -104,15 +115,30 @@ impl Capture {
     }
 }
 
-/// Decouples (`coupled == false`) or re-couples the on-screen pointer from
-/// physical mouse input. See `CGAssociateMouseAndMouseCursorPosition` in
-/// `cg_ffi.rs` for why this is needed on top of the tap consuming events.
-fn set_cursor_coupled(coupled: bool) {
-    // SAFETY: plain C call taking a `bool`, no preconditions. The
-    // association is process-global; `stop`/`Drop` always restore it.
+/// Warps the cursor to `(x, y)` in global display coordinates. Used to pin
+/// the hidden cursor at `ANCHOR_*` while suppressed. `CGWarpMouseCursorPosition`
+/// moves the cursor without posting an event, so this never re-enters the
+/// tap as a spurious move.
+fn warp_cursor_to(x: i32, y: i32) {
+    // SAFETY: takes a plain value struct, no preconditions.
     unsafe {
-        CGAssociateMouseAndMouseCursorPosition(coupled);
+        CGWarpMouseCursorPosition(CGPoint {
+            x: f64::from(x),
+            y: f64::from(y),
+        });
     }
+}
+
+/// The centre of the main display, in global coordinates — the anchor the
+/// suppressed cursor is pinned to.
+fn main_display_centre() -> (i32, i32) {
+    // SAFETY: plain C calls, no preconditions.
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    #[allow(clippy::cast_possible_truncation)]
+    (
+        (bounds.origin.x + bounds.size.width / 2.0) as i32,
+        (bounds.origin.y + bounds.size.height / 2.0) as i32,
+    )
 }
 
 /// Hides or shows the hardware cursor on the main display. Hide/show are
@@ -236,9 +262,9 @@ impl InputCapture for Capture {
     }
 
     fn stop(&mut self) -> Result<(), PlatformError> {
-        // Never tear down leaving the pointer decoupled, hidden, or events
-        // suppressed — this runs on every session end, including an
-        // `abort()` mid-handoff (via `Session`'s `Drop`).
+        // Never tear down leaving the cursor hidden or events suppressed —
+        // this runs on every session end, including an `abort()`
+        // mid-handoff (via `Session`'s `Drop`).
         let _ = self.set_suppression(false);
         if let Some(SendableRunLoop(run_loop)) = self.run_loop.take() {
             // SAFETY: `run_loop` came from `CFRunLoopGetCurrent()` on the
@@ -255,13 +281,16 @@ impl InputCapture for Capture {
     fn set_suppression(&mut self, suppress: bool) -> Result<(), PlatformError> {
         SUPPRESS.store(suppress, Ordering::SeqCst);
         if suppress != self.suppressing {
-            // Returning NULL from the tap only hides events from other
-            // apps; without decoupling, the WindowServer keeps moving the
-            // real cursor (it visibly drifts across the local screen the
-            // whole time the peer is driven, and hot corners / edge
-            // gestures can fire). Deltas keep flowing either way, so
-            // relayed motion is unaffected.
-            set_cursor_coupled(!suppress);
+            if suppress {
+                // Pin the (now hidden) cursor at the display centre; the
+                // tap callback warps it back here on every move so it
+                // can't drift off-screen and stall the delta stream, and
+                // so it can't trip hot corners while the peer is driven.
+                let (cx, cy) = main_display_centre();
+                ANCHOR_X.store(cx, Ordering::SeqCst);
+                ANCHOR_Y.store(cy, Ordering::SeqCst);
+                warp_cursor_to(cx, cy);
+            }
             set_cursor_hidden(suppress);
             self.suppressing = suppress;
         }
@@ -387,11 +416,10 @@ unsafe extern "C" fn tap_callback(
             let CGPoint { x, y } = unsafe { CGEventGetLocation(event) };
 
             // Tier 7.2: the raw per-event delta, straight from the HID
-            // report — unlike `CGEventGetLocation` above, this keeps
-            // flowing (in every direction) once `RemoteActive` decouples
-            // and freezes our own cursor via
-            // `CGAssociateMouseAndMouseCursorPosition`, so it's what
-            // carries the peer's motion over the wire while driving.
+            // report — independent of cursor position, so it keeps
+            // flowing in every direction while `RemoteActive` pins our own
+            // (hidden) cursor at `ANCHOR_*`. This is what carries the
+            // peer's motion over the wire while driving.
             // SAFETY: same as above.
             let dx = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_X) };
             // SAFETY: same as above.
@@ -401,6 +429,17 @@ unsafe extern "C" fn tap_callback(
                     dx: clamp_to_i32(dx),
                     dy: clamp_to_i32(dy),
                 });
+            }
+
+            // Keep the suppressed cursor from actually moving: warp it
+            // straight back to the anchor. Done after reading the delta
+            // (which is unaffected), and `CGWarpMouseCursorPosition` posts
+            // no event, so this doesn't feed back into the tap.
+            if SUPPRESS.load(Ordering::SeqCst) {
+                warp_cursor_to(
+                    ANCHOR_X.load(Ordering::SeqCst),
+                    ANCHOR_Y.load(Ordering::SeqCst),
+                );
             }
 
             #[allow(clippy::cast_possible_truncation)]
