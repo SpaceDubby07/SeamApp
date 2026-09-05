@@ -10,30 +10,50 @@ seam-core = { path = "../seam-core" }
 tracing   = { workspace = true }
 tokio     = { workspace = true }
 
-# Windows — see Tier 5.4 of the build guide. Kept minimal for M1 (capture,
-# inject, screens); clipboard/HiDPI extras land with later milestones.
+# Windows — see Tier 5.4 of the build guide. M1 needed capture/inject/
+# screens only; M7 adds clipboard.rs (AddClipboardFormatListener on a
+# message-only window, GlobalAlloc'd CF_UNICODETEXT/PNG clipboard formats).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.60", features = [
     "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",    # SetWindowsHookEx, message pump
+    "Win32_UI_WindowsAndMessaging",    # SetWindowsHookEx, message pump, message-only window
     "Win32_UI_Input_KeyboardAndMouse", # SendInput, VK codes
     "Win32_Graphics_Gdi",              # EnumDisplayMonitors
     "Win32_UI_HiDpi",                  # per-monitor DPI awareness
     "Win32_System_Threading",          # GetCurrentThreadId, for stop()'s WM_QUIT
+    "Win32_System_DataExchange",       # OpenClipboard/SetClipboardData/AddClipboardFormatListener
+    "Win32_System_Memory",             # GlobalAlloc/GlobalLock for clipboard payloads
+    "Win32_System_Ole",                # CF_UNICODETEXT and friends
+    "Win32_System_LibraryLoader",      # GetModuleHandleW, for registering the message-only window class
+] }
+
+# macOS — see Tier 5.4 of the build guide. M1/M5's capture/inject/screens/
+# permissions go through direct `extern "C"` FFI against CoreGraphics/
+# CoreFoundation/ApplicationServices (`cg_ffi.rs`) rather than
+# objc2-core-graphics — those C ABIs have been stable for decades and are
+# more reliably gotten right from memory than a newer wrapper crate's exact
+# Rust-side shape. Using CGDisplayBounds/CGDisplayPixelsWide instead of
+# NSScreen also sidesteps a real gotcha: NSScreen's coordinate space has its
+# origin at the bottom-left with Y increasing upward, while CGEventTap/
+# CGWarpMouseCursorPosition use a top-left origin with Y increasing
+# downward — mixing the two silently flips Y.
+#
+# M7's clipboard.rs is the exception: NSPasteboard is a heavily
+# Objective-C-object-oriented API (not a stable flat C ABI like
+# CoreGraphics), so it goes through the `objc2`/`objc2-app-kit` safe
+# wrappers instead of hand-written FFI. Feature lists trimmed to just
+# NSPasteboard's own dependency chain (reading the class definition's own
+# `[features]` block in objc2-app-kit shows exactly what it needs) rather
+# than each crate's large default feature set.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSPasteboard",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSString",
+    "NSData",
 ] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-
-# macOS — see Tier 5.4 of the build guide. No objc2 crates needed for M5:
-# CGEventTap/CGEventPost/display enumeration/the Accessibility check all
-# go through direct `extern "C"` FFI against
-# CoreGraphics/CoreFoundation/ApplicationServices (`cg_ffi.rs`) rather
-# than objc2-core-graphics — those C ABIs have been stable for decades
-# and are more reliably gotten right from memory than a newer wrapper
-# crate's exact Rust-side shape. Using CGDisplayBounds/CGDisplayPixelsWide
-# instead of NSScreen also sidesteps a real gotcha: NSScreen's coordinate
-# space has its origin at the bottom-left with Y increasing upward, while
-# CGEventTap/CGWarpMouseCursorPosition use a top-left origin with Y
-# increasing downward — mixing the two silently flips Y. objc2/objc2-app-kit
-# will likely return for M7 (NSPasteboard clipboard access).

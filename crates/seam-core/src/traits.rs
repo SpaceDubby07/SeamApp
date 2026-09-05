@@ -76,7 +76,13 @@ pub trait InputSink: Send + 'static {
 
 /// Watches and sets the system clipboard.
 pub trait ClipboardProvider: Send + 'static {
-    /// Emits an event whenever local clipboard content changes.
+    /// Starts watching. Implementations MUST emit one event immediately
+    /// with whatever the clipboard currently holds, if it's text or an
+    /// image (nothing is emitted if the clipboard is empty or holds
+    /// content this trait doesn't model, e.g. files) — this is what seeds
+    /// the on-connect clipboard sync (`Action::SyncClipboard`) without
+    /// needing a separate "read current content" method. Every local
+    /// change thereafter emits another event the same way.
     ///
     /// # Errors
     /// Returns an error if the OS clipboard watcher could not be started.
@@ -277,12 +283,18 @@ mod tests {
         assert!(screens.displays()[0].is_primary);
     }
 
-    /// Compile-time check only: a `ClipboardProvider` mock must be
-    /// constructible against the trait as written.
-    struct MockClipboard;
+    /// Mirrors what a real implementation must do: `watch` fires once
+    /// immediately with whatever "current content" it's holding, seeding
+    /// the on-connect sync described in the trait docs.
+    struct MockClipboard {
+        current: Option<ClipboardEvent>,
+    }
 
     impl super::ClipboardProvider for MockClipboard {
-        fn watch(&mut self, _sink: UnboundedSender<ClipboardEvent>) -> Result<(), PlatformError> {
+        fn watch(&mut self, sink: UnboundedSender<ClipboardEvent>) -> Result<(), PlatformError> {
+            if let Some(event) = self.current.clone() {
+                sink.send(event).expect("receiver still open");
+            }
             Ok(())
         }
 
@@ -295,9 +307,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn clipboard_provider_watch_emits_current_content_immediately() {
+        let mut clipboard = MockClipboard {
+            current: Some(ClipboardEvent::Text("hello".to_string())),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        clipboard.watch(tx).expect("mock never fails");
+
+        assert_eq!(
+            rx.recv().await,
+            Some(ClipboardEvent::Text("hello".to_string()))
+        );
+    }
+
     #[test]
     fn clipboard_provider_mock_constructs() {
-        let mut clipboard = MockClipboard;
+        let mut clipboard = MockClipboard { current: None };
         clipboard.set_text("hello").expect("mock never fails");
     }
 }

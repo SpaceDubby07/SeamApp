@@ -8,7 +8,6 @@
 //! Windows so far (M1) and macOS lands in M5.
 //!
 //! # What's deliberately NOT here yet
-//! - Clipboard sync (`ClipboardUpdate`/`ClipboardBlob`) — M7.
 //! - Transfer coordination (`TransferOffer` and friends) — M10.
 //! - Dynamic `ScreenConfig` handling on resolution change — not scheduled
 //!   to a specific milestone yet.
@@ -22,15 +21,35 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::config::Config;
 use crate::error::PlatformError;
+use crate::net::bulk::BulkChannel;
 use crate::net::control::{ControlChannel, now_micros};
-use crate::protocol::{ControlMessage, KeyCode, Modifiers, ProtocolError};
+use crate::protocol::{
+    BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, KeyCode, Modifiers,
+    ProtocolError,
+};
 use crate::remap::RemapTable;
 use crate::state::{Action, Input, State, StateMachine};
 use crate::topology::{Point, Rect};
-use crate::traits::{InputCapture, InputSink};
+use crate::traits::{ClipboardProvider, InputCapture, InputSink};
 
 pub use crate::protocol::InputEvent;
+
+/// Tier 7.4: plain text travels inline on the control channel only up to
+/// this size. There's no bulk-relay path for text in the wire protocol
+/// (only images have an offer/blob split) — oversized text is skipped
+/// entirely rather than partially synced, same as an oversized image.
+const CLIPBOARD_TEXT_INLINE_MAX_BYTES: usize = 256 * 1024;
+
+/// An accepted `ClipboardContent::ImageOffer` awaiting its matching
+/// `BulkMessage::ClipboardBlob`. Only one can be outstanding at a time — a
+/// newer offer simply replaces it, matching the "ignore anything not the
+/// latest" spirit of the `seq` ordering rule (Tier 6.3).
+struct PendingClipboardImage {
+    seq: u64,
+    mime: String,
+}
 
 /// Everything that can go wrong while a session runs.
 #[derive(Debug, thiserror::Error)]
@@ -56,9 +75,15 @@ pub enum SessionError {
 pub struct Session {
     state_machine: StateMachine,
     control: ControlChannel,
+    /// The bulk channel (M7, Tier 6.1): clipboard images travel here, never
+    /// on `control` — a multi-MB image on the control channel would stall
+    /// the input-latency-critical path.
+    bulk: BulkChannel,
     capture: Box<dyn InputCapture>,
     sink: Box<dyn InputSink>,
+    clipboard: Box<dyn ClipboardProvider>,
     capture_rx: UnboundedReceiver<InputEvent>,
+    clipboard_rx: UnboundedReceiver<ClipboardEvent>,
     local_bounds: Rect,
     /// What we last told the being-driven-side OS to reflect via
     /// `ModifierState` sync (Tier 7.1) — compared against each new
@@ -69,6 +94,26 @@ pub struct Session {
     /// inject on the peer's behalf, never to what we send. Each machine
     /// owns its own rules, so this is never synced over the wire.
     remap: RemapTable,
+    /// Hard cap on outgoing clipboard content (Tier 7.4); see
+    /// [`Config::clipboard_max_bytes`].
+    clipboard_max_bytes: u64,
+    /// Monotonic `seq` for our own outgoing `ClipboardUpdate`s.
+    next_clipboard_seq: u64,
+    /// Highest peer `ClipboardUpdate` `seq` we've accepted (Text applied
+    /// immediately; an image offer counts once accepted, not once its blob
+    /// arrives) — anything at or below this is a stale/duplicate/
+    /// out-of-order update and is ignored (Tier 6.3's `seq` rule).
+    last_seen_peer_clipboard_seq: u64,
+    /// An accepted image offer waiting on its bulk-channel blob.
+    pending_image: Option<PendingClipboardImage>,
+    /// Content we just wrote to the local clipboard because the PEER sent
+    /// it. Compared against the next local `ClipboardEvent` our own watcher
+    /// reports — if it matches, that event is our own write echoing back
+    /// rather than a genuine new local change, and must NOT be broadcast
+    /// again (the clipboard-sync equivalent of the stuck-modifier echo
+    /// problem: without this, two synced machines would ping-pong the same
+    /// update back and forth forever).
+    last_applied_from_peer: Option<ClipboardEvent>,
     ping_seq: u64,
 }
 
@@ -80,22 +125,33 @@ impl Session {
     /// (`Handshake::Hello`/`HelloAck`) has already succeeded — that IS
     /// this state machine's `PeerHandshakeOk` trigger.
     ///
-    /// `remap` is this machine's own modifier remap table and scroll
-    /// inversion (Tier 7.3) — applied to everything injected locally on the
-    /// peer's behalf. Pass [`RemapTable::default`] for no remapping.
+    /// `bulk` is this session's already-connected bulk channel (M7) —
+    /// clipboard images travel there. `clipboard` is this machine's
+    /// clipboard watcher/setter; its `watch` call immediately seeds an
+    /// on-connect sync if the local clipboard already holds something (see
+    /// [`ClipboardProvider::watch`]'s contract). `config` supplies this
+    /// machine's own remap table (Tier 7.3) and clipboard size cap (Tier
+    /// 7.4) — only those two fields are read; `config.node_id`/
+    /// `display_name` already went into `control`'s handshake before this
+    /// call.
     ///
     /// # Errors
-    /// Returns an error if `capture` fails to start (e.g. a missing OS
-    /// permission).
+    /// Returns an error if `capture` or `clipboard` fail to start (e.g. a
+    /// missing OS permission).
     pub fn new(
         mut state_machine: StateMachine,
         control: ControlChannel,
+        bulk: BulkChannel,
         mut capture: Box<dyn InputCapture>,
         sink: Box<dyn InputSink>,
-        remap: RemapTable,
+        mut clipboard: Box<dyn ClipboardProvider>,
+        config: &Config,
     ) -> Result<Self, PlatformError> {
         let (tx, capture_rx) = tokio::sync::mpsc::unbounded_channel();
         capture.start(tx)?;
+
+        let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
+        clipboard.watch(clipboard_tx)?;
 
         let local_bounds = state_machine.local_bounds();
         let peer = control.peer_node_id;
@@ -103,7 +159,10 @@ impl Session {
             match action {
                 Action::StartHeartbeat => tracing::debug!("heartbeat starting"),
                 Action::SyncClipboard => {
-                    tracing::debug!("clipboard sync not implemented until M7");
+                    tracing::debug!(
+                        "clipboard sync driven by ClipboardProvider::watch's initial event, \
+                         nothing further to do here"
+                    );
                 }
                 other => tracing::warn!(?other, "unexpected action from PeerHandshakeOk"),
             }
@@ -112,12 +171,20 @@ impl Session {
         Ok(Self {
             state_machine,
             control,
+            bulk,
             capture,
             sink,
+            clipboard,
             capture_rx,
+            clipboard_rx,
             local_bounds,
             injected_modifiers: Modifiers::default(),
-            remap,
+            remap: config.remap.clone(),
+            clipboard_max_bytes: config.clipboard_max_bytes,
+            next_clipboard_seq: 0,
+            last_seen_peer_clipboard_seq: 0,
+            pending_image: None,
+            last_applied_from_peer: None,
             ping_seq: 0,
         })
     }
@@ -143,6 +210,13 @@ impl Session {
         // the peer has even seen us as connected.
         ping_interval.tick().await;
 
+        // Once the bulk channel closes, `recv()` would return `None`
+        // immediately forever — this guard stops polling it rather than
+        // busy-looping. Losing bulk sync degrades clipboard images only;
+        // the control channel stays authoritative for whether the session
+        // as a whole is still alive.
+        let mut bulk_open = true;
+
         loop {
             tokio::select! {
                 event = self.capture_rx.recv() => {
@@ -152,6 +226,13 @@ impl Session {
                     };
                     self.handle_capture_event(event).await?;
                 }
+                event = self.clipboard_rx.recv() => {
+                    let Some(event) = event else {
+                        tracing::warn!("clipboard watcher channel closed unexpectedly");
+                        return Ok(());
+                    };
+                    self.handle_local_clipboard_event(event).await?;
+                }
                 msg = self.control.recv() => {
                     match msg {
                         Ok(Some(msg)) => self.handle_control_message(msg).await?,
@@ -160,6 +241,16 @@ impl Session {
                             let actions =
                                 self.state_machine.handle(Input::ConnectionLost, Instant::now());
                             self.execute_actions(actions).await?;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                msg = self.bulk.recv(), if bulk_open => {
+                    match msg {
+                        Ok(Some(msg)) => self.handle_bulk_message(msg)?,
+                        Ok(None) => {
+                            tracing::info!("peer closed the bulk channel; clipboard images will no longer sync");
+                            bulk_open = false;
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -289,8 +380,8 @@ impl Session {
             | ControlMessage::KeyUp { .. } => {
                 self.inject_relayed_input(&msg)?;
             }
-            ControlMessage::ClipboardUpdate { .. } => {
-                tracing::debug!("clipboard sync not implemented until M7");
+            ControlMessage::ClipboardUpdate { seq, content } => {
+                self.handle_remote_clipboard_update(seq, content)?;
             }
             ControlMessage::TransferOffer { .. }
             | ControlMessage::TransferAccept { .. }
@@ -326,6 +417,161 @@ impl Session {
         if let Some(event) = control_message_to_input_event(msg, self.local_bounds) {
             let event = self.remap.apply(event);
             self.sink.inject(&event)?;
+        }
+        Ok(())
+    }
+
+    /// Handles one clipboard change our own `ClipboardProvider` reported —
+    /// either a genuine local edit, or the initial "here's what's already
+    /// on the clipboard" event `watch` fires on startup (Tier 7.4).
+    ///
+    /// # Errors
+    /// Returns an error if sending the resulting control/bulk message
+    /// fails.
+    async fn handle_local_clipboard_event(
+        &mut self,
+        event: ClipboardEvent,
+    ) -> Result<(), SessionError> {
+        if self.is_echo_of_what_we_just_applied(&event) {
+            tracing::debug!("skipping clipboard sync: this is our own write echoing back");
+            return Ok(());
+        }
+
+        match event {
+            ClipboardEvent::Text(text) => {
+                if text.len() > CLIPBOARD_TEXT_INLINE_MAX_BYTES {
+                    tracing::warn!(
+                        len = text.len(),
+                        max = CLIPBOARD_TEXT_INLINE_MAX_BYTES,
+                        "clipboard text exceeds the inline size limit; not syncing"
+                    );
+                    return Ok(());
+                }
+                let seq = self.alloc_clipboard_seq();
+                self.control
+                    .send(&ControlMessage::ClipboardUpdate {
+                        seq,
+                        content: ClipboardContent::Text(text),
+                    })
+                    .await?;
+            }
+            ClipboardEvent::Image { mime, data } => {
+                let size = data.len() as u64;
+                if size > self.clipboard_max_bytes {
+                    tracing::warn!(
+                        size,
+                        max = self.clipboard_max_bytes,
+                        "clipboard image exceeds the size cap; not syncing"
+                    );
+                    return Ok(());
+                }
+                let seq = self.alloc_clipboard_seq();
+                self.control
+                    .send(&ControlMessage::ClipboardUpdate {
+                        seq,
+                        content: ClipboardContent::ImageOffer {
+                            mime: mime.clone(),
+                            size,
+                        },
+                    })
+                    .await?;
+                self.bulk
+                    .send(&BulkMessage::ClipboardBlob { seq, mime, data })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocates the next outgoing clipboard `seq`, starting at 1 (0 is
+    /// reserved to mean "nothing sent yet" for `last_seen_peer_clipboard_seq`
+    /// on the receiving end).
+    fn alloc_clipboard_seq(&mut self) -> u64 {
+        self.next_clipboard_seq += 1;
+        self.next_clipboard_seq
+    }
+
+    /// True if `event` is exactly the content we last wrote to the local
+    /// clipboard on the peer's behalf — see `last_applied_from_peer`'s
+    /// docs. Consumes the marker either way, so only the ONE local event
+    /// immediately following an applied peer update can match; anything
+    /// after that is a genuine new local change even if it happens to have
+    /// identical content.
+    fn is_echo_of_what_we_just_applied(&mut self, event: &ClipboardEvent) -> bool {
+        self.last_applied_from_peer.take().as_ref() == Some(event)
+    }
+
+    /// Handles a `ClipboardUpdate` from the peer: applies `Text` content
+    /// immediately, or — for `ImageOffer` — records it as pending until the
+    /// matching `BulkMessage::ClipboardBlob` arrives (`handle_bulk_message`).
+    ///
+    /// # Errors
+    /// Returns an error if writing to the local clipboard fails.
+    fn handle_remote_clipboard_update(
+        &mut self,
+        seq: u64,
+        content: ClipboardContent,
+    ) -> Result<(), SessionError> {
+        if seq <= self.last_seen_peer_clipboard_seq {
+            tracing::debug!(
+                seq,
+                last_seen = self.last_seen_peer_clipboard_seq,
+                "ignoring stale/out-of-order clipboard update"
+            );
+            return Ok(());
+        }
+        self.last_seen_peer_clipboard_seq = seq;
+
+        match content {
+            ClipboardContent::Text(text) => {
+                self.clipboard.set_text(&text)?;
+                self.last_applied_from_peer = Some(ClipboardEvent::Text(text));
+                self.pending_image = None;
+            }
+            ClipboardContent::ImageOffer { mime, size } => {
+                if size > self.clipboard_max_bytes {
+                    tracing::warn!(
+                        size,
+                        max = self.clipboard_max_bytes,
+                        "peer's clipboard image offer exceeds our size cap; ignoring"
+                    );
+                    return Ok(());
+                }
+                self.pending_image = Some(PendingClipboardImage { seq, mime });
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles a message on the bulk channel: applies a `ClipboardBlob`
+    /// that matches the pending image offer, and ignores anything else
+    /// (stale blob, or a `Chunk` — file transfer isn't implemented until
+    /// M10).
+    ///
+    /// # Errors
+    /// Returns an error if writing the image to the local clipboard fails.
+    fn handle_bulk_message(&mut self, msg: BulkMessage) -> Result<(), SessionError> {
+        match msg {
+            BulkMessage::ClipboardBlob { seq, data, .. } => {
+                // The offer's `mime` is what we already validated against
+                // our size cap, so it — not the blob's own copy — is what
+                // gets used from here on.
+                let Some(pending) = self.pending_image.take_if(|pending| pending.seq == seq) else {
+                    tracing::debug!(
+                        seq,
+                        "ignoring clipboard blob with no matching pending offer"
+                    );
+                    return Ok(());
+                };
+                self.clipboard.set_image(&data)?;
+                self.last_applied_from_peer = Some(ClipboardEvent::Image {
+                    mime: pending.mime,
+                    data,
+                });
+            }
+            BulkMessage::Chunk { .. } => {
+                tracing::debug!("file transfer not implemented until M10");
+            }
         }
         Ok(())
     }
@@ -421,7 +667,10 @@ impl Session {
                 tracing::warn!("connection lost; reconnect not implemented until M12");
                 return Err(SessionError::Disconnected);
             }
-            Action::SyncClipboard => tracing::debug!("clipboard sync not implemented until M7"),
+            // Only ever produced by `on_handshake_ok`, which `Session::new`
+            // consumes directly rather than through `execute_actions` — kept
+            // here only so this match stays exhaustive against `Action`.
+            Action::SyncClipboard => {}
         }
         Ok(())
     }
@@ -489,9 +738,14 @@ fn clamp_i16(v: i32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::{InputEvent, Session};
+    use crate::config::Config;
     use crate::error::PlatformError;
+    use crate::net::bulk::BulkChannel;
     use crate::net::control::ControlChannel;
-    use crate::protocol::{ControlMessage, KeyCode, Modifiers, MouseButton, OsKind};
+    use crate::protocol::{
+        BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, KeyCode, Modifiers,
+        MouseButton, OsKind,
+    };
     use crate::remap::RemapTable;
     use crate::state::{State, StateMachine};
     use crate::topology::{Layout, NodeId, Rect};
@@ -597,42 +851,142 @@ mod tests {
         layout
     }
 
-    fn session_with(
+    /// A `ClipboardProvider` mock: `watch` fires `initial` immediately (if
+    /// any), mirroring the real on-connect-sync contract, and every
+    /// `set_text`/`set_image` call is recorded for assertions.
+    #[derive(Clone, Default)]
+    struct RecordingClipboard {
+        initial: Option<ClipboardEvent>,
+        set_texts: Arc<Mutex<Vec<String>>>,
+        set_images: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl ClipboardProvider for RecordingClipboard {
+        fn watch(&mut self, sink: UnboundedSender<ClipboardEvent>) -> Result<(), PlatformError> {
+            if let Some(event) = self.initial.clone() {
+                sink.send(event).expect("receiver still open");
+            }
+            Ok(())
+        }
+        fn set_text(&mut self, text: &str) -> Result<(), PlatformError> {
+            self.set_texts
+                .lock()
+                .expect("mutex poisoned")
+                .push(text.to_string());
+            Ok(())
+        }
+        fn set_image(&mut self, png_bytes: &[u8]) -> Result<(), PlatformError> {
+            self.set_images
+                .lock()
+                .expect("mutex poisoned")
+                .push(png_bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Builds a connected `BulkChannel` pair over real loopback TCP, same
+    /// pattern as `loopback_pair` for the control channel.
+    async fn bulk_loopback_pair() -> (BulkChannel, BulkChannel) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server =
+            tokio::spawn(async move { BulkChannel::accept(&listener).await.expect("accept") });
+        let client = BulkChannel::connect(addr).await.expect("connect");
+        let server = server.await.expect("server task");
+        (client, server)
+    }
+
+    async fn session_with(
         control: ControlChannel,
         local: NodeId,
         layout: Layout,
     ) -> (Session, RecordingSink, Arc<Mutex<Vec<bool>>>) {
-        session_with_remap(control, local, layout, RemapTable::default())
+        let (session, sink, _clipboard, suppressed) = session_with_full(
+            control,
+            local,
+            layout,
+            Config::new_default(),
+            RecordingClipboard::default(),
+        )
+        .await;
+        (session, sink, suppressed)
     }
 
-    fn session_with_remap(
+    async fn session_with_remap(
         control: ControlChannel,
         local: NodeId,
         layout: Layout,
         remap: RemapTable,
     ) -> (Session, RecordingSink, Arc<Mutex<Vec<bool>>>) {
+        let mut config = Config::new_default();
+        config.remap = remap;
+        let (session, sink, _clipboard, suppressed) = session_with_full(
+            control,
+            local,
+            layout,
+            config,
+            RecordingClipboard::default(),
+        )
+        .await;
+        (session, sink, suppressed)
+    }
+
+    async fn session_with_clipboard(
+        control: ControlChannel,
+        local: NodeId,
+        layout: Layout,
+        clipboard: RecordingClipboard,
+    ) -> (
+        Session,
+        RecordingSink,
+        RecordingClipboard,
+        Arc<Mutex<Vec<bool>>>,
+    ) {
+        session_with_full(control, local, layout, Config::new_default(), clipboard).await
+    }
+
+    async fn session_with_full(
+        control: ControlChannel,
+        local: NodeId,
+        layout: Layout,
+        config: Config,
+        clipboard: RecordingClipboard,
+    ) -> (
+        Session,
+        RecordingSink,
+        RecordingClipboard,
+        Arc<Mutex<Vec<bool>>>,
+    ) {
         let sm = StateMachine::new(local, bounds(), layout);
         let suppressed = Arc::new(Mutex::new(Vec::new()));
         let capture = NoopCapture {
             suppressed: suppressed.clone(),
         };
         let sink = RecordingSink::default();
+        // Only one end is ever driven directly in these tests (via
+        // `handle_local_clipboard_event`/`handle_bulk_message`, not the
+        // real `run()` select loop), so the peer end just needs to stay
+        // alive — kept in the returned tuple's drop scope by virtue of
+        // `bulk_loopback_pair`'s server task, not read from here.
+        let (bulk, _peer_bulk) = bulk_loopback_pair().await;
         let session = Session::new(
             sm,
             control,
+            bulk,
             Box::new(capture),
             Box::new(sink.clone()),
-            remap,
+            Box::new(clipboard.clone()),
+            &config,
         )
         .expect("session construction");
-        (session, sink, suppressed)
+        (session, sink, clipboard, suppressed)
     }
 
     #[tokio::test]
     async fn constructing_a_session_reaches_local_active() {
         let (a, a_node, b, b_node) = loopback_pair().await;
         let layout = adjacent_layout(a_node, b_node, true);
-        let (session, ..) = session_with(a, a_node, layout);
+        let (session, ..) = session_with(a, a_node, layout).await;
         assert_eq!(session.state(), State::LocalActive);
         // b's side of the channel is unused in this test but stays bound
         // (not dropped) so the connection doesn't look closed to a.
@@ -649,8 +1003,10 @@ mod tests {
         let a_layout = adjacent_layout(a_node, b_node, true);
         let b_layout = adjacent_layout(b_node, a_node, false);
 
-        let (mut a_session, _a_sink, a_suppressed) = session_with(a_control, a_node, a_layout);
-        let (mut b_session, b_sink, _b_suppressed) = session_with(b_control, b_node, b_layout);
+        let (mut a_session, _a_sink, a_suppressed) =
+            session_with(a_control, a_node, a_layout).await;
+        let (mut b_session, b_sink, _b_suppressed) =
+            session_with(b_control, b_node, b_layout).await;
 
         // A slides its cursor to the right edge -> should hand off to B.
         a_session
@@ -691,7 +1047,7 @@ mod tests {
     async fn escape_combo_is_detected_even_though_forwarding_would_be_suppressed() {
         let (a_control, a_node, b_control, b_node) = loopback_pair().await;
         let layout = adjacent_layout(a_node, b_node, true);
-        let (mut session, _sink, suppressed) = session_with(a_control, a_node, layout);
+        let (mut session, _sink, suppressed) = session_with(a_control, a_node, layout).await;
         // Kept alive (never read from) so every `control.send()` below has
         // somewhere to land — a dropped peer socket makes send() failure
         // timing-dependent, and this test cares about the state machine's
@@ -734,7 +1090,7 @@ mod tests {
     async fn modifier_state_sync_injects_only_the_changed_keys() {
         let (a_control, a_node, b_control, b_node) = loopback_pair().await;
         let layout = adjacent_layout(a_node, b_node, true);
-        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout);
+        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout).await;
         let _b_control = b_control;
 
         session
@@ -777,7 +1133,7 @@ mod tests {
     async fn relayed_input_is_ignored_outside_being_driven() {
         let (a_control, a_node, b_control, b_node) = loopback_pair().await;
         let layout = adjacent_layout(a_node, b_node, true);
-        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout);
+        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout).await;
         let _b_control = b_control;
         assert_eq!(session.state(), State::LocalActive);
 
@@ -803,7 +1159,8 @@ mod tests {
             a_node,
             layout,
             RemapTable::windows_keyboard_on_mac(),
-        );
+        )
+        .await;
         let _b_control = b_control;
 
         // Force BeingDriven directly (bypassing a real handoff) — this test
@@ -851,7 +1208,8 @@ mod tests {
             a_node,
             layout,
             RemapTable::windows_keyboard_on_mac(),
-        );
+        )
+        .await;
         let _b_control = b_control;
 
         session
@@ -883,7 +1241,8 @@ mod tests {
             invert_scroll_y: true,
             ..RemapTable::default()
         };
-        let (mut session, sink, _suppressed) = session_with_remap(a_control, a_node, layout, table);
+        let (mut session, sink, _suppressed) =
+            session_with_remap(a_control, a_node, layout, table).await;
         let _b_control = b_control;
 
         session
@@ -911,26 +1270,280 @@ mod tests {
         );
     }
 
-    // Compile-time proof that ClipboardProvider/ScreenInfo mocks still
-    // satisfy the trait boundary after M3/M4's additions — mirrors
-    // traits.rs's own tests, kept here too since session.rs is the module
-    // most likely to break that boundary by accident.
-    #[allow(dead_code)]
-    struct UnusedClipboard;
-    impl ClipboardProvider for UnusedClipboard {
-        fn watch(
-            &mut self,
-            _sink: UnboundedSender<crate::protocol::ClipboardEvent>,
-        ) -> Result<(), PlatformError> {
-            Ok(())
-        }
-        fn set_text(&mut self, _text: &str) -> Result<(), PlatformError> {
-            Ok(())
-        }
-        fn set_image(&mut self, _png_bytes: &[u8]) -> Result<(), PlatformError> {
-            Ok(())
-        }
+    /// The M7 demo (Tier 13), text half: copying on one machine syncs to
+    /// the other over the control channel, inline.
+    #[tokio::test]
+    async fn local_text_change_is_synced_to_the_peer() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, ..) = session_with(a_control, a_node, layout).await;
+
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Text("hello from A".to_string()))
+            .await
+            .expect("sync text");
+
+        let msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            msg,
+            ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::Text("hello from A".to_string()),
+            }
+        );
     }
+
+    /// The M7 demo, image half: an image never touches the control
+    /// channel — only an offer does, with the bytes themselves following on
+    /// the bulk channel (Tier 7.4).
+    #[tokio::test]
+    async fn local_image_change_is_offered_on_control_then_sent_on_bulk() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let sm = StateMachine::new(a_node, bounds(), layout);
+        let capture = NoopCapture {
+            suppressed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (a_bulk, mut b_bulk) = bulk_loopback_pair().await;
+        let mut session = Session::new(
+            sm,
+            a_control,
+            a_bulk,
+            Box::new(capture),
+            Box::new(RecordingSink::default()),
+            Box::new(RecordingClipboard::default()),
+            &Config::new_default(),
+        )
+        .expect("session construction");
+
+        let png_bytes = vec![1u8, 2, 3, 4];
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Image {
+                mime: "image/png".to_string(),
+                data: png_bytes.clone(),
+            })
+            .await
+            .expect("sync image");
+
+        let control_msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            control_msg,
+            ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::ImageOffer {
+                    mime: "image/png".to_string(),
+                    size: png_bytes.len() as u64,
+                },
+            }
+        );
+
+        let bulk_msg = b_bulk.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            bulk_msg,
+            BulkMessage::ClipboardBlob {
+                seq: 1,
+                mime: "image/png".to_string(),
+                data: png_bytes,
+            }
+        );
+    }
+
+    /// The clipboard-sync equivalent of the stuck-modifier test: applying a
+    /// peer update must not bounce right back to them as if it were a fresh
+    /// local edit, but a genuinely new local change afterward still syncs.
+    #[tokio::test]
+    async fn applying_a_peer_update_does_not_echo_back_to_the_peer() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, clipboard, _suppressed) =
+            session_with_clipboard(a_control, a_node, layout, RecordingClipboard::default()).await;
+
+        session
+            .handle_control_message(ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::Text("from peer".to_string()),
+            })
+            .await
+            .expect("apply peer update");
+        assert_eq!(
+            *clipboard.set_texts.lock().expect("mutex poisoned"),
+            vec!["from peer".to_string()]
+        );
+
+        // Our own watcher, having just observed that exact write, reports
+        // it back through the local-change path — must be swallowed.
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Text("from peer".to_string()))
+            .await
+            .expect("handle echo");
+        // A genuinely new local change afterward must still sync normally.
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Text("actually new".to_string()))
+            .await
+            .expect("handle new change");
+
+        let msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            msg,
+            ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::Text("actually new".to_string()),
+            }
+        );
+    }
+
+    /// Tier 7.4: content over the size limit is skipped entirely — not
+    /// partially sent — and doesn't consume a `seq`.
+    #[tokio::test]
+    async fn oversized_text_is_not_synced() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, ..) = session_with(a_control, a_node, layout).await;
+
+        let huge = "x".repeat(300 * 1024);
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Text(huge))
+            .await
+            .expect("handle oversized text");
+        session
+            .handle_local_clipboard_event(ClipboardEvent::Text("fits fine".to_string()))
+            .await
+            .expect("handle normal text");
+
+        let msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(
+            msg,
+            ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::Text("fits fine".to_string()),
+            }
+        );
+    }
+
+    /// Tier 6.3's `seq` rule: an update at or below the highest `seq`
+    /// already accepted is ignored.
+    #[tokio::test]
+    async fn stale_clipboard_update_is_ignored() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, clipboard, _suppressed) =
+            session_with_clipboard(a_control, a_node, layout, RecordingClipboard::default()).await;
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::ClipboardUpdate {
+                seq: 5,
+                content: ClipboardContent::Text("newer".to_string()),
+            })
+            .await
+            .expect("apply newer update");
+        session
+            .handle_control_message(ControlMessage::ClipboardUpdate {
+                seq: 3,
+                content: ClipboardContent::Text("stale".to_string()),
+            })
+            .await
+            .expect("stale update should not error");
+
+        assert_eq!(
+            *clipboard.set_texts.lock().expect("mutex poisoned"),
+            vec!["newer".to_string()]
+        );
+    }
+
+    /// An `ImageOffer` alone doesn't carry bytes — the image is only
+    /// applied once its matching `ClipboardBlob` arrives on the bulk
+    /// channel.
+    #[tokio::test]
+    async fn image_offer_is_applied_once_its_bulk_blob_arrives() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, clipboard, _suppressed) =
+            session_with_clipboard(a_control, a_node, layout, RecordingClipboard::default()).await;
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::ImageOffer {
+                    mime: "image/png".to_string(),
+                    size: 4,
+                },
+            })
+            .await
+            .expect("accept offer");
+        assert!(
+            clipboard
+                .set_images
+                .lock()
+                .expect("mutex poisoned")
+                .is_empty()
+        );
+
+        session
+            .handle_bulk_message(BulkMessage::ClipboardBlob {
+                seq: 1,
+                mime: "image/png".to_string(),
+                data: vec![1, 2, 3, 4],
+            })
+            .expect("apply blob");
+
+        assert_eq!(
+            *clipboard.set_images.lock().expect("mutex poisoned"),
+            vec![vec![1, 2, 3, 4]]
+        );
+    }
+
+    /// The size cap is enforced on the offer itself — the receiving side
+    /// never waits on (or applies) a blob for an offer it already rejected.
+    #[tokio::test]
+    async fn oversized_image_offer_is_rejected_without_applying_its_blob() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let mut config = Config::new_default();
+        config.clipboard_max_bytes = 10;
+        let (mut session, _sink, clipboard, _suppressed) = session_with_full(
+            a_control,
+            a_node,
+            layout,
+            config,
+            RecordingClipboard::default(),
+        )
+        .await;
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::ClipboardUpdate {
+                seq: 1,
+                content: ClipboardContent::ImageOffer {
+                    mime: "image/png".to_string(),
+                    size: 1000,
+                },
+            })
+            .await
+            .expect("offer over cap should not error");
+        session
+            .handle_bulk_message(BulkMessage::ClipboardBlob {
+                seq: 1,
+                mime: "image/png".to_string(),
+                data: vec![0; 1000],
+            })
+            .expect("blob for a rejected offer should not error");
+
+        assert!(
+            clipboard
+                .set_images
+                .lock()
+                .expect("mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    // Compile-time proof that ScreenInfo mocks still satisfy the trait
+    // boundary after M3/M4/M7's additions — mirrors traits.rs's own tests,
+    // kept here too since session.rs is the module most likely to break
+    // that boundary by accident. (`ClipboardProvider` gets the same
+    // coverage for real, above, via `RecordingClipboard`.)
     #[allow(dead_code)]
     struct UnusedScreens;
     impl ScreenInfo for UnusedScreens {

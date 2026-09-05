@@ -1,5 +1,6 @@
-//! Persisted per-machine settings: node identity, display name, and the
-//! modifier remap table (Tier 3.2's `config.rs`, M6 of the build guide).
+//! Persisted per-machine settings: node identity, display name, the
+//! modifier remap table (Tier 3.2's `config.rs`, M6 of the build guide),
+//! and the clipboard sync size cap (M7, Tier 7.4).
 //!
 //! Stored as TOML in the OS's standard per-user config directory via
 //! `directories::ProjectDirs`. Deliberately excludes anything a later
@@ -33,6 +34,12 @@ pub struct Config {
     /// This machine's modifier remap table and scroll inversion, applied
     /// at injection time to whatever the peer sends us (Tier 7.3).
     pub remap: RemapTable,
+    /// Hard cap, in bytes, on clipboard content we'll sync to the peer
+    /// (Tier 7.4). Content over this is skipped entirely — not truncated —
+    /// and logged. Defaults to 10 MB. `#[serde(default)]` so a config file
+    /// written before this field existed (M6) still loads.
+    #[serde(default = "default_clipboard_max_bytes")]
+    pub clipboard_max_bytes: u64,
 }
 
 /// Things that can go wrong loading or saving [`Config`].
@@ -55,13 +62,15 @@ pub enum ConfigError {
 
 impl Config {
     /// A fresh default config: a new random node identity, no remap rules,
-    /// and a hostname-derived display name.
+    /// a hostname-derived display name, and the default 10 MB clipboard
+    /// cap.
     #[must_use]
     pub fn new_default() -> Self {
         Self {
             node_id: NodeId::new(),
             display_name: default_display_name(),
             remap: RemapTable::default(),
+            clipboard_max_bytes: default_clipboard_max_bytes(),
         }
     }
 
@@ -121,6 +130,11 @@ fn default_display_name() -> String {
         .unwrap_or_else(|_| "Unnamed machine".to_string())
 }
 
+/// 10 MB — Tier 7.4's default clipboard sync size cap.
+fn default_clipboard_max_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -171,5 +185,25 @@ mod tests {
 
         let result = Config::load_or_create(&path);
         assert!(result.is_err());
+    }
+
+    /// M6 wrote config files without `clipboard_max_bytes` (added in M7).
+    /// Loading one of those must not fail — it should fall back to the
+    /// default cap via `#[serde(default)]`.
+    #[test]
+    fn config_written_before_clipboard_cap_existed_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let pre_m7_toml = format!(
+            "node_id = \"{}\"\ndisplay_name = \"old machine\"\n\n[remap]\nrules = []\ninvert_scroll_y = false\ninvert_scroll_x = false\n",
+            uuid::Uuid::new_v4()
+        );
+        std::fs::write(&path, pre_m7_toml).expect("write pre-M7 config");
+
+        let loaded = Config::load_or_create(&path).expect("load");
+        assert_eq!(
+            loaded.clipboard_max_bytes,
+            super::default_clipboard_max_bytes()
+        );
     }
 }

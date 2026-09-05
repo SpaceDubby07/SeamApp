@@ -19,25 +19,38 @@
 //! On machine B (the "connector"), using A's LAN IP:
 //!   cargo run -p seam-platform --example windows_handoff_demo -- connect 192.168.1.50
 //!
+//! Both the control port (24800) and the bulk port (24801, Tier 6.5:
+//! control port + 1) are fixed — this demo doesn't take a custom port.
+//!
 //! Push your cursor to the shared edge (A's right / B's left) to hand
 //! off. Ctrl+Alt+Shift+Escape forces control back to whichever machine
-//! you press it on, regardless of who's currently driving.
+//! you press it on, regardless of who's currently driving. Copying text or
+//! an image on either machine syncs it to the other's clipboard (M7).
 //!
 //! Append `--remap windows-on-mac` to either invocation to load the
 //! Ctrl<->Cmd remap preset for that run (M6, Tier 7.3) — mostly useful for
 //! poking at the remap table's config persistence with two Windows boxes,
 //! since the real Ctrl<->Cmd swap only matters once one side is a Mac.
 
+/// Control port (Tier 6.5). Fixed for this demo — no custom-port support.
+#[cfg(windows)]
+const CONTROL_PORT: u16 = 24800;
+
+/// Bulk port: control port + 1, by the same Tier 6.5 convention.
+#[cfg(windows)]
+const BULK_PORT: u16 = 24801;
+
 #[cfg(windows)]
 fn main() {
     use seam_core::config::Config;
+    use seam_core::net::bulk::BulkChannel;
     use seam_core::net::control::ControlChannel;
     use seam_core::protocol::OsKind;
     use seam_core::session::Session;
     use seam_core::state::StateMachine;
     use seam_core::topology::{Layout, Rect};
     use seam_core::traits::ScreenInfo;
-    use seam_platform::windows::{Capture, Screens, Sink};
+    use seam_platform::windows::{Capture, Clipboard, Screens, Sink};
 
     tracing_subscriber::fmt::init();
 
@@ -67,43 +80,56 @@ fn main() {
 
         let local_node = config.node_id;
 
-        let (control, peer_on_right) = match role {
+        let (control, bulk, peer_on_right) = match role {
             Some("listen") => {
-                let addr = "0.0.0.0:24800";
-                let listener = tokio::net::TcpListener::bind(addr)
+                let control_addr = format!("0.0.0.0:{CONTROL_PORT}");
+                let bulk_addr = format!("0.0.0.0:{BULK_PORT}");
+                let control_listener = tokio::net::TcpListener::bind(&control_addr)
                     .await
-                    .expect("failed to bind — is port 24800 already in use?");
-                println!("Listening on {addr}. Waiting for the peer to connect...");
+                    .expect("failed to bind the control port — already in use?");
+                let bulk_listener = tokio::net::TcpListener::bind(&bulk_addr)
+                    .await
+                    .expect("failed to bind the bulk port — already in use?");
+                println!(
+                    "Listening on {control_addr} (control) and {bulk_addr} (bulk). Waiting for the peer..."
+                );
                 let control = ControlChannel::accept(
-                    &listener,
+                    &control_listener,
                     local_node,
                     &config.display_name,
                     OsKind::Windows,
                 )
                 .await
-                .expect("handshake failed");
-                (control, true)
+                .expect("control handshake failed");
+                let bulk = BulkChannel::accept(&bulk_listener)
+                    .await
+                    .expect("bulk channel accept failed");
+                (control, bulk, true)
             }
             Some("connect") => {
-                let target = peer_arg.expect("usage: connect <peer-ip>[:24800]");
-                let target = if target.contains(':') {
-                    target
-                } else {
-                    format!("{target}:24800")
-                };
-                println!("Connecting to {target}...");
+                let host = peer_arg.expect("usage: connect <peer-host>");
+                // Both ports are fixed by convention (Tier 6.5); strip any
+                // port the user tacked on rather than trying to derive the
+                // bulk port from a custom control port.
+                let host = host.split(':').next().unwrap_or(&host).to_string();
+                let control_target = format!("{host}:{CONTROL_PORT}");
+                let bulk_target = format!("{host}:{BULK_PORT}");
+                println!("Connecting to {control_target} (control) and {bulk_target} (bulk)...");
                 let control = ControlChannel::connect(
-                    target,
+                    control_target,
                     local_node,
                     &config.display_name,
                     OsKind::Windows,
                 )
                 .await
-                .expect("handshake failed");
-                (control, false)
+                .expect("control handshake failed");
+                let bulk = BulkChannel::connect(bulk_target)
+                    .await
+                    .expect("bulk channel connect failed");
+                (control, bulk, false)
             }
             _ => {
-                eprintln!("usage: windows_handoff_demo listen | connect <peer-ip>[:24800]");
+                eprintln!("usage: windows_handoff_demo listen | connect <peer-host>");
                 std::process::exit(1);
             }
         };
@@ -131,13 +157,17 @@ fn main() {
         let state_machine = StateMachine::new(local_node, local_bounds, layout);
         let capture = Box::new(Capture::new());
         let sink = Box::new(Sink::new());
+        let clipboard = Box::new(Clipboard::new());
 
-        let session = Session::new(state_machine, control, capture, sink, config.remap).expect(
-            "failed to start input capture — run this interactively, not as a scheduled task",
-        );
+        let session = Session::new(state_machine, control, bulk, capture, sink, clipboard, &config)
+            .expect(
+                "failed to start input capture/clipboard watch — run this interactively, not \
+                 as a scheduled task",
+            );
 
         println!("Session running. Push your cursor to the shared edge to hand off.");
         println!("Ctrl+Alt+Shift+Escape forces control back to whichever machine you press it on.");
+        println!("Clipboard sync is live — copy text or an image on either machine.");
 
         if let Err(e) = session.run().await {
             eprintln!("session ended: {e}");
