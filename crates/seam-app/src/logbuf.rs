@@ -3,12 +3,15 @@
 //! file.
 //!
 //! A [`BufferLayer`] is installed alongside the file/stdout layers in
-//! `init_logging`; it copies every record that passes the global
-//! `EnvFilter` into a bounded [`VecDeque`]. `commands::{get_logs,
-//! export_logs, clear_logs}` read and manage it. Everything here is
-//! process-global (one capture instance per process, like the rest of the
-//! app) and lock-guarded; the layer does only a format + push under the
-//! lock, so it stays cheap enough to sit on every logging call.
+//! `init_logging`, with its own [`filter`] (our crates at `TRACE`,
+//! everything else at `WARN`) so the Log panel can show per-move `trace!`
+//! detail without the user having to set `RUST_LOG` — the file/stdout
+//! layers stay governed by the global `EnvFilter`. It copies each matching
+//! record into a bounded [`VecDeque`]; `commands::{get_logs, export_logs,
+//! clear_logs}` read and manage it. Everything here is process-global (one
+//! capture instance per process, like the rest of the app) and
+//! lock-guarded; the layer does only a format + push under the lock, so it
+//! stays cheap enough to sit on every logging call.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -19,7 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::Context;
 
 /// Most recent lines kept. ~5k lines is enough to span a full connect →
@@ -124,6 +129,19 @@ impl<S: Subscriber> Layer<S> for BufferLayer {
 #[must_use]
 pub fn layer() -> BufferLayer {
     BufferLayer
+}
+
+/// Per-layer filter for the buffer: everything from the app's own crates
+/// (down to `trace`), plus `warn`+ from dependencies. Deliberately
+/// independent of `RUST_LOG` so the in-app Log panel always has the
+/// detail available; the frontend narrows it down with its level dropdown.
+#[must_use]
+pub fn filter() -> Targets {
+    Targets::new()
+        .with_target("seam_core", LevelFilter::TRACE)
+        .with_target("seam_platform", LevelFilter::TRACE)
+        .with_target("seam_app_lib", LevelFilter::TRACE)
+        .with_default(LevelFilter::WARN)
 }
 
 /// Pulls the `message` field out on its own and renders every other field

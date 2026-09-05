@@ -31,23 +31,40 @@ pub(crate) fn log_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-/// Sets up structured logging to both a rolling daily file and stdout.
+/// Sets up structured logging to a rolling daily file, stdout, and the
+/// in-app Log panel's ring buffer.
 ///
-/// `RUST_LOG` overrides the default filter, which shows our own crates at
-/// `debug` and everything else (tokio internals, etc.) at `warn` so they
-/// don't drown out application logs.
+/// The file and stdout layers are governed by `RUST_LOG` (default: our own
+/// crates at `debug`, everything else at `warn`). The buffer layer carries
+/// its own, more permissive filter ([`logbuf::filter`]) so the Log panel
+/// always has `trace`-level detail regardless of `RUST_LOG` — the filters
+/// are attached PER LAYER (not as one global filter) precisely so the
+/// buffer can see callsites the file/stdout layers drop.
 fn init_logging() {
     let file_appender = tracing_appender::rolling::daily(log_dir(), "seam.log");
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    // `EnvFilter` isn't `Clone`; build a fresh one per layer from the same
+    // source (`RUST_LOG`, or the default string).
+    let env_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("warn,seam_core=debug,seam_platform=debug,seam_app_lib=debug")
-        }))
-        .with(fmt::layer().with_writer(file_appender).json())
-        .with(fmt::layer().with_writer(std::io::stdout).pretty())
-        // Mirror everything the filter lets through into the in-memory
-        // ring buffer the frontend's Log panel reads.
-        .with(logbuf::layer())
+        })
+    };
+
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(file_appender)
+                .json()
+                .with_filter(env_filter()),
+        )
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .pretty()
+                .with_filter(env_filter()),
+        )
+        .with(logbuf::layer().with_filter(logbuf::filter()))
         .init();
 }
 
