@@ -26,7 +26,18 @@ const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 
 /// How far (in pixels) the cursor has to move back inward from a handoff
 /// edge before we treat it as a reclaim attempt, rather than jitter.
-const RECLAIM_THRESHOLD_PX: i32 = 4;
+///
+/// Real hardware testing (Tier 13's M4 dogfooding) found 4px — this
+/// constant's original value — was nowhere near enough: reclaim isn't
+/// cooldown-gated (see `handoff_cooldown_blocks_immediate_reverse_handoff`;
+/// a deliberate pull-back should feel instant), so any few-pixel wobble
+/// right after a handoff — completely ordinary mouse/trackpad jitter,
+/// especially once real motion deltas are being tracked accurately —
+/// immediately reclaimed control, making a real drag across the edge feel
+/// like it kept "resetting and ungrabbing." 40px is a deliberate motion no
+/// normal jitter produces, while still reading as instant to a human
+/// pulling back on purpose.
+const RECLAIM_THRESHOLD_PX: i32 = 40;
 
 /// The handoff state machine's current mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,8 +661,11 @@ mod tests {
 
         // Immediately try to reclaim well within the cooldown window — the
         // *reclaim* path itself isn't cooldown-gated (only the outward
-        // handoff is, per Tier 7.2), so this should still succeed...
-        let actions = sm.handle(Input::CursorMoved(Point { x: 1900, y: 540 }), t0);
+        // handoff is, per Tier 7.2), so this should still succeed... a
+        // deliberate 59px pull-back, comfortably past RECLAIM_THRESHOLD_PX
+        // (jitter-sized wobbles must NOT reclaim — that's the whole point
+        // of the threshold).
+        let actions = sm.handle(Input::CursorMoved(Point { x: 1860, y: 540 }), t0);
         assert_eq!(sm.state(), State::LocalActive);
         assert!(actions.contains(&Action::SendReclaim));
 

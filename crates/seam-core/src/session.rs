@@ -1936,7 +1936,7 @@ mod tests {
         // threshold must reclaim, even though no `MouseMoveAbs` ever
         // reported a position off the edge.
         session
-            .handle_capture_event(InputEvent::MouseDelta { dx: -10, dy: 0 })
+            .handle_capture_event(InputEvent::MouseDelta { dx: -50, dy: 0 })
             .await
             .expect("reclaim delta");
         assert_eq!(session.state(), State::LocalActive);
