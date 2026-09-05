@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::net::tls::{Fingerprint, Trust};
 use crate::remap::RemapTable;
 use crate::topology::NodeId;
+use crate::transfer::AcceptPolicy;
 
 /// The app identity used to locate the config directory: matches
 /// `seam-app`'s own `ProjectDirs::from("com", "zach", "seam")` for the log
@@ -49,6 +50,19 @@ pub struct Config {
     /// (M6/M7) still loads, as "not yet paired with anyone."
     #[serde(default)]
     pub paired_peer: Option<PairedPeer>,
+    /// Whether to prompt, always accept, or always deny incoming file
+    /// transfer offers from the paired peer (Tier 7.5, M10).
+    /// `#[serde(default)]` so a config file written before M10 still
+    /// loads, defaulting to `AcceptPolicy::Ask`.
+    #[serde(default)]
+    pub accept_policy: AcceptPolicy,
+    /// Where accepted incoming files are written. `None` means "the OS
+    /// Downloads folder," resolved lazily via [`Self::resolved_download_dir`]
+    /// rather than baked in at config-creation time, so it still tracks a
+    /// later OS-level change. `#[serde(default)]` for the same pre-M10
+    /// compatibility reason as `accept_policy`.
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
 }
 
 /// The peer this machine has paired with: its node identity and the
@@ -92,7 +106,22 @@ impl Config {
             remap: RemapTable::default(),
             clipboard_max_bytes: default_clipboard_max_bytes(),
             paired_peer: None,
+            accept_policy: AcceptPolicy::default(),
+            download_dir: None,
         }
+    }
+
+    /// Where incoming transfers should be written: `download_dir` if set,
+    /// else the OS's standard Downloads folder, else the current
+    /// directory as a last resort (e.g. a CI/test environment with no
+    /// concept of a home directory).
+    #[must_use]
+    pub fn resolved_download_dir(&self) -> PathBuf {
+        self.download_dir.clone().unwrap_or_else(|| {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
     }
 
     /// Which [`Trust`] mode a connection attempt should use: pinned to our

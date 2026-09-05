@@ -45,6 +45,13 @@
 //! through. Running `connect`/`listen` again against an already-paired
 //! peer whose certificate has since changed (e.g. a re-imaged machine, or
 //! an actual attacker) hard-fails instead of silently reconnecting.
+//!
+//! Append `--send <path>` to either invocation to offer that file to the
+//! peer once connected (M10, Tier 7.5) — progress and completion print to
+//! the console, standing in for the eventual UI's progress bar. This demo
+//! always auto-accepts incoming offers (writing them to the OS Downloads
+//! folder) rather than exercising `AcceptPolicy::Ask`'s prompt flow, which
+//! needs real UI (M11) to be worth wiring up here.
 
 /// Control port (Tier 6.5). Fixed for this demo — no custom-port support.
 #[cfg(windows)]
@@ -67,6 +74,7 @@ fn main() {
     use seam_core::state::StateMachine;
     use seam_core::topology::{Layout, Rect};
     use seam_core::traits::ScreenInfo;
+    use seam_core::transfer::{AcceptPolicy, SessionCommand, TransferEvent};
     use seam_platform::windows::{Capture, Clipboard, Screens, Sink};
 
     tracing_subscriber::fmt::init();
@@ -74,6 +82,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).cloned();
     let peer_arg = args.get(2).cloned();
+    // M10: `--send <path>` anywhere in the arguments queues that file for
+    // send once connected — independent of `--remap`'s fixed position,
+    // since either flag may or may not be present on a given run.
+    let send_path = args
+        .iter()
+        .position(|a| a == "--send")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
 
     // M6: node identity, display name, and the remap table now come from
     // persisted config rather than being regenerated every run — pass
@@ -87,6 +103,10 @@ fn main() {
         config.remap = seam_core::remap::RemapTable::windows_keyboard_on_mac();
         println!("Using the windows-keyboard-on-mac remap preset for this run.");
     }
+    // M10: this demo has no prompt UI for `AcceptPolicy::Ask`, so it
+    // always auto-accepts — a real UI (M11) is where `Ask`'s prompt flow
+    // actually belongs.
+    config.accept_policy = AcceptPolicy::AlwaysAccept;
 
     // M8: this machine's own TLS identity, generated once and reused for
     // every run (Tier 7.6).
@@ -272,7 +292,7 @@ fn main() {
         let sink = Box::new(Sink::new());
         let clipboard = Box::new(Clipboard::new());
 
-        let session = Session::new(
+        let (session, handle) = Session::new(
             state_machine,
             control,
             bulk,
@@ -285,10 +305,63 @@ fn main() {
             "failed to start input capture/clipboard watch — run this interactively, not \
                  as a scheduled task",
         );
+        let seam_core::session::SessionHandle {
+            command_tx,
+            mut event_rx,
+        } = handle;
+        let event_task_command_tx = command_tx.clone();
 
         println!("Session running. Push your cursor to the shared edge to hand off.");
         println!("Ctrl+Alt+Shift+Escape forces control back to whichever machine you press it on.");
         println!("Clipboard sync is live — copy text or an image on either machine.");
+        println!(
+            "Downloads folder for incoming transfers: {}",
+            config.resolved_download_dir().display()
+        );
+
+        // M10: prints transfer progress/completion to the console, standing
+        // in for the eventual UI's progress bar (Tier 8.1's Transfers
+        // panel).
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    TransferEvent::OfferReceived {
+                        transfer_id,
+                        manifest,
+                    } => {
+                        println!(
+                            "Incoming file '{}' ({} bytes) offered — accepting.",
+                            manifest.name, manifest.size
+                        );
+                        let _ = event_task_command_tx.send(SessionCommand::RespondToOffer {
+                            transfer_id,
+                            accept: true,
+                        });
+                    }
+                    TransferEvent::Progress {
+                        bytes_done, total, ..
+                    } => {
+                        println!("transfer progress: {bytes_done}/{total} bytes");
+                    }
+                    TransferEvent::Rejected { reason, .. } => {
+                        println!("transfer rejected: {reason}");
+                    }
+                    TransferEvent::Completed { path, .. } => {
+                        println!("transfer complete: {}", path.display());
+                    }
+                    TransferEvent::Failed { reason, .. } => {
+                        println!("transfer failed: {reason}");
+                    }
+                }
+            }
+        });
+
+        if let Some(path) = send_path {
+            println!("Offering {} to the peer...", path.display());
+            command_tx
+                .send(SessionCommand::SendFile(path))
+                .expect("session command channel closed");
+        }
 
         if let Err(e) = session.run().await {
             eprintln!("session ended: {e}");

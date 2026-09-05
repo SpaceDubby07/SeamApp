@@ -8,7 +8,6 @@
 //! Windows so far (M1) and macOS lands in M5.
 //!
 //! # What's deliberately NOT here yet
-//! - Transfer coordination (`TransferOffer` and friends) — M10.
 //! - Dynamic `ScreenConfig` handling on resolution change — not scheduled
 //!   to a specific milestone yet.
 //! - Reconnect on disconnect — M12. `Action::StartReconnect` currently
@@ -17,22 +16,28 @@
 //!   supervisor." Pings are sent and answered, but a silent peer alone
 //!   doesn't yet trigger a disconnect.
 
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::Config;
 use crate::error::PlatformError;
 use crate::net::bulk::BulkChannel;
 use crate::net::control::{ControlChannel, now_micros};
 use crate::protocol::{
-    BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, KeyCode, Modifiers,
-    ProtocolError,
+    BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, FileManifest, KeyCode,
+    Modifiers, ProtocolError, TransferId,
 };
 use crate::remap::RemapTable;
 use crate::state::{Action, Input, State, StateMachine};
 use crate::topology::{Point, Rect};
 use crate::traits::{ClipboardProvider, InputCapture, InputSink};
+use crate::transfer::manifest::{build_manifest, sanitize_file_name};
+use crate::transfer::{
+    AcceptPolicy, CHUNK_SIZE, IncomingTransfer, OutgoingTransfer, SessionCommand, TransferEvent,
+};
 
 pub use crate::protocol::InputEvent;
 
@@ -115,6 +120,48 @@ pub struct Session {
     /// update back and forth forever).
     last_applied_from_peer: Option<ClipboardEvent>,
     ping_seq: u64,
+    /// Files queued to offer once whatever's currently sending (if
+    /// anything) finishes — v1 sends one file at a time (Tier 15's
+    /// single-peer simplification applied to transfers; nothing about the
+    /// wire protocol requires this).
+    pending_sends: VecDeque<PathBuf>,
+    /// The transfer currently being sent, from the `TransferOffer` up
+    /// through however many chunks have gone out. `None` means nothing is
+    /// being sent right now.
+    current_outgoing: Option<OutgoingTransfer>,
+    /// Transfers currently being received, keyed by id.
+    incoming_transfers: HashMap<TransferId, IncomingTransfer>,
+    /// Incoming offers awaiting a human decision under
+    /// `AcceptPolicy::Ask` — the file isn't opened for writing until
+    /// `RespondToOffer { accept: true, .. }` arrives.
+    pending_offers: HashMap<TransferId, FileManifest>,
+    /// This machine's policy for incoming offers from the (single, v1)
+    /// paired peer (Tier 7.5).
+    accept_policy: AcceptPolicy,
+    /// Where accepted incoming files are written.
+    download_dir: PathBuf,
+    /// Commands from whatever's driving this session (Tier 4.5: channels,
+    /// not a method call, since `run` owns the only handle to the live
+    /// channels once it's running).
+    command_rx: UnboundedReceiver<SessionCommand>,
+    /// `false` once `command_rx`'s sender (the driver's [`SessionHandle`])
+    /// is dropped — same guard pattern as `bulk_open` in `run`, so a
+    /// closed channel doesn't turn into a busy-loop.
+    commands_open: bool,
+    /// Where transfer progress/completion/offers are reported to whatever
+    /// is driving this session.
+    event_tx: UnboundedSender<TransferEvent>,
+}
+
+/// The other end of a running [`Session`]'s command/event channels —
+/// returned alongside it from [`Session::new`] so a driver (a CLI demo
+/// today; a Tauri command layer eventually) can send it work and observe
+/// transfer progress without blocking `run`'s select loop.
+pub struct SessionHandle {
+    /// Send [`SessionCommand`]s into the running session.
+    pub command_tx: UnboundedSender<SessionCommand>,
+    /// Receive [`TransferEvent`]s from the running session.
+    pub event_rx: UnboundedReceiver<TransferEvent>,
 }
 
 impl Session {
@@ -130,10 +177,14 @@ impl Session {
     /// clipboard watcher/setter; its `watch` call immediately seeds an
     /// on-connect sync if the local clipboard already holds something (see
     /// [`ClipboardProvider::watch`]'s contract). `config` supplies this
-    /// machine's own remap table (Tier 7.3) and clipboard size cap (Tier
-    /// 7.4) — only those two fields are read; `config.node_id`/
-    /// `display_name` already went into `control`'s handshake before this
-    /// call.
+    /// machine's own remap table (Tier 7.3), clipboard size cap (Tier
+    /// 7.4), and transfer accept policy/download directory (Tier 7.5) —
+    /// `config.node_id`/`display_name` already went into `control`'s
+    /// handshake before this call.
+    ///
+    /// Returns the session alongside a [`SessionHandle`] — the command/
+    /// event channel a driver uses to queue file sends and observe
+    /// transfer progress while `run` is blocking on its select loop.
     ///
     /// # Errors
     /// Returns an error if `capture` or `clipboard` fail to start (e.g. a
@@ -146,7 +197,7 @@ impl Session {
         sink: Box<dyn InputSink>,
         mut clipboard: Box<dyn ClipboardProvider>,
         config: &Config,
-    ) -> Result<Self, PlatformError> {
+    ) -> Result<(Self, SessionHandle), PlatformError> {
         let (tx, capture_rx) = tokio::sync::mpsc::unbounded_channel();
         capture.start(tx)?;
 
@@ -168,7 +219,10 @@ impl Session {
             }
         }
 
-        Ok(Self {
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let session = Self {
             state_machine,
             control,
             bulk,
@@ -186,7 +240,21 @@ impl Session {
             pending_image: None,
             last_applied_from_peer: None,
             ping_seq: 0,
-        })
+            pending_sends: VecDeque::new(),
+            current_outgoing: None,
+            incoming_transfers: HashMap::new(),
+            pending_offers: HashMap::new(),
+            accept_policy: config.accept_policy,
+            download_dir: config.resolved_download_dir(),
+            command_rx,
+            commands_open: true,
+            event_tx,
+        };
+        let handle = SessionHandle {
+            command_tx,
+            event_rx,
+        };
+        Ok((session, handle))
     }
 
     /// The current handoff state, mostly useful for logging/diagnostics.
@@ -247,13 +315,28 @@ impl Session {
                 }
                 msg = self.bulk.recv(), if bulk_open => {
                     match msg {
-                        Ok(Some(msg)) => self.handle_bulk_message(msg)?,
+                        Ok(Some(msg)) => self.handle_bulk_message(msg).await?,
                         Ok(None) => {
-                            tracing::info!("peer closed the bulk channel; clipboard images will no longer sync");
+                            tracing::info!("peer closed the bulk channel; clipboard images and file transfers will no longer sync");
                             bulk_open = false;
                         }
                         Err(e) => return Err(e.into()),
                     }
+                }
+                cmd = self.command_rx.recv(), if self.commands_open => {
+                    match cmd {
+                        Some(cmd) => self.handle_session_command(cmd).await?,
+                        None => self.commands_open = false,
+                    }
+                }
+                // M10: sends the next outgoing chunk one at a time, ready
+                // every tick this select loop runs whenever a transfer is
+                // actively sending — so a multi-gigabyte file never
+                // monopolizes this task for longer than one chunk write,
+                // keeping it interleaved with the input-latency-critical
+                // branches above (Tier 7.5's smoothness requirement).
+                () = std::future::ready(()), if self.ready_to_send_chunk() => {
+                    self.send_next_outgoing_chunk().await?;
                 }
                 _ = ping_interval.tick() => {
                     self.ping_seq += 1;
@@ -383,12 +466,29 @@ impl Session {
             ControlMessage::ClipboardUpdate { seq, content } => {
                 self.handle_remote_clipboard_update(seq, content)?;
             }
-            ControlMessage::TransferOffer { .. }
-            | ControlMessage::TransferAccept { .. }
-            | ControlMessage::TransferReject { .. }
-            | ControlMessage::TransferCancel { .. }
-            | ControlMessage::TransferComplete { .. } => {
-                tracing::debug!("file transfer not implemented until M10");
+            ControlMessage::TransferOffer {
+                transfer_id,
+                manifest,
+            } => {
+                self.handle_incoming_offer(transfer_id, manifest).await?;
+            }
+            ControlMessage::TransferAccept {
+                transfer_id,
+                resume_from,
+            } => {
+                self.handle_transfer_accept(transfer_id, resume_from).await;
+            }
+            ControlMessage::TransferReject {
+                transfer_id,
+                reason,
+            } => {
+                self.handle_transfer_reject(transfer_id, reason).await?;
+            }
+            ControlMessage::TransferCancel { transfer_id } => {
+                self.handle_transfer_cancel(transfer_id).await?;
+            }
+            ControlMessage::TransferComplete { transfer_id, hash } => {
+                self.handle_transfer_complete(transfer_id, hash).await?;
             }
             ControlMessage::ScreenConfig { .. } => {
                 tracing::debug!("dynamic screen config updates not implemented yet");
@@ -544,13 +644,12 @@ impl Session {
     }
 
     /// Handles a message on the bulk channel: applies a `ClipboardBlob`
-    /// that matches the pending image offer, and ignores anything else
-    /// (stale blob, or a `Chunk` — file transfer isn't implemented until
-    /// M10).
+    /// that matches the pending image offer (ignoring a stale one with no
+    /// match), or writes an incoming file transfer `Chunk`.
     ///
     /// # Errors
     /// Returns an error if writing the image to the local clipboard fails.
-    fn handle_bulk_message(&mut self, msg: BulkMessage) -> Result<(), SessionError> {
+    async fn handle_bulk_message(&mut self, msg: BulkMessage) -> Result<(), SessionError> {
         match msg {
             BulkMessage::ClipboardBlob { seq, data, .. } => {
                 // The offer's `mime` is what we already validated against
@@ -569,11 +668,388 @@ impl Session {
                     data,
                 });
             }
-            BulkMessage::Chunk { .. } => {
-                tracing::debug!("file transfer not implemented until M10");
+            BulkMessage::Chunk {
+                transfer_id,
+                offset,
+                data,
+            } => {
+                self.handle_incoming_chunk(transfer_id, offset, data)
+                    .await?;
             }
         }
         Ok(())
+    }
+
+    /// Handles a `TransferOffer` from the peer, per `accept_policy` (Tier
+    /// 7.5): auto-reject, auto-accept, or park it in `pending_offers` and
+    /// tell the driver to ask the user.
+    async fn handle_incoming_offer(
+        &mut self,
+        transfer_id: TransferId,
+        manifest: FileManifest,
+    ) -> Result<(), SessionError> {
+        match self.accept_policy {
+            AcceptPolicy::AlwaysDeny => {
+                self.control
+                    .send(&ControlMessage::TransferReject {
+                        transfer_id,
+                        reason: "this device is not accepting incoming transfers".to_string(),
+                    })
+                    .await?;
+            }
+            AcceptPolicy::Ask => {
+                let _ = self.event_tx.send(TransferEvent::OfferReceived {
+                    transfer_id,
+                    manifest: manifest.clone(),
+                });
+                self.pending_offers.insert(transfer_id, manifest);
+            }
+            AcceptPolicy::AlwaysAccept => {
+                self.accept_offer(transfer_id, manifest).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the destination file and tells the peer to start sending —
+    /// the second half of `handle_incoming_offer`'s `AlwaysAccept` path,
+    /// also called from `handle_session_command` once a human answers an
+    /// `Ask`-policy offer.
+    async fn accept_offer(
+        &mut self,
+        transfer_id: TransferId,
+        manifest: FileManifest,
+    ) -> Result<(), SessionError> {
+        let dest = self.download_dir.join(sanitize_file_name(&manifest.name));
+        match IncomingTransfer::open(transfer_id, manifest, dest).await {
+            Ok((incoming, resume_from)) => {
+                self.incoming_transfers.insert(transfer_id, incoming);
+                self.control
+                    .send(&ControlMessage::TransferAccept {
+                        transfer_id,
+                        resume_from,
+                    })
+                    .await?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?transfer_id,
+                    error = %e,
+                    "failed to open destination for incoming transfer"
+                );
+                self.control
+                    .send(&ControlMessage::TransferReject {
+                        transfer_id,
+                        reason: format!("receiver I/O error: {e}"),
+                    })
+                    .await?;
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles the peer rejecting a transfer we offered: gives up on it
+    /// and starts the next queued send, if any. Ignored if `transfer_id`
+    /// doesn't match `current_outgoing` (e.g. a stale/duplicate reject).
+    async fn handle_transfer_reject(
+        &mut self,
+        transfer_id: TransferId,
+        reason: String,
+    ) -> Result<(), SessionError> {
+        if self
+            .current_outgoing
+            .as_ref()
+            .is_some_and(|t| t.transfer_id == transfer_id)
+        {
+            self.current_outgoing = None;
+            let _ = self.event_tx.send(TransferEvent::Rejected {
+                transfer_id,
+                reason,
+            });
+            self.start_next_pending_send().await?;
+        }
+        Ok(())
+    }
+
+    /// Handles the peer cancelling a transfer, sent or received: drops
+    /// whichever side we're tracking it on and, if it was our own send,
+    /// starts the next queued one.
+    async fn handle_transfer_cancel(
+        &mut self,
+        transfer_id: TransferId,
+    ) -> Result<(), SessionError> {
+        let was_incoming = self.incoming_transfers.remove(&transfer_id).is_some();
+        let was_outgoing = self
+            .current_outgoing
+            .as_ref()
+            .is_some_and(|t| t.transfer_id == transfer_id);
+        if was_outgoing {
+            self.current_outgoing = None;
+        }
+        if was_incoming || was_outgoing {
+            let _ = self.event_tx.send(TransferEvent::Failed {
+                transfer_id,
+                reason: "cancelled by peer".to_string(),
+            });
+        }
+        if was_outgoing {
+            self.start_next_pending_send().await?;
+        }
+        Ok(())
+    }
+
+    /// Marks the matching outgoing transfer ready to send, seeking to
+    /// `resume_from`. Silently ignored if `transfer_id` doesn't match
+    /// `current_outgoing` (e.g. we already gave up on it).
+    async fn handle_transfer_accept(&mut self, transfer_id: TransferId, resume_from: u64) {
+        if let Some(outgoing) = self.current_outgoing.as_mut()
+            && outgoing.transfer_id == transfer_id
+        {
+            if let Err(e) = outgoing.accept(resume_from).await {
+                tracing::warn!(?transfer_id, error = %e, "failed to seek outgoing transfer to resume_from");
+                self.current_outgoing = None;
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+            } else {
+                tracing::info!(?transfer_id, resume_from, "peer accepted transfer");
+            }
+        }
+    }
+
+    /// Whether `run`'s select loop should send another chunk this tick.
+    fn ready_to_send_chunk(&self) -> bool {
+        self.current_outgoing.as_ref().is_some_and(|t| t.accepted)
+    }
+
+    /// Sends exactly one chunk of `current_outgoing`, or — once the file is
+    /// exhausted — the closing `TransferComplete` and starts the next
+    /// queued send, if any.
+    async fn send_next_outgoing_chunk(&mut self) -> Result<(), SessionError> {
+        let Some(outgoing) = self.current_outgoing.as_mut() else {
+            return Ok(());
+        };
+        let transfer_id = outgoing.transfer_id;
+        let total = outgoing.manifest.size;
+
+        match outgoing.read_next_chunk().await {
+            Ok(Some((offset, data))) => {
+                self.bulk
+                    .send(&BulkMessage::Chunk {
+                        transfer_id,
+                        offset,
+                        data,
+                    })
+                    .await?;
+                let bytes_done = self
+                    .current_outgoing
+                    .as_ref()
+                    .map_or(total, |t| t.bytes_sent);
+                let _ = self.event_tx.send(TransferEvent::Progress {
+                    transfer_id,
+                    bytes_done,
+                    total,
+                });
+            }
+            Ok(None) => {
+                let hash = outgoing.manifest.hash;
+                let path = outgoing.original_path.clone();
+                self.current_outgoing = None;
+                self.control
+                    .send(&ControlMessage::TransferComplete { transfer_id, hash })
+                    .await?;
+                let _ = self
+                    .event_tx
+                    .send(TransferEvent::Completed { transfer_id, path });
+                self.start_next_pending_send().await?;
+            }
+            Err(e) => {
+                tracing::warn!(?transfer_id, error = %e, "outgoing transfer read failed");
+                self.current_outgoing = None;
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+                self.start_next_pending_send().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pops the next queued file (if any), hashes it, opens it, and offers
+    /// it to the peer. A no-op if the queue is empty.
+    async fn start_next_pending_send(&mut self) -> Result<(), SessionError> {
+        let Some(path) = self.pending_sends.pop_front() else {
+            return Ok(());
+        };
+        let transfer_id = TransferId::new();
+
+        let manifest = match build_manifest(&path, CHUNK_SIZE).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "failed to read file to send");
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+                return Ok(());
+            }
+        };
+        match OutgoingTransfer::open(transfer_id, path, manifest.clone()).await {
+            Ok(outgoing) => {
+                self.current_outgoing = Some(outgoing);
+                self.control
+                    .send(&ControlMessage::TransferOffer {
+                        transfer_id,
+                        manifest,
+                    })
+                    .await?;
+            }
+            Err(e) => {
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one command from the driver (Tier 4.5's channel-not-mutex
+    /// boundary between `Session` and whatever's running it).
+    async fn handle_session_command(&mut self, cmd: SessionCommand) -> Result<(), SessionError> {
+        match cmd {
+            SessionCommand::SendFile(path) => {
+                self.pending_sends.push_back(path);
+                if self.current_outgoing.is_none() {
+                    self.start_next_pending_send().await?;
+                }
+            }
+            SessionCommand::RespondToOffer {
+                transfer_id,
+                accept,
+            } => {
+                if let Some(manifest) = self.pending_offers.remove(&transfer_id) {
+                    if accept {
+                        self.accept_offer(transfer_id, manifest).await?;
+                    } else {
+                        self.control
+                            .send(&ControlMessage::TransferReject {
+                                transfer_id,
+                                reason: "declined by user".to_string(),
+                            })
+                            .await?;
+                    }
+                }
+            }
+            SessionCommand::CancelTransfer(transfer_id) => {
+                let was_incoming = self.incoming_transfers.remove(&transfer_id).is_some();
+                let was_outgoing = self
+                    .current_outgoing
+                    .as_ref()
+                    .is_some_and(|t| t.transfer_id == transfer_id);
+                if was_outgoing {
+                    self.current_outgoing = None;
+                }
+                if was_incoming || was_outgoing {
+                    self.control
+                        .send(&ControlMessage::TransferCancel { transfer_id })
+                        .await?;
+                }
+                if was_outgoing {
+                    self.start_next_pending_send().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one incoming chunk and reports progress. Silently ignored if
+    /// `transfer_id` doesn't match an accepted incoming transfer (e.g. a
+    /// stray chunk after we cancelled it).
+    async fn handle_incoming_chunk(
+        &mut self,
+        transfer_id: TransferId,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let Some(incoming) = self.incoming_transfers.get_mut(&transfer_id) else {
+            tracing::debug!(
+                ?transfer_id,
+                "ignoring chunk for unknown/not-accepted transfer"
+            );
+            return Ok(());
+        };
+        let total = incoming.manifest.size;
+        if let Err(e) = incoming.write_chunk(offset, &data).await {
+            tracing::warn!(?transfer_id, error = %e, "failed to write incoming chunk");
+            self.incoming_transfers.remove(&transfer_id);
+            let _ = self.event_tx.send(TransferEvent::Failed {
+                transfer_id,
+                reason: e.to_string(),
+            });
+            return Ok(());
+        }
+        let bytes_done = self.incoming_transfers[&transfer_id].bytes_received;
+        let _ = self.event_tx.send(TransferEvent::Progress {
+            transfer_id,
+            bytes_done,
+            total,
+        });
+        self.maybe_finalize_incoming(transfer_id).await;
+        Ok(())
+    }
+
+    /// Records the peer's claimed hash for a finished transfer, then
+    /// finalizes it if every byte has already arrived.
+    async fn handle_transfer_complete(
+        &mut self,
+        transfer_id: TransferId,
+        hash: [u8; 32],
+    ) -> Result<(), SessionError> {
+        let Some(incoming) = self.incoming_transfers.get_mut(&transfer_id) else {
+            tracing::debug!(?transfer_id, "TransferComplete for unknown transfer");
+            return Ok(());
+        };
+        incoming.complete_hash = Some(hash);
+        self.maybe_finalize_incoming(transfer_id).await;
+        Ok(())
+    }
+
+    /// Finalizes `transfer_id` if it's ready (Tier 7.5: verify BLAKE3,
+    /// rename `.part` into place, restore mtime) — a no-op otherwise,
+    /// since `TransferComplete` and the last `Chunk` can arrive in either
+    /// order (different connections, no ordering guarantee between them).
+    async fn maybe_finalize_incoming(&mut self, transfer_id: TransferId) {
+        let Some(incoming) = self.incoming_transfers.get(&transfer_id) else {
+            return;
+        };
+        if !incoming.is_ready_to_finalize() {
+            return;
+        }
+        let mut incoming = self
+            .incoming_transfers
+            .remove(&transfer_id)
+            .expect("just checked it's present");
+        match incoming.finalize().await {
+            Ok(path) => {
+                let _ = self
+                    .event_tx
+                    .send(TransferEvent::Completed { transfer_id, path });
+            }
+            Err(e) => {
+                tracing::warn!(?transfer_id, error = %e, "transfer failed verification");
+                let _ = self.event_tx.send(TransferEvent::Failed {
+                    transfer_id,
+                    reason: e.to_string(),
+                });
+            }
+        }
     }
 
     /// Diffs `mods` against what we last synced and injects `KeyDown`/
@@ -751,7 +1227,9 @@ mod tests {
     use crate::state::{State, StateMachine};
     use crate::topology::{Layout, NodeId, Rect};
     use crate::traits::{ClipboardProvider, InputCapture, InputSink, ScreenInfo};
+    use crate::transfer::{AcceptPolicy, SessionCommand, TransferEvent};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc::UnboundedSender;
 
@@ -787,6 +1265,50 @@ mod tests {
         }
         fn is_healthy(&self) -> bool {
             true
+        }
+    }
+
+    /// Keeps its `start`/`watch`-provided sender alive for as long as the
+    /// mock itself lives, unlike `NoopCapture`/`RecordingClipboard`
+    /// (which drop theirs immediately, having no need for it since every
+    /// other test drives `Session` via direct method calls rather than
+    /// the real `run()` select loop). `run()` treats a closed
+    /// `capture_rx`/`clipboard_rx` as "the platform layer died" and ends
+    /// the session — needed only by
+    /// `full_file_transfer_over_loopback`, the one test that runs the
+    /// real select loop end to end.
+    #[derive(Default)]
+    struct KeepAlivePlatform {
+        capture_tx: Option<UnboundedSender<InputEvent>>,
+        clipboard_tx: Option<UnboundedSender<ClipboardEvent>>,
+    }
+
+    impl InputCapture for KeepAlivePlatform {
+        fn start(&mut self, sink: UnboundedSender<InputEvent>) -> Result<(), PlatformError> {
+            self.capture_tx = Some(sink);
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn set_suppression(&mut self, _suppress: bool) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    impl ClipboardProvider for KeepAlivePlatform {
+        fn watch(&mut self, sink: UnboundedSender<ClipboardEvent>) -> Result<(), PlatformError> {
+            self.clipboard_tx = Some(sink);
+            Ok(())
+        }
+        fn set_text(&mut self, _text: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn set_image(&mut self, _png_bytes: &[u8]) -> Result<(), PlatformError> {
+            Ok(())
         }
     }
 
@@ -996,7 +1518,7 @@ mod tests {
         // alive — kept in the returned tuple's drop scope by virtue of
         // `bulk_loopback_pair`'s server task, not read from here.
         let (bulk, _peer_bulk) = bulk_loopback_pair().await;
-        let session = Session::new(
+        let (session, _handle) = Session::new(
             sm,
             control,
             bulk,
@@ -1332,7 +1854,7 @@ mod tests {
             suppressed: Arc::new(Mutex::new(Vec::new())),
         };
         let (a_bulk, mut b_bulk) = bulk_loopback_pair().await;
-        let mut session = Session::new(
+        let (mut session, _handle) = Session::new(
             sm,
             a_control,
             a_bulk,
@@ -1513,6 +2035,7 @@ mod tests {
                 mime: "image/png".to_string(),
                 data: vec![1, 2, 3, 4],
             })
+            .await
             .expect("apply blob");
 
         assert_eq!(
@@ -1555,6 +2078,7 @@ mod tests {
                 mime: "image/png".to_string(),
                 data: vec![0; 1000],
             })
+            .await
             .expect("blob for a rejected offer should not error");
 
         assert!(
@@ -1564,6 +2088,103 @@ mod tests {
                 .expect("mutex poisoned")
                 .is_empty()
         );
+    }
+
+    /// The M10 demo (Tier 13), end to end at the protocol/session level:
+    /// unlike every other test in this module, this one drives BOTH sides
+    /// through the real `Session::run` select loop (not direct method
+    /// calls) since chunk-by-chunk sending only happens inside it —
+    /// proving the whole `SendFile` → `TransferOffer` → `TransferAccept`
+    /// → `Chunk`... → `TransferComplete` → verify-and-rename flow works
+    /// over real loopback TCP, not just each piece in isolation.
+    #[tokio::test]
+    async fn full_file_transfer_over_loopback() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let a_layout = adjacent_layout(a_node, b_node, true);
+        let b_layout = adjacent_layout(b_node, a_node, false);
+        let (a_bulk, b_bulk) = bulk_loopback_pair().await;
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let dest_dir = tempfile::tempdir().expect("dest tempdir");
+        let src_path = src_dir.path().join("payload.bin");
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&src_path, &payload)
+            .await
+            .expect("write payload");
+
+        let a_config = Config::new_default();
+        let mut b_config = Config::new_default();
+        b_config.accept_policy = AcceptPolicy::AlwaysAccept;
+        b_config.download_dir = Some(dest_dir.path().to_path_buf());
+
+        let (a_session, a_handle) = Session::new(
+            StateMachine::new(a_node, bounds(), a_layout),
+            a_control,
+            a_bulk,
+            Box::new(KeepAlivePlatform::default()),
+            Box::new(RecordingSink::default()),
+            Box::new(KeepAlivePlatform::default()),
+            &a_config,
+        )
+        .expect("a session construction");
+        let (b_session, mut b_handle) = Session::new(
+            StateMachine::new(b_node, bounds(), b_layout),
+            b_control,
+            b_bulk,
+            Box::new(KeepAlivePlatform::default()),
+            Box::new(RecordingSink::default()),
+            Box::new(KeepAlivePlatform::default()),
+            &b_config,
+        )
+        .expect("b session construction");
+
+        let mut a_join = tokio::spawn(a_session.run());
+        let mut b_join = tokio::spawn(b_session.run());
+
+        a_handle
+            .command_tx
+            .send(SessionCommand::SendFile(src_path))
+            .expect("a's command channel still open");
+
+        let received_path = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = &mut a_join => {
+                        panic!("a_session.run() ended early: {result:?}");
+                    }
+                    result = &mut b_join => {
+                        panic!("b_session.run() ended early: {result:?}");
+                    }
+                    event = b_handle.event_rx.recv() => {
+                        let Some(event) = event else {
+                            let a_result = (&mut a_join).await;
+                            let b_result = (&mut b_join).await;
+                            panic!(
+                                "b's event channel closed unexpectedly; a_session.run() -> {a_result:?}, b_session.run() -> {b_result:?}"
+                            );
+                        };
+                        match event {
+                            TransferEvent::Completed { path, .. } => return path,
+                            TransferEvent::Failed { reason, .. } => {
+                                panic!("transfer failed: {reason}")
+                            }
+                            TransferEvent::Rejected { reason, .. } => {
+                                panic!("transfer rejected: {reason}")
+                            }
+                            TransferEvent::Progress { .. } | TransferEvent::OfferReceived { .. } => {}
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the transfer to complete");
+
+        let received = tokio::fs::read(&received_path)
+            .await
+            .expect("read received file");
+        assert_eq!(received, payload);
+        assert_eq!(received_path, dest_dir.path().join("payload.bin"));
     }
 
     // Compile-time proof that ScreenInfo mocks still satisfy the trait

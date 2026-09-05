@@ -25,5 +25,6 @@ pub mod session;
 pub mod state;
 pub mod topology;
 pub mod traits;
+pub mod transfer;
 
 pub use error::PlatformError;

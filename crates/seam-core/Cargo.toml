@@ -22,6 +22,8 @@ tokio-rustls = { workspace = true }
 rcgen        = { workspace = true }
 blake3       = { workspace = true }
 mdns-sd      = { workspace = true }
+serde_json   = { workspace = true }
+filetime     = { workspace = true }
 
 [dev-dependencies]
 tempfile     = { workspace = true }
