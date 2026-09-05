@@ -1,7 +1,10 @@
 //! Networking: the control channel (M3), the bulk channel (M7, carrying
-//! clipboard images now and file chunks from M10 on), and — landing in
-//! later milestones — mDNS discovery (M9), pairing (M8), and TLS (M8). See
-//! Tier 5/6 of the build guide.
+//! clipboard images now and file chunks from M10 on), TLS identity and
+//! fingerprint pinning (M8), pairing-code derivation (M8), and — landing in
+//! a later milestone — mDNS discovery (M9). See Tier 5/6 of the build
+//! guide.
 
 pub mod bulk;
 pub mod control;
+pub mod pairing;
+pub mod tls;

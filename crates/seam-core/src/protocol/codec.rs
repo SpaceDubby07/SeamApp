@@ -55,9 +55,23 @@ pub enum ProtocolError {
     #[error("decode failed: {0}")]
     Decode(#[from] postcard::Error),
 
-    /// The underlying socket errored.
+    /// The underlying socket errored — this is also how a TLS handshake
+    /// failure surfaces (`tokio_rustls` reports certificate-verification
+    /// failures, including a pinned-fingerprint mismatch, as an `io::Error`
+    /// wrapping the underlying `rustls::Error`).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Building this node's TLS identity/config failed (Tier 7.6, M8).
+    #[error(transparent)]
+    Tls(#[from] crate::net::tls::TlsError),
+
+    /// A TLS handshake completed with no peer certificate available. Both
+    /// `client_config` and `server_config` make client-cert presentation
+    /// mandatory, so this should be unreachable in practice — a defensive
+    /// variant rather than a panic.
+    #[error("TLS handshake completed with no peer certificate")]
+    MissingPeerCertificate,
 }
 
 /// Builds a [`LengthDelimitedCodec`] for the control channel: `u32`

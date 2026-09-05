@@ -742,6 +742,7 @@ mod tests {
     use crate::error::PlatformError;
     use crate::net::bulk::BulkChannel;
     use crate::net::control::ControlChannel;
+    use crate::net::tls::{NodeIdentity, Trust};
     use crate::protocol::{
         BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, KeyCode, Modifiers,
         MouseButton, OsKind,
@@ -820,15 +821,31 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let a_node = NodeId::new();
         let b_node = NodeId::new();
+        let a_identity = NodeIdentity::generate().expect("a identity");
+        let b_identity = NodeIdentity::generate().expect("b identity");
 
         let b_task = tokio::spawn(async move {
-            ControlChannel::accept(&listener, b_node, "b", OsKind::Windows)
-                .await
-                .expect("b handshake")
-        });
-        let a = ControlChannel::connect(addr, a_node, "a", OsKind::Windows)
+            ControlChannel::accept(
+                &listener,
+                b_node,
+                "b",
+                OsKind::Windows,
+                &b_identity,
+                Trust::OnFirstUse,
+            )
             .await
-            .expect("a handshake");
+            .expect("b handshake")
+        });
+        let a = ControlChannel::connect(
+            addr,
+            a_node,
+            "a",
+            OsKind::Windows,
+            &a_identity,
+            Trust::OnFirstUse,
+        )
+        .await
+        .expect("a handshake");
         let b = b_task.await.expect("b task");
         (a, a_node, b, b_node)
     }
@@ -889,9 +906,19 @@ mod tests {
     async fn bulk_loopback_pair() -> (BulkChannel, BulkChannel) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server =
-            tokio::spawn(async move { BulkChannel::accept(&listener).await.expect("accept") });
-        let client = BulkChannel::connect(addr).await.expect("connect");
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
+        let server_fingerprint = server_identity.fingerprint;
+        let client_fingerprint = client_identity.fingerprint;
+
+        let server = tokio::spawn(async move {
+            BulkChannel::accept(&listener, &server_identity, client_fingerprint)
+                .await
+                .expect("accept")
+        });
+        let client = BulkChannel::connect(addr, &client_identity, server_fingerprint)
+            .await
+            .expect("connect");
         let server = server.await.expect("server task");
         (client, server)
     }

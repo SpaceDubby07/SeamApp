@@ -1,13 +1,12 @@
-//! Bulk channel: a second plain-TCP connection alongside the control
-//! channel, used for anything too large for the control channel's 1 MB
-//! frame cap (Tier 6.1) — clipboard images (M7) and, later, file chunks
-//! (M10).
+//! Bulk channel: a second TLS connection alongside the control channel,
+//! used for anything too large for the control channel's 1 MB frame cap
+//! (Tier 6.1) — clipboard images (M7) and, later, file chunks (M10).
 //!
-//! No handshake of its own: it rides on the peer identity the control
-//! channel already established. In v1 (exactly one peer) the accepting side
-//! simply takes the first incoming connection on the bulk listener as
-//! belonging to that peer — TLS + cert pinning, which is what actually
-//! authenticates a channel, lands in M8 and will cover this one too.
+//! Always [`Trust::Pinned`] to whatever fingerprint the control channel
+//! already authenticated — never `OnFirstUse` here. Pairing happens once,
+//! on the control channel; the bulk channel just needs to prove it's
+//! talking to that SAME already-trusted peer, not repeat first-contact
+//! trust decisions of its own (Tier 7.6/M8).
 //!
 //! `TCP_NODELAY` is deliberately left ON (the default) here — the opposite
 //! of the control channel — since bulk traffic cares about throughput, not
@@ -20,37 +19,71 @@
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::net::tls::{
+    Fingerprint, NodeIdentity, Trust, client_config, dummy_server_name, peer_fingerprint,
+    server_config,
+};
 use crate::protocol::{BULK_MAX_FRAME, BulkMessage, ProtocolError, bulk_codec, decode_frame};
 
-/// A connected bulk channel to one peer. See the module docs for what
-/// makes this different from [`crate::net::control::ControlChannel`].
+/// A connected, TLS-encrypted bulk channel to one peer. See the module docs
+/// for what makes this different from
+/// [`crate::net::control::ControlChannel`].
 pub struct BulkChannel {
-    framed: Framed<TcpStream, LengthDelimitedCodec>,
+    framed: Framed<TlsStream<TcpStream>, LengthDelimitedCodec>,
+    /// The peer's TLS certificate fingerprint, confirmed to match
+    /// `expected_fingerprint` during the handshake.
+    pub peer_fingerprint: Fingerprint,
 }
 
 impl BulkChannel {
     /// Connects to `addr` — the peer's bulk port (Tier 6.5: control port +
-    /// 1 by convention).
+    /// 1 by convention) — establishing TLS pinned to
+    /// `expected_fingerprint` (the same peer the control channel already
+    /// authenticated).
     ///
     /// # Errors
-    /// Returns an error if the connection can't be established.
-    pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self, ProtocolError> {
+    /// Returns an error if the connection or TLS handshake fails, or if
+    /// the peer's certificate doesn't match `expected_fingerprint`.
+    pub async fn connect(
+        addr: impl ToSocketAddrs,
+        identity: &NodeIdentity,
+        expected_fingerprint: Fingerprint,
+    ) -> Result<Self, ProtocolError> {
         let stream = TcpStream::connect(addr).await?;
+        let tls_config = client_config(identity, Trust::Pinned(expected_fingerprint))?;
+        let connector = TlsConnector::from(tls_config);
+        let tls_stream = TlsStream::Client(connector.connect(dummy_server_name(), stream).await?);
+        let peer_fingerprint =
+            peer_fingerprint(&tls_stream).ok_or(ProtocolError::MissingPeerCertificate)?;
         Ok(Self {
-            framed: Framed::new(stream, bulk_codec()),
+            framed: Framed::new(tls_stream, bulk_codec()),
+            peer_fingerprint,
         })
     }
 
-    /// Accepts one incoming connection on `listener`.
+    /// Accepts one incoming connection on `listener`, establishing TLS
+    /// pinned to `expected_fingerprint`.
     ///
     /// # Errors
-    /// Returns an error if the accept fails.
-    pub async fn accept(listener: &TcpListener) -> Result<Self, ProtocolError> {
+    /// Returns an error if the accept or TLS handshake fails, or if the
+    /// peer's certificate doesn't match `expected_fingerprint`.
+    pub async fn accept(
+        listener: &TcpListener,
+        identity: &NodeIdentity,
+        expected_fingerprint: Fingerprint,
+    ) -> Result<Self, ProtocolError> {
         let (stream, _addr) = listener.accept().await?;
+        let tls_config = server_config(identity, Trust::Pinned(expected_fingerprint))?;
+        let acceptor = TlsAcceptor::from(tls_config);
+        let tls_stream = TlsStream::Server(acceptor.accept(stream).await?);
+        let peer_fingerprint =
+            peer_fingerprint(&tls_stream).ok_or(ProtocolError::MissingPeerCertificate)?;
         Ok(Self {
-            framed: Framed::new(stream, bulk_codec()),
+            framed: Framed::new(tls_stream, bulk_codec()),
+            peer_fingerprint,
         })
     }
 
@@ -83,16 +116,26 @@ impl BulkChannel {
 #[cfg(test)]
 mod tests {
     use super::BulkChannel;
+    use crate::net::tls::NodeIdentity;
     use crate::protocol::{BulkMessage, CONTROL_MAX_FRAME, ControlMessage, ProtocolError};
     use tokio::net::TcpListener;
 
     async fn loopback_pair() -> (BulkChannel, BulkChannel) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
+        let server_fingerprint = server_identity.fingerprint;
+        let client_fingerprint = client_identity.fingerprint;
 
-        let server =
-            tokio::spawn(async move { BulkChannel::accept(&listener).await.expect("accept") });
-        let client = BulkChannel::connect(addr).await.expect("connect");
+        let server = tokio::spawn(async move {
+            BulkChannel::accept(&listener, &server_identity, client_fingerprint)
+                .await
+                .expect("accept")
+        });
+        let client = BulkChannel::connect(addr, &client_identity, server_fingerprint)
+            .await
+            .expect("connect");
         let server = server.await.expect("server task");
         (client, server)
     }
@@ -112,10 +155,41 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_after_clean_close() {
-        let (client, mut server) = loopback_pair().await;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = loopback_pair().await;
+        // See control.rs's identical test for why an explicit TLS
+        // `shutdown` (close_notify) is required here, unlike the pre-TLS
+        // plain-TCP version of this test.
+        client
+            .framed
+            .get_mut()
+            .shutdown()
+            .await
+            .expect("tls shutdown");
         drop(client);
         let result = server.recv().await.expect("recv should not error");
         assert!(result.is_none());
+    }
+
+    /// Mirrors control.rs's equivalent test: pinning to the wrong
+    /// fingerprint hard-fails rather than silently connecting.
+    #[tokio::test]
+    async fn connect_refuses_a_mismatched_fingerprint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
+        let client_fingerprint = client_identity.fingerprint;
+        let wrong_fingerprint = NodeIdentity::generate().expect("throwaway").fingerprint;
+
+        let server_task = tokio::spawn(async move {
+            BulkChannel::accept(&listener, &server_identity, client_fingerprint).await
+        });
+
+        let result = BulkChannel::connect(addr, &client_identity, wrong_fingerprint).await;
+        assert!(result.is_err());
+        assert!(server_task.await.expect("server task").is_err());
     }
 
     /// The whole reason clipboard images and file chunks travel on this
@@ -144,11 +218,17 @@ mod tests {
             mime: "image/png".to_string(),
             data: oversized_for_control.clone(),
         };
-        client
-            .send(&msg)
-            .await
-            .expect("send oversized-for-control frame");
-        let received = server.recv().await.expect("recv").expect("not closed");
+        // Concurrent, not sequential: a payload this size can exceed the
+        // OS's loopback socket buffer once TLS overhead is added, so
+        // `send` blocks (correctly) until something is actually reading
+        // the other end. Awaiting `send` to completion before even
+        // starting `recv` would deadlock — nothing would ever drain the
+        // socket.
+        let send = client.send(&msg);
+        let recv = server.recv();
+        let (send_result, recv_result) = tokio::join!(send, recv);
+        send_result.expect("send oversized-for-control frame");
+        let received = recv_result.expect("recv").expect("not closed");
         assert_eq!(received, msg);
     }
 }

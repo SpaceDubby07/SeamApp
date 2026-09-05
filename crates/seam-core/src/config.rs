@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::net::tls::{Fingerprint, Trust};
 use crate::remap::RemapTable;
 use crate::topology::NodeId;
 
@@ -40,6 +41,25 @@ pub struct Config {
     /// written before this field existed (M6) still loads.
     #[serde(default = "default_clipboard_max_bytes")]
     pub clipboard_max_bytes: u64,
+    /// The one peer we've paired with (Tier 7.6, M8) — a single `Option`
+    /// rather than a collection, matching v1's "exactly one peer"
+    /// simplification used throughout (`StateMachine`'s `peer: Option<NodeId>`
+    /// is the same call; see Tier 15 for what a third machine would need).
+    /// `#[serde(default)]` so a config file written before pairing existed
+    /// (M6/M7) still loads, as "not yet paired with anyone."
+    #[serde(default)]
+    pub paired_peer: Option<PairedPeer>,
+}
+
+/// The peer this machine has paired with: its node identity and the
+/// certificate fingerprint pinned for it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PairedPeer {
+    /// The peer's stable node identity, learned during pairing.
+    pub node_id: NodeId,
+    /// The peer's certificate fingerprint, pinned once a human confirms
+    /// the pairing code matches on both screens.
+    pub fingerprint: Fingerprint,
 }
 
 /// Things that can go wrong loading or saving [`Config`].
@@ -62,8 +82,8 @@ pub enum ConfigError {
 
 impl Config {
     /// A fresh default config: a new random node identity, no remap rules,
-    /// a hostname-derived display name, and the default 10 MB clipboard
-    /// cap.
+    /// a hostname-derived display name, the default 10 MB clipboard cap,
+    /// and no paired peer yet.
     #[must_use]
     pub fn new_default() -> Self {
         Self {
@@ -71,7 +91,31 @@ impl Config {
             display_name: default_display_name(),
             remap: RemapTable::default(),
             clipboard_max_bytes: default_clipboard_max_bytes(),
+            paired_peer: None,
         }
+    }
+
+    /// Which [`Trust`] mode a connection attempt should use: pinned to our
+    /// paired peer's fingerprint if we have one, or [`Trust::OnFirstUse`]
+    /// if we've never paired with anyone yet. Used by BOTH `connect` and
+    /// `accept` — v1's single-peer simplification means there's no
+    /// per-connection identity to look up ahead of time, only "have we
+    /// paired with anyone at all" (Tier 7.6).
+    #[must_use]
+    pub fn trust_mode(&self) -> Trust {
+        match &self.paired_peer {
+            Some(peer) => Trust::Pinned(peer.fingerprint),
+            None => Trust::OnFirstUse,
+        }
+    }
+
+    /// Pins `fingerprint` as the trusted identity for `node_id`, after a
+    /// human has confirmed the pairing code matches on both screens.
+    pub fn pin_peer(&mut self, node_id: NodeId, fingerprint: Fingerprint) {
+        self.paired_peer = Some(PairedPeer {
+            node_id,
+            fingerprint,
+        });
     }
 
     /// Loads config from `path`, creating and persisting a fresh default if
@@ -117,6 +161,21 @@ impl Config {
         let (qualifier, organization, application) = APP_QUALIFIER;
         directories::ProjectDirs::from(qualifier, organization, application)
             .map(|dirs| dirs.config_dir().join("config.toml"))
+            .ok_or(ConfigError::NoConfigDir)
+    }
+
+    /// The default directory for this machine's TLS identity
+    /// (`identity_cert.der`/`identity_key.der` — see
+    /// [`crate::net::tls::NodeIdentity::load_or_create`]): the same
+    /// OS-standard config directory `default_path` uses.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::NoConfigDir`] if the OS won't report a config
+    /// directory.
+    pub fn identity_dir() -> Result<PathBuf, ConfigError> {
+        let (qualifier, organization, application) = APP_QUALIFIER;
+        directories::ProjectDirs::from(qualifier, organization, application)
+            .map(|dirs| dirs.config_dir().to_path_buf())
             .ok_or(ConfigError::NoConfigDir)
     }
 }

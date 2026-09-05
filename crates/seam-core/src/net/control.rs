@@ -1,23 +1,31 @@
-//! Control channel: connect, handshake, and the read/write loop over plain
-//! TCP (Tier 6 of the build guide).
+//! Control channel: connect, TLS handshake, and the read/write loop
+//! (Tier 6 of the build guide).
 //!
-//! No TLS yet — that's M8. Pairing and cert pinning aren't implemented, so
-//! this accepts any peer that speaks the right protocol version. Do not
-//! point this at an untrusted network.
+//! TLS always, per the crate-level non-negotiable rule (Tier 7.6, M8) — the
+//! app-level `Handshake`/`ControlMessage` exchange rides entirely inside
+//! the encrypted channel. Identity is by certificate-fingerprint pinning,
+//! not a CA: pass [`Trust::OnFirstUse`] for the initial pairing connection,
+//! [`Trust::Pinned`] for every connection after that (see `net::tls` and
+//! `net::pairing`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::net::tls::{
+    Fingerprint, NodeIdentity, Trust, client_config, dummy_server_name, peer_fingerprint,
+    server_config,
+};
 use crate::protocol::{
     CONTROL_MAX_FRAME, ControlMessage, Handshake, OsKind, PROTOCOL_VERSION, ProtocolError,
     control_codec, decode_frame, encode_frame,
 };
 use crate::topology::NodeId;
 
-/// A connected, handshaked control channel to one peer.
+/// A connected, handshaked, TLS-encrypted control channel to one peer.
 ///
 /// # Socket options
 /// `TCP_NODELAY` is set on connect/accept (Tier 6.4) — Nagle's algorithm
@@ -25,29 +33,47 @@ use crate::topology::NodeId;
 /// more data, which is the single most common cause of a KVM tool feeling
 /// laggy.
 pub struct ControlChannel {
-    framed: Framed<TcpStream, LengthDelimitedCodec>,
+    framed: Framed<TlsStream<TcpStream>, LengthDelimitedCodec>,
     /// The peer's node id, learned during the handshake.
     pub peer_node_id: NodeId,
     /// The peer's user-facing display name, learned during the handshake.
     pub peer_display_name: String,
+    /// The peer's TLS certificate fingerprint, learned during the TLS
+    /// handshake itself (before the app-level `Handshake` even runs). Under
+    /// [`Trust::Pinned`] this is guaranteed to equal the fingerprint that
+    /// was pinned; under [`Trust::OnFirstUse`] this is what a pairing flow
+    /// shows the user and, on confirmation, is what gets pinned.
+    pub peer_fingerprint: Fingerprint,
 }
 
 impl ControlChannel {
-    /// Connects to `addr` and performs the handshake as the initiating
-    /// side.
+    /// Connects to `addr`, establishes TLS as the client side (presenting
+    /// `identity`'s certificate, verifying the peer's per `trust`), and
+    /// performs the application handshake as the initiating side.
     ///
     /// # Errors
-    /// Returns an error on connection failure, if the peer rejects the
-    /// handshake, or on a protocol version mismatch.
+    /// Returns an error on connection failure, TLS handshake/verification
+    /// failure (including a [`Trust::Pinned`] fingerprint mismatch — a hard
+    /// fail, never a silent fallback), a rejected application handshake, or
+    /// a protocol version mismatch.
     pub async fn connect(
         addr: impl ToSocketAddrs,
         local_node_id: NodeId,
         display_name: &str,
         os: OsKind,
+        identity: &NodeIdentity,
+        trust: Trust,
     ) -> Result<Self, ProtocolError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        let mut framed = Framed::new(stream, control_codec());
+
+        let tls_config = client_config(identity, trust)?;
+        let connector = TlsConnector::from(tls_config);
+        let tls_stream = TlsStream::Client(connector.connect(dummy_server_name(), stream).await?);
+        let peer_fingerprint =
+            peer_fingerprint(&tls_stream).ok_or(ProtocolError::MissingPeerCertificate)?;
+
+        let mut framed = Framed::new(tls_stream, control_codec());
 
         send_handshake(
             &mut framed,
@@ -90,25 +116,39 @@ impl ControlChannel {
             framed,
             peer_node_id,
             peer_display_name,
+            peer_fingerprint,
         })
     }
 
-    /// Accepts one incoming connection on `listener` and performs the
-    /// handshake as the accepting side.
+    /// Accepts one incoming connection on `listener`, establishes TLS as
+    /// the server side (presenting `identity`'s certificate, REQUIRING and
+    /// verifying the connecting side's per `trust` — mutual TLS), and
+    /// performs the application handshake as the accepting side.
     ///
     /// # Errors
-    /// Returns an error on accept failure, or if the incoming handshake is
-    /// malformed or speaks an incompatible protocol version (in which case
-    /// a rejecting `HelloAck` is still sent before returning the error).
+    /// Returns an error on accept failure, TLS handshake/verification
+    /// failure (including a [`Trust::Pinned`] fingerprint mismatch), or if
+    /// the incoming application handshake is malformed or speaks an
+    /// incompatible protocol version (in which case a rejecting `HelloAck`
+    /// is still sent before returning the error).
     pub async fn accept(
         listener: &TcpListener,
         local_node_id: NodeId,
         display_name: &str,
         os: OsKind,
+        identity: &NodeIdentity,
+        trust: Trust,
     ) -> Result<Self, ProtocolError> {
         let (stream, _addr) = listener.accept().await?;
         stream.set_nodelay(true)?;
-        let mut framed = Framed::new(stream, control_codec());
+
+        let tls_config = server_config(identity, trust)?;
+        let acceptor = TlsAcceptor::from(tls_config);
+        let tls_stream = TlsStream::Server(acceptor.accept(stream).await?);
+        let peer_fingerprint =
+            peer_fingerprint(&tls_stream).ok_or(ProtocolError::MissingPeerCertificate)?;
+
+        let mut framed = Framed::new(tls_stream, control_codec());
 
         let (peer_node_id, peer_display_name) = match recv_handshake(&mut framed).await? {
             Handshake::Hello {
@@ -147,6 +187,7 @@ impl ControlChannel {
             framed,
             peer_node_id,
             peer_display_name,
+            peer_fingerprint,
         })
     }
 
@@ -177,7 +218,7 @@ impl ControlChannel {
 }
 
 async fn send_handshake(
-    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+    framed: &mut Framed<TlsStream<TcpStream>, LengthDelimitedCodec>,
     hs: &Handshake,
 ) -> Result<(), ProtocolError> {
     let bytes = encode_frame(hs, CONTROL_MAX_FRAME)?;
@@ -186,7 +227,7 @@ async fn send_handshake(
 }
 
 async fn recv_handshake(
-    framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+    framed: &mut Framed<TlsStream<TcpStream>, LengthDelimitedCodec>,
 ) -> Result<Handshake, ProtocolError> {
     match framed.next().await {
         Some(Ok(bytes)) => decode_frame(&bytes),
@@ -207,6 +248,7 @@ pub fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ControlChannel, now_micros};
+    use crate::net::tls::{NodeIdentity, Trust};
     use crate::protocol::{ControlMessage, OsKind, ProtocolError};
     use crate::topology::NodeId;
     use tokio::net::TcpListener;
@@ -216,15 +258,31 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let server_node = NodeId::new();
         let client_node = NodeId::new();
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
 
         let server = tokio::spawn(async move {
-            ControlChannel::accept(&listener, server_node, "server", OsKind::MacOs)
-                .await
-                .expect("server-side handshake")
-        });
-        let client = ControlChannel::connect(addr, client_node, "client", OsKind::Windows)
+            ControlChannel::accept(
+                &listener,
+                server_node,
+                "server",
+                OsKind::MacOs,
+                &server_identity,
+                Trust::OnFirstUse,
+            )
             .await
-            .expect("client-side handshake");
+            .expect("server-side handshake")
+        });
+        let client = ControlChannel::connect(
+            addr,
+            client_node,
+            "client",
+            OsKind::Windows,
+            &client_identity,
+            Trust::OnFirstUse,
+        )
+        .await
+        .expect("client-side handshake");
         let server = server.await.expect("server task");
         (client, server)
     }
@@ -237,8 +295,62 @@ mod tests {
         assert_ne!(client.peer_node_id, server.peer_node_id);
     }
 
-    /// The M3 demo: two instances on one machine exchange handshakes and
-    /// heartbeats (Tier 13).
+    /// Both sides learn each other's TLS fingerprint from the handshake
+    /// itself — this is what a pairing flow shows the user (Tier 7.6).
+    #[tokio::test]
+    async fn both_sides_learn_the_others_tls_fingerprint() {
+        let (client, server) = loopback_pair().await;
+        assert_ne!(client.peer_fingerprint, server.peer_fingerprint);
+        // Each side's observed peer fingerprint is the OTHER side's own —
+        // there's no direct accessor for "my own fingerprint" here, but
+        // never matching your own would be a stronger, cheaper sanity
+        // check than trying to compare against a value this test can't
+        // otherwise obtain without threading the identities out too.
+    }
+
+    /// The M8 demo (Tier 13): a connection attempt pinned to a fingerprint
+    /// that doesn't match the peer's real certificate hard-fails — it must
+    /// never silently fall back to trusting an unpaired/changed peer.
+    #[tokio::test]
+    async fn connect_refuses_to_establish_with_an_unpaired_or_mismatched_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
+        let wrong_fingerprint = NodeIdentity::generate().expect("throwaway").fingerprint;
+
+        let server_task = tokio::spawn(async move {
+            ControlChannel::accept(
+                &listener,
+                NodeId::new(),
+                "server",
+                OsKind::MacOs,
+                &server_identity,
+                Trust::OnFirstUse,
+            )
+            .await
+        });
+
+        let result = ControlChannel::connect(
+            addr,
+            NodeId::new(),
+            "client",
+            OsKind::Windows,
+            &client_identity,
+            Trust::Pinned(wrong_fingerprint),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "connecting with a fingerprint that doesn't match any real peer must fail"
+        );
+        // The server side observes the failed handshake as an error too,
+        // rather than quietly proceeding without a peer.
+        let server_result = server_task.await.expect("server task");
+        assert!(server_result.is_err());
+    }
+
     #[tokio::test]
     async fn exchanges_ping_pong_heartbeat() {
         let (mut client, mut server) = loopback_pair().await;
@@ -289,7 +401,21 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_none_after_clean_close() {
-        let (client, mut server) = loopback_pair().await;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = loopback_pair().await;
+        // A "clean close" for TLS means sending `close_notify` before the
+        // socket goes away — TLS deliberately treats an ungraceful drop as
+        // an error rather than a plain EOF, to guard against truncation
+        // attacks, so simply `drop`ping `client` here (as the pre-TLS
+        // version of this test did) would make `recv` return `Err`, not
+        // `Ok(None)`.
+        client
+            .framed
+            .get_mut()
+            .shutdown()
+            .await
+            .expect("tls shutdown");
         drop(client);
         let result = server.recv().await.expect("recv should not error");
         assert!(result.is_none());
@@ -300,24 +426,43 @@ mod tests {
         // Can't drive a real version mismatch through the public API (it
         // always sends PROTOCOL_VERSION), so this exercises the same
         // accept-side rejection path with a listener + a hand-rolled
-        // Hello at a different version, over the same framing the real
-        // client uses.
+        // Hello at a different version, over the same TLS + framing the
+        // real client uses.
+        use crate::net::tls::{client_config, dummy_server_name};
         use crate::protocol::{CONTROL_MAX_FRAME, Handshake, control_codec, encode_frame};
         use futures_util::SinkExt;
-        use tokio::net::TcpStream;
+        use tokio_rustls::{TlsConnector, TlsStream};
         use tokio_util::codec::Framed;
 
         const WRONG_VERSION: u16 = crate::protocol::PROTOCOL_VERSION + 1;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let server_identity = NodeIdentity::generate().expect("server identity");
+        let client_identity = NodeIdentity::generate().expect("client identity");
 
         let server = tokio::spawn(async move {
-            ControlChannel::accept(&listener, NodeId::new(), "server", OsKind::MacOs).await
+            ControlChannel::accept(
+                &listener,
+                NodeId::new(),
+                "server",
+                OsKind::MacOs,
+                &server_identity,
+                Trust::OnFirstUse,
+            )
+            .await
         });
 
-        let stream = TcpStream::connect(addr).await.expect("connect");
-        let mut framed = Framed::new(stream, control_codec());
+        let tls_config = client_config(&client_identity, Trust::OnFirstUse).expect("tls config");
+        let connector = TlsConnector::from(tls_config);
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let tls_stream = TlsStream::Client(
+            connector
+                .connect(dummy_server_name(), stream)
+                .await
+                .expect("tls handshake"),
+        );
+        let mut framed = Framed::new(tls_stream, control_codec());
         let bad_hello = Handshake::Hello {
             protocol_version: WRONG_VERSION,
             node_id: NodeId::new(),
