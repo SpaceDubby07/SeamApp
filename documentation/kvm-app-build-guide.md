@@ -1035,13 +1035,16 @@ pub enum State {
 | From | Trigger | To | Actions |
 |---|---|---|---|
 | `Disconnected` | peer handshake OK | `LocalActive` | start heartbeat, sync clipboard |
-| `LocalActive` | cursor crosses configured edge | `RemoteActive` | send `ModifierState`, send `Handoff`, enable suppression, hide local cursor |
-| `RemoteActive` | cursor crosses back over edge | `LocalActive` | send `Reclaim`, disable suppression, warp local cursor to remembered position |
+| `LocalActive` | cursor crosses configured edge | `RemoteActive` | send `ModifierState`, send `Handoff`, enable suppression, hide + **decouple** local cursor |
+| `RemoteActive` | receives `ReleaseBack` | `LocalActive` | disable suppression, warp local cursor to remembered position, `release_all_modifiers()` |
 | `RemoteActive` | escape hotkey | `LocalActive` | send `EmergencyRelease`, disable suppression, `release_all_modifiers()` |
-| `*` | receives `Handoff` | `BeingDriven` | `warp_cursor()` to entry point, begin injecting |
+| `*` | receives `Handoff` | `BeingDriven` | `warp_cursor()` to entry point, arm back-out detector, begin injecting |
+| `BeingDriven` | driven cursor pushed back out the shared edge | `LocalActive` | send `ReleaseBack`, `release_all_modifiers()` |
 | `BeingDriven` | receives `Reclaim` | `LocalActive` | `release_all_modifiers()`, restore local cursor |
 | `*` | connection lost | `Disconnected` | disable suppression, `release_all_modifiers()`, start reconnect backoff |
 | `LocalActive` | lock toggle | `Locked` | ignore edge crossings |
+
+**Reclaim is decided on the machine BEING driven, not by the driver.** The original design had the driver watch its own cursor cross back over the edge; in practice the driver's cursor is suppressed (and on macOS keeps physically moving unless decoupled with `CGAssociateMouseAndMouseCursorPosition(false)`), so that check fired on ordinary jitter and the boundary "kept re-grabbing." Instead: the driven side integrates the motion it's injecting, and once the cursor is pushed back out through the edge it entered on it sends `ReleaseBack`. The `RemoteActive → LocalActive` on the driver is a *response* to that message. `Reclaim` (driver-initiated) is kept in the protocol and state machine for a future explicit "take control back" affordance, but nothing sends it today. A short inward-travel arm step after entry keeps the very first jitter sample from reading as an immediate exit.
 
 **Non-negotiable invariant:** any transition out of `RemoteActive` or `BeingDriven` calls `release_all_modifiers()` on the affected machine. Write this as a test.
 

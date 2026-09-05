@@ -1,6 +1,6 @@
 //! `#[tauri::command]` handlers the `ui/` frontend calls via `invoke`.
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use seam_core::config::Config;
 use seam_core::net::control::ControlChannel;
@@ -181,10 +181,18 @@ pub fn respond_to_offer(
 /// covers a real `Goodbye`-then-close), so this drops the control/bulk
 /// sockets without telling the peer; it'll notice via its own
 /// connection-closed handling. A no-op if nothing's connected.
+///
+/// Aborting is safe: `Session`'s `Drop` still runs when the task's future
+/// is dropped, so suppression is lifted, modifiers are released, and the
+/// capture hook is torn down. But abort skips `run`'s own post-exit
+/// bookkeeping in `finish_connection` (which is what normally emits
+/// `disconnected`), so we emit it here — otherwise the UI never leaves
+/// the connected state.
 #[tauri::command]
-pub fn disconnect(state: State<'_, AppState>) {
+pub fn disconnect(state: State<'_, AppState>, app: AppHandle) {
     if let Some(task) = state.session_task.lock().expect("mutex poisoned").take() {
         task.abort();
     }
     *state.session_command_tx.lock().expect("mutex poisoned") = None;
+    let _ = app.emit("disconnected", ());
 }

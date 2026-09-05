@@ -537,6 +537,17 @@ pub enum ControlMessage {
         /// sender's coordinate space.
         peer_bounds: Rect,
     },
+    /// Sent by the machine currently BEING driven once the peer-driven
+    /// cursor has been pushed back out through the shared edge it entered
+    /// on — the driven-side half of reclaim. The driver watches the
+    /// visible cursor on the driven screen (relayed motion, integrated),
+    /// never its own suppressed local cursor. On receipt the driver
+    /// returns to `LocalActive`: drop suppression, warp its cursor back to
+    /// where the user left off, release all modifiers.
+    ///
+    /// Kept LAST in this enum on purpose — see `PROTOCOL_VERSION`'s
+    /// "adding a variant at the end is backward-compatible" note.
+    ReleaseBack,
 }
 
 /// Messages that cross the bulk channel: file chunks and large clipboard

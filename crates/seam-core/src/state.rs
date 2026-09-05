@@ -24,20 +24,24 @@ const HANDOFF_COOLDOWN: Duration = Duration::from_millis(200);
 /// doesn't trigger an accidental handoff (Tier 7.2).
 const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 
-/// How far (in pixels) the cursor has to move back inward from a handoff
-/// edge before we treat it as a reclaim attempt, rather than jitter.
+/// How far (in pixels) the peer-driven cursor must travel inward from the
+/// edge it entered on before a push back out through that same edge counts
+/// as "give control back" rather than entry jitter.
 ///
-/// Real hardware testing (Tier 13's M4 dogfooding) found 4px — this
-/// constant's original value — was nowhere near enough: reclaim isn't
-/// cooldown-gated (see `handoff_cooldown_blocks_immediate_reverse_handoff`;
-/// a deliberate pull-back should feel instant), so any few-pixel wobble
-/// right after a handoff — completely ordinary mouse/trackpad jitter,
-/// especially once real motion deltas are being tracked accurately —
-/// immediately reclaimed control, making a real drag across the edge feel
-/// like it kept "resetting and ungrabbing." 40px is a deliberate motion no
-/// normal jitter produces, while still reading as instant to a human
-/// pulling back on purpose.
-const RECLAIM_THRESHOLD_PX: i32 = 40;
+/// Reclaim now happens on the machine BEING driven (see
+/// [`StateMachine::on_driven_cursor_moved`] and
+/// `ControlMessage::ReleaseBack`), not by the driver watching its own
+/// suppressed cursor — that earlier local-side approach reclaimed on any
+/// few-pixel wobble right after a handoff and, on macOS (where a suppressed
+/// cursor keeps physically moving), fired constantly, producing the
+/// "it never leaves either screen, keeps re-grabbing" behaviour.
+///
+/// The driven cursor is warped exactly onto the shared edge on entry, so
+/// without an arm step its very first outward jitter sample would look like
+/// a deliberate exit. Requiring `DRIVEN_BACKOUT_ARM_PX` of inward travel
+/// first makes the exit unambiguous while still reading as instant to a
+/// human pushing back on purpose.
+const DRIVEN_BACKOUT_ARM_PX: i32 = 12;
 
 /// The handoff state machine's current mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +68,15 @@ pub enum Input {
     /// The peer handshake completed successfully.
     PeerHandshakeOk(NodeId),
     /// The local cursor is now at this position (post-capture, in local
-    /// virtual-desktop pixels).
+    /// virtual-desktop pixels). Only meaningful in `LocalActive` — while
+    /// driving a peer our own cursor is suppressed and its position isn't
+    /// consulted (reclaim is the driven side's job now).
     CursorMoved(Point),
+    /// While `BeingDriven`: the peer-driven cursor is now at this position
+    /// on our screen (in local pixels), integrated by the caller from the
+    /// relayed motion it's injecting. Used to detect the cursor being
+    /// pushed back out through the shared edge, which hands control back.
+    DrivenCursorMoved(Point),
     /// The configured escape hotkey was pressed locally. In the real app
     /// this bypasses the normal event queue for latency (Tier 7.7), but
     /// the state machine's reaction to it is the same either way.
@@ -81,6 +92,10 @@ pub enum Input {
     },
     /// We received a `Reclaim` message from the peer we were driving.
     ReceivedReclaim,
+    /// We received a `ReleaseBack` from the peer we were driving: it
+    /// pushed the cursor back out through the shared edge, so control
+    /// returns to us. Only meaningful in `RemoteActive`.
+    ReceivedReleaseBack,
     /// We received an `EmergencyRelease` from the peer.
     ReceivedEmergencyRelease,
     /// The connection to the active peer was lost.
@@ -98,8 +113,12 @@ pub enum Action {
     SendModifierState(Modifiers),
     /// Tell the peer "you have control now, enter here."
     SendHandoff(EdgePoint),
-    /// Tell the peer "I'm taking control back."
+    /// Tell the peer "I'm taking control back." Sent by the driver.
     SendReclaim,
+    /// Tell the peer "your cursor came back onto your own screen; you're
+    /// driving again." Sent by the machine that was BEING driven, when the
+    /// cursor is pushed back out through the shared edge.
+    SendReleaseBack,
     /// Tell both sides to drop everything and return control local.
     SendEmergencyRelease,
     /// Enable/disable local input suppression
@@ -137,9 +156,19 @@ pub struct StateMachine {
     /// The peer we're either driving (`RemoteActive`) or being driven by
     /// (`BeingDriven`). `None` in every other state.
     peer: Option<NodeId>,
-    /// Which local edge triggered the current `RemoteActive` handoff, so
-    /// `on_cursor_moved` knows which direction counts as "back inward".
-    active_edge: Option<Edge>,
+    /// While `BeingDriven`: which local edge the peer's cursor entered
+    /// through (the far side of the shared boundary), i.e. the edge it has
+    /// to cross back out of to hand control back. `None` in every other
+    /// state.
+    driven_entry_edge: Option<Edge>,
+    /// While `BeingDriven`: the last integrated position of the
+    /// peer-driven cursor, in local pixels, for back-out edge detection.
+    last_driven_cursor: Option<Point>,
+    /// While `BeingDriven`: set once the driven cursor has moved far enough
+    /// inward from `driven_entry_edge` (`DRIVEN_BACKOUT_ARM_PX`) that a
+    /// subsequent push back out through that edge is a deliberate exit and
+    /// not entry jitter.
+    driven_backout_armed: bool,
     last_cursor: Option<Point>,
     last_handoff_at: Option<Instant>,
     held_modifiers: Modifiers,
@@ -161,7 +190,9 @@ impl StateMachine {
             local_bounds,
             layout,
             peer: None,
-            active_edge: None,
+            driven_entry_edge: None,
+            last_driven_cursor: None,
+            driven_backout_armed: false,
             last_cursor: None,
             last_handoff_at: None,
             held_modifiers: Modifiers::default(),
@@ -245,10 +276,12 @@ impl StateMachine {
         match input {
             Input::PeerHandshakeOk(peer) => self.on_handshake_ok(peer),
             Input::CursorMoved(pos) => self.on_cursor_moved(pos, now),
+            Input::DrivenCursorMoved(pos) => self.on_driven_cursor_moved(pos),
             Input::EscapeHotkey => self.on_escape_hotkey(),
             Input::LockToggled(locked) => self.on_lock_toggled(locked),
             Input::ReceivedHandoff { from, entry } => self.on_received_handoff(from, entry),
             Input::ReceivedReclaim => self.on_received_reclaim(),
+            Input::ReceivedReleaseBack => self.on_received_release_back(),
             Input::ReceivedEmergencyRelease => self.on_emergency_release(),
             Input::ConnectionLost => self.on_connection_lost(),
         }
@@ -268,9 +301,63 @@ impl StateMachine {
 
         match self.state {
             State::LocalActive => self.try_handoff(prev, pos, now),
-            State::RemoteActive => self.try_reclaim_from_remote_active(pos),
-            State::BeingDriven | State::Disconnected | State::Locked => Vec::new(),
+            // While `RemoteActive` our own cursor is suppressed (and on
+            // macOS decoupled/frozen); reclaim is decided on the driven
+            // side now (`on_driven_cursor_moved`), so there's nothing to
+            // do with a local position reading here.
+            State::RemoteActive | State::BeingDriven | State::Disconnected | State::Locked => {
+                Vec::new()
+            }
         }
+    }
+
+    /// While `BeingDriven`, tracks the peer-driven cursor and hands
+    /// control back once it's been pushed out through the shared edge it
+    /// entered on. This is the reclaim trigger — it lives here, on the
+    /// machine being driven, rather than on the driver (which can't see
+    /// where the cursor visibly is, and whose own suppressed cursor is an
+    /// unreliable proxy — especially on macOS).
+    fn on_driven_cursor_moved(&mut self, pos: Point) -> Vec<Action> {
+        if self.state != State::BeingDriven {
+            return Vec::new();
+        }
+        let Some(edge) = self.driven_entry_edge else {
+            return Vec::new();
+        };
+        let prev = self.last_driven_cursor.replace(pos);
+
+        if !self.driven_backout_armed {
+            // Arm only once the cursor is unambiguously inside our screen.
+            if detect_edge_reclaim(self.local_bounds, edge, pos, DRIVEN_BACKOUT_ARM_PX) {
+                self.driven_backout_armed = true;
+            }
+            return Vec::new();
+        }
+
+        let Some(prev) = prev else {
+            return Vec::new();
+        };
+        if detect_edge_crossing(self.local_bounds, prev, pos, self.corner_dead_zone_px)
+            != Some(edge)
+        {
+            return Vec::new();
+        }
+
+        // Pushed back out through the shared edge — control returns to the
+        // peer. Release every modifier we were holding on its behalf
+        // (Tier 7.1: mandatory on every exit from `BeingDriven`).
+        self.state = State::LocalActive;
+        self.peer = None;
+        self.clear_driven_tracking();
+        vec![Action::SendReleaseBack, Action::ReleaseAllModifiers]
+    }
+
+    /// Resets the `BeingDriven` cursor-tracking bookkeeping. Called on
+    /// every transition out of `BeingDriven`.
+    fn clear_driven_tracking(&mut self) {
+        self.driven_entry_edge = None;
+        self.last_driven_cursor = None;
+        self.driven_backout_armed = false;
     }
 
     fn try_handoff(&mut self, prev: Option<Point>, pos: Point, now: Instant) -> Vec<Action> {
@@ -299,7 +386,6 @@ impl StateMachine {
 
         let entry = compute_entry_point(self.local_bounds, pos, edge);
         self.state = State::RemoteActive;
-        self.active_edge = Some(edge);
         self.last_handoff_at = Some(now);
         self.remembered_cursor.insert(self.local_node, pos);
 
@@ -310,31 +396,29 @@ impl StateMachine {
         ]
     }
 
-    fn try_reclaim_from_remote_active(&mut self, pos: Point) -> Vec<Action> {
-        let Some(edge) = self.active_edge else {
-            return Vec::new();
-        };
-        if !detect_edge_reclaim(self.local_bounds, edge, pos, RECLAIM_THRESHOLD_PX) {
+    /// Driver side: the peer we were driving pushed the cursor back out
+    /// through the shared edge and sent `ReleaseBack`. Return to
+    /// `LocalActive`, drop suppression, warp our cursor back to where the
+    /// user left off, and release any modifiers (Tier 7.1: mandatory on
+    /// every exit from `RemoteActive`). No `SendReclaim` — the peer
+    /// initiated this and already knows.
+    fn on_received_release_back(&mut self) -> Vec<Action> {
+        if self.state != State::RemoteActive {
             return Vec::new();
         }
-        self.enter_local_active_from_remote()
-    }
-
-    fn enter_local_active_from_remote(&mut self) -> Vec<Action> {
         self.state = State::LocalActive;
-        self.active_edge = None;
         let warp_to = self
             .remembered_cursor
             .get(&self.local_node)
             .copied()
             .unwrap_or(Point { x: 0, y: 0 });
         vec![
-            Action::SendReclaim,
             Action::SetSuppression(false),
             Action::WarpCursor {
                 x: warp_to.x,
                 y: warp_to.y,
             },
+            Action::ReleaseAllModifiers,
         ]
     }
 
@@ -346,7 +430,6 @@ impl StateMachine {
             // work when everything else is broken".
             State::RemoteActive => {
                 self.state = State::LocalActive;
-                self.active_edge = None;
                 vec![
                     Action::SendEmergencyRelease,
                     Action::SetSuppression(false),
@@ -356,6 +439,7 @@ impl StateMachine {
             State::BeingDriven => {
                 self.state = State::LocalActive;
                 self.peer = None;
+                self.clear_driven_tracking();
                 vec![Action::SendEmergencyRelease, Action::ReleaseAllModifiers]
             }
             State::LocalActive | State::Disconnected | State::Locked => Vec::new(),
@@ -402,6 +486,13 @@ impl StateMachine {
                 bounds.y + bounds.height.cast_signed() - 1,
             ),
         };
+        // Arm the back-out detector fresh: the cursor is being placed
+        // exactly on `entry.edge`, and it has to travel `DRIVEN_BACKOUT_ARM_PX`
+        // inward before pushing back out through that edge counts as a
+        // deliberate hand-back (`on_driven_cursor_moved`).
+        self.driven_entry_edge = Some(entry.edge);
+        self.last_driven_cursor = Some(Point { x, y });
+        self.driven_backout_armed = false;
         vec![Action::WarpCursor { x, y }]
     }
 
@@ -411,6 +502,7 @@ impl StateMachine {
         }
         self.state = State::LocalActive;
         self.peer = None;
+        self.clear_driven_tracking();
         vec![Action::ReleaseAllModifiers]
     }
 
@@ -418,8 +510,8 @@ impl StateMachine {
         match self.state {
             State::RemoteActive | State::BeingDriven => {
                 self.state = State::LocalActive;
-                self.active_edge = None;
                 self.peer = None;
+                self.clear_driven_tracking();
                 vec![Action::SetSuppression(false), Action::ReleaseAllModifiers]
             }
             State::LocalActive | State::Disconnected | State::Locked => Vec::new(),
@@ -433,7 +525,7 @@ impl StateMachine {
         let was_active_or_driven = matches!(self.state, State::RemoteActive | State::BeingDriven);
         self.state = State::Disconnected;
         self.peer = None;
-        self.active_edge = None;
+        self.clear_driven_tracking();
 
         let mut actions = Vec::new();
         if was_active_or_driven {
@@ -659,29 +751,21 @@ mod tests {
         sm.handle(Input::CursorMoved(Point { x: 1919, y: 540 }), t0);
         assert_eq!(sm.state(), State::RemoteActive);
 
-        // Immediately try to reclaim well within the cooldown window — the
-        // *reclaim* path itself isn't cooldown-gated (only the outward
-        // handoff is, per Tier 7.2), so this should still succeed... a
-        // deliberate 59px pull-back, comfortably past RECLAIM_THRESHOLD_PX
-        // (jitter-sized wobbles must NOT reclaim — that's the whole point
-        // of the threshold).
-        let actions = sm.handle(Input::CursorMoved(Point { x: 1860, y: 540 }), t0);
+        // The peer pushes the cursor back onto its own screen and sends
+        // `ReleaseBack` — control returns to us immediately (this path
+        // isn't cooldown-gated; only the outward handoff is, per Tier 7.2).
+        let actions = sm.handle(Input::ReceivedReleaseBack, t0);
         assert_eq!(sm.state(), State::LocalActive);
-        assert!(actions.contains(&Action::SendReclaim));
+        assert!(actions.contains(&Action::SetSuppression(false)));
 
-        // ...but immediately sliding back to the edge again, inside the
-        // 200ms cooldown, must NOT trigger a second handoff.
+        // Immediately sliding back to the edge again, inside the 200ms
+        // cooldown, must NOT trigger a second handoff.
         let actions = sm.handle(
             Input::CursorMoved(Point { x: 1919, y: 540 }),
             t0 + Duration::from_millis(50),
         );
         assert_eq!(sm.state(), State::LocalActive);
-        assert!(
-            !actions.contains(&Action::SendHandoff(crate::topology::EdgePoint {
-                edge: crate::topology::Edge::Left,
-                pos: 0.5
-            }))
-        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::SendHandoff(_))));
 
         // After the cooldown elapses, the handoff can fire again.
         let actions = sm.handle(
@@ -689,6 +773,116 @@ mod tests {
             t0 + Duration::from_millis(250),
         );
         assert_eq!(sm.state(), State::RemoteActive, "actions were {actions:?}");
+    }
+
+    /// Reclaim now happens on the driven side: the machine being driven
+    /// integrates the cursor it's injecting and, once the cursor has been
+    /// pushed back out through the edge it entered on, hands control back.
+    #[test]
+    fn driven_side_hands_control_back_when_cursor_pushed_out_the_shared_edge() {
+        // `local` sits to the RIGHT of `peer` here, so a handoff from
+        // `peer` enters through `local`'s LEFT edge.
+        let local = NodeId::new();
+        let peer = NodeId::new();
+        let mut layout = Layout::new();
+        layout.set_placement(local, local_bounds());
+        layout.set_placement(
+            peer,
+            Rect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let mut sm = StateMachine::new(local, local_bounds(), layout);
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+
+        let entry = crate::topology::EdgePoint {
+            edge: crate::topology::Edge::Left,
+            pos: 0.5,
+        };
+        let actions = sm.handle(Input::ReceivedHandoff { from: peer, entry }, Instant::now());
+        assert_eq!(sm.state(), State::BeingDriven);
+        assert!(matches!(actions[0], Action::WarpCursor { x: 0, .. }));
+
+        // A tiny outward wobble before the cursor has come inward at all
+        // must NOT be read as an exit (the cursor was warped onto the edge).
+        let actions = sm.handle(
+            Input::DrivenCursorMoved(Point { x: -3, y: 540 }),
+            Instant::now(),
+        );
+        assert!(actions.is_empty());
+        assert_eq!(sm.state(), State::BeingDriven);
+
+        // Cursor travels well inside our screen — arms the back-out detector.
+        sm.handle(
+            Input::DrivenCursorMoved(Point { x: 400, y: 540 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::BeingDriven);
+
+        // Now pushed back out through the LEFT (shared) edge -> hand back.
+        let actions = sm.handle(
+            Input::DrivenCursorMoved(Point { x: -1, y: 540 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+        assert!(actions.contains(&Action::SendReleaseBack));
+        assert!(actions.contains(&Action::ReleaseAllModifiers));
+    }
+
+    #[test]
+    fn driven_cursor_moving_out_a_different_edge_does_not_hand_back() {
+        let (mut sm, _local, peer) = two_node_machine();
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+        let entry = crate::topology::EdgePoint {
+            edge: crate::topology::Edge::Left,
+            pos: 0.5,
+        };
+        sm.handle(Input::ReceivedHandoff { from: peer, entry }, Instant::now());
+        assert_eq!(sm.state(), State::BeingDriven);
+
+        sm.handle(
+            Input::DrivenCursorMoved(Point { x: 400, y: 540 }),
+            Instant::now(),
+        );
+        // Straight out the RIGHT edge — not the edge it entered on.
+        let actions = sm.handle(
+            Input::DrivenCursorMoved(Point { x: 1919, y: 540 }),
+            Instant::now(),
+        );
+        assert!(actions.is_empty());
+        assert_eq!(sm.state(), State::BeingDriven);
+    }
+
+    #[test]
+    fn received_release_back_only_acts_while_remote_active() {
+        let (mut sm, _, peer) = two_node_machine();
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+        // In LocalActive it's a no-op.
+        assert!(
+            sm.handle(Input::ReceivedReleaseBack, Instant::now())
+                .is_empty()
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+
+        // From RemoteActive it returns control and drops suppression.
+        sm.handle(Input::CursorMoved(Point { x: 960, y: 540 }), Instant::now());
+        sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::RemoteActive);
+        let actions = sm.handle(Input::ReceivedReleaseBack, Instant::now());
+        assert_eq!(sm.state(), State::LocalActive);
+        assert!(actions.contains(&Action::SetSuppression(false)));
+        assert!(actions.contains(&Action::ReleaseAllModifiers));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::WarpCursor { .. }))
+        );
     }
 
     #[test]

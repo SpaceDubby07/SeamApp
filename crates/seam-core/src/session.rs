@@ -116,17 +116,18 @@ pub struct Session {
     /// update back and forth forever).
     last_applied_from_peer: Option<ClipboardEvent>,
     ping_seq: u64,
-    /// Tier 7.2: while `RemoteActive`, the OS clamps our own (suppressed)
-    /// cursor's reported absolute position at whichever edge triggered
-    /// the handoff — pushing further in that direction can't produce a
-    /// new `MouseMoveAbs` reading, only continued `MouseDelta`s (a real
-    /// hardware delta on macOS; a since-last-real-sample delta on Windows
-    /// — see each platform's `capture.rs`). This tracks where the cursor
-    /// would logically be if it weren't clamped, seeded at the exact
-    /// crossing point and integrated purely from `MouseDelta`s from then
-    /// on, so reclaim detection (which needs a real, unclamped distance
-    /// from that edge) keeps working. `None` whenever not `RemoteActive`.
-    remote_drive_position: Option<Point>,
+    /// While `BeingDriven`: where the peer-driven cursor currently is, in
+    /// local pixels — seeded at the `Handoff` entry point (via the
+    /// `Action::WarpCursor` that transition emits) and integrated from
+    /// every relayed `MouseDelta` after that. Fed into the state machine
+    /// as `Input::DrivenCursorMoved` so it can detect the cursor being
+    /// pushed back out through the shared edge — the reclaim trigger,
+    /// which lives on THIS side now (see `ControlMessage::ReleaseBack`).
+    /// The driver never watches its own suppressed cursor for reclaim: on
+    /// macOS a suppressed cursor keeps physically moving, which made the
+    /// old local-side approach re-grab control constantly. `None` whenever
+    /// not `BeingDriven`.
+    driven_cursor: Option<Point>,
     /// Files queued to offer once whatever's currently sending (if
     /// anything) finishes — v1 sends one file at a time (Tier 15's
     /// single-peer simplification applied to transfers; nothing about the
@@ -352,7 +353,7 @@ impl Session {
             pending_image: None,
             last_applied_from_peer: None,
             ping_seq: 0,
-            remote_drive_position: None,
+            driven_cursor: None,
             pending_sends: VecDeque::new(),
             current_outgoing: None,
             incoming_transfers: HashMap::new(),
@@ -508,28 +509,18 @@ impl Session {
         }
 
         if let InputEvent::MouseMoveAbs { x, y } = event {
-            let was_remote_active = self.state_machine.state() == State::RemoteActive;
-            let actions = self
-                .state_machine
-                .handle(Input::CursorMoved(Point { x, y }), Instant::now());
-            self.execute_actions(actions).await?;
-            if !was_remote_active && self.state_machine.state() == State::RemoteActive {
-                // Tier 7.2: seeds the virtual drive position (below) at
-                // the exact crossing point. Everything past this relies
-                // on `MouseDelta`, not further `MouseMoveAbs` readings —
-                // see `remote_drive_position`'s docs for why.
-                self.remote_drive_position = Some(Point { x, y });
+            // Only `LocalActive` cares about our own cursor position, for
+            // edge-crossing detection. Once `RemoteActive` our cursor is
+            // suppressed (on macOS also decoupled and frozen), and reclaim
+            // is decided on the driven side now — feeding absolute
+            // readings in here while driving would do nothing but risk a
+            // spurious transition off a stale position.
+            if self.state_machine.state() == State::LocalActive {
+                let actions = self
+                    .state_machine
+                    .handle(Input::CursorMoved(Point { x, y }), Instant::now());
+                self.execute_actions(actions).await?;
             }
-        } else if let InputEvent::MouseDelta { dx, dy } = event
-            && self.state_machine.state() == State::RemoteActive
-            && let Some(pos) = self.remote_drive_position.as_mut()
-        {
-            pos.x += dx;
-            pos.y += dy;
-            let actions = self
-                .state_machine
-                .handle(Input::CursorMoved(*pos), Instant::now());
-            self.execute_actions(actions).await?;
         }
 
         // `MouseMoveAbs` is deliberately never relayed: the receiving
@@ -591,16 +582,16 @@ impl Session {
                 self.execute_actions(actions).await?;
             }
             ControlMessage::Reclaim => {
-                let actions = self.state_machine.handle(Input::ReceivedReclaim, now);
-                tracing::info!("peer reclaimed control");
-                self.execute_actions(actions).await?;
+                self.apply_peer_control_transition(Input::ReceivedReclaim)
+                    .await?;
+            }
+            ControlMessage::ReleaseBack => {
+                self.apply_peer_control_transition(Input::ReceivedReleaseBack)
+                    .await?;
             }
             ControlMessage::EmergencyRelease => {
-                let actions = self
-                    .state_machine
-                    .handle(Input::ReceivedEmergencyRelease, now);
-                tracing::info!("peer sent emergency release");
-                self.execute_actions(actions).await?;
+                self.apply_peer_control_transition(Input::ReceivedEmergencyRelease)
+                    .await?;
             }
             ControlMessage::MouseMove { .. }
             | ControlMessage::MouseDelta { .. }
@@ -610,6 +601,7 @@ impl Session {
             | ControlMessage::KeyDown { .. }
             | ControlMessage::KeyUp { .. } => {
                 self.inject_relayed_input(&msg)?;
+                self.track_driven_cursor(&msg, now).await?;
             }
             ControlMessage::ClipboardUpdate { seq, content } => {
                 self.handle_remote_clipboard_update(seq, content)?;
@@ -657,6 +649,20 @@ impl Session {
         Ok(())
     }
 
+    /// Feeds a peer-initiated control-transition input (`ReceivedReclaim`,
+    /// `ReceivedReleaseBack`, `ReceivedEmergencyRelease`) into the state
+    /// machine, runs the resulting actions, and clears the being-driven
+    /// cursor tracking — the shared shape of the three
+    /// `handle_control_message` arms that return control to one side or
+    /// the other.
+    async fn apply_peer_control_transition(&mut self, input: Input) -> Result<(), SessionError> {
+        let actions = self.state_machine.handle(input, Instant::now());
+        tracing::info!(?input, "peer-initiated control transition");
+        self.execute_actions(actions).await?;
+        self.driven_cursor = None;
+        Ok(())
+    }
+
     /// Injects a relayed input message while `BeingDriven`. Logs and
     /// ignores it otherwise — a well-behaved peer only sends these while
     /// we've told it we're being driven, so seeing one outside that state
@@ -674,6 +680,54 @@ impl Session {
         if let Some(event) = control_message_to_input_event(msg, self.local_bounds) {
             let event = self.remap.apply(event);
             self.sink.inject(&event)?;
+        }
+        Ok(())
+    }
+
+    /// While `BeingDriven`, keeps `driven_cursor` in step with the motion
+    /// we're injecting on the peer's behalf and feeds it to the state
+    /// machine, which decides when the cursor has been pushed back out
+    /// through the shared edge and control should return to the peer
+    /// (`Action::SendReleaseBack`). A no-op for non-motion messages and
+    /// outside `BeingDriven`.
+    ///
+    /// Integration is done here rather than reading the OS cursor back
+    /// because the driver only ever relays `MouseDelta` once driving
+    /// (never `MouseMove` — see `handle_capture_event`), so summing the
+    /// deltas from the `Handoff` entry point is both sufficient and
+    /// immune to the driven OS re-clamping the real cursor at its own
+    /// screen edge.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    async fn track_driven_cursor(
+        &mut self,
+        msg: &ControlMessage,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        if self.state_machine.state() != State::BeingDriven {
+            return Ok(());
+        }
+        let Some(mut pos) = self.driven_cursor else {
+            return Ok(());
+        };
+        match *msg {
+            ControlMessage::MouseDelta { dx, dy } => {
+                pos.x += i32::from(dx);
+                pos.y += i32::from(dy);
+            }
+            ControlMessage::MouseMove { x, y } => {
+                pos.x = self.local_bounds.x + (x * self.local_bounds.width as f32) as i32;
+                pos.y = self.local_bounds.y + (y * self.local_bounds.height as f32) as i32;
+            }
+            // Buttons/keys/scroll don't move the cursor.
+            _ => return Ok(()),
+        }
+        self.driven_cursor = Some(pos);
+        let actions = self
+            .state_machine
+            .handle(Input::DrivenCursorMoved(pos), now);
+        self.execute_actions(actions).await?;
+        if self.state_machine.state() != State::BeingDriven {
+            self.driven_cursor = None;
         }
         Ok(())
     }
@@ -1379,6 +1433,10 @@ impl Session {
                 tracing::info!("reclaiming control from peer");
                 self.control.send(&ControlMessage::Reclaim).await?;
             }
+            Action::SendReleaseBack => {
+                tracing::info!("cursor left our screen; handing control back to peer");
+                self.control.send(&ControlMessage::ReleaseBack).await?;
+            }
             Action::SendEmergencyRelease => {
                 tracing::info!("sending emergency release");
                 self.control.send(&ControlMessage::EmergencyRelease).await?;
@@ -1392,6 +1450,15 @@ impl Session {
             }
             Action::WarpCursor { x, y } => {
                 self.sink.warp_cursor(x, y)?;
+                // A warp issued while `BeingDriven` is the peer placing
+                // the cursor on our screen (the `Handoff` entry point) —
+                // seed/resync `driven_cursor` to it so back-out detection
+                // starts from the right place. A warp on any other
+                // transition (e.g. the driver warping its own cursor back
+                // on `ReleaseBack`) is deliberately not tracked here.
+                if self.state_machine.state() == State::BeingDriven {
+                    self.driven_cursor = Some(Point { x, y });
+                }
             }
             Action::StartHeartbeat => tracing::debug!("heartbeat already running"),
             Action::StartReconnect => {
@@ -1404,6 +1471,26 @@ impl Session {
             Action::SyncClipboard => {}
         }
         Ok(())
+    }
+}
+
+impl Drop for Session {
+    /// The non-negotiable safety net (Tier 7.1 / Tier 12.1): however a
+    /// session ends — `run` returning cleanly, `run` erroring, or the task
+    /// running `run` being `abort()`ed out from under it by the app's
+    /// `disconnect` command — the OS must not be left with input
+    /// suppressed, a modifier key stuck down, or the capture hook still
+    /// installed. On macOS a leaked+suppressed event tap swallows every
+    /// keystroke and mouse move system-wide until the process dies, so
+    /// this is the difference between "disconnect" and "reboot the Mac".
+    ///
+    /// All three calls are best-effort; there is nothing useful to do
+    /// with an error at drop time. `capture.stop()` also re-runs the
+    /// un-suppress internally, so ordering here is not load-bearing.
+    fn drop(&mut self) {
+        let _ = self.capture.set_suppression(false);
+        let _ = self.sink.release_all_modifiers();
+        let _ = self.capture.stop();
     }
 }
 
@@ -1896,16 +1983,14 @@ mod tests {
         assert_eq!(msg, ControlMessage::MouseDelta { dx: 5, dy: 0 });
     }
 
-    /// The other half of the same fix: reclaim must key off REAL motion
-    /// (accumulated deltas), not the OS-visible absolute position, since
-    /// that position can be stuck at the edge indefinitely while the user
-    /// is very much still moving the mouse.
+    /// The driver never reclaims off its own (suppressed, possibly still
+    /// drifting) cursor — accumulated local deltas while `RemoteActive`
+    /// are relayed to the peer as motion and nothing else.
     #[tokio::test]
-    async fn accumulated_delta_can_trigger_reclaim_even_though_os_position_stays_pinned() {
-        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+    async fn local_delta_while_remote_active_is_relayed_and_never_reclaims_locally() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
         let layout = adjacent_layout(a_node, b_node, true);
         let (mut session, _sink, suppressed) = session_with(a_control, a_node, layout).await;
-        let _b_control = b_control;
 
         session
             .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
@@ -1916,32 +2001,84 @@ mod tests {
             .await
             .expect("edge move");
         assert_eq!(session.state(), State::RemoteActive);
-
-        // Repeating the exact same clamped absolute reading must never
-        // reclaim on its own, no matter how many times it repeats.
-        for _ in 0..5 {
-            session
-                .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
-                .await
-                .expect("pinned move");
+        for _ in 0..2 {
+            b_control.recv().await.expect("recv").expect("not closed");
         }
+
+        // A long run of inward deltas — the old local-side reclaim would
+        // have fired on this. It must not now: it's just relayed motion.
+        for _ in 0..20 {
+            session
+                .handle_capture_event(InputEvent::MouseDelta { dx: -50, dy: 0 })
+                .await
+                .expect("delta");
+            assert_eq!(
+                b_control.recv().await.expect("recv").expect("not closed"),
+                ControlMessage::MouseDelta { dx: -50, dy: 0 }
+            );
+        }
+        assert_eq!(session.state(), State::RemoteActive);
+        assert_eq!(*suppressed.lock().expect("mutex poisoned"), vec![true]);
+    }
+
+    /// Reclaim happens on the DRIVEN side: once the peer-driven cursor is
+    /// pushed back out through the shared edge, that machine sends
+    /// `ReleaseBack` and the driver returns to `LocalActive`.
+    #[tokio::test]
+    async fn driven_side_push_back_through_shared_edge_returns_control_to_the_driver() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let a_layout = adjacent_layout(a_node, b_node, true);
+        let b_layout = adjacent_layout(b_node, a_node, false);
+        let (mut a_session, _a_sink, a_suppressed) =
+            session_with(a_control, a_node, a_layout).await;
+        let (mut b_session, _b_sink, _b_suppressed) =
+            session_with(b_control, b_node, b_layout).await;
+
+        // A hands off to B across A's right edge (B enters on its left).
+        a_session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
+            .await
+            .expect("first move");
+        a_session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+            .await
+            .expect("edge move");
+        assert_eq!(a_session.state(), State::RemoteActive);
+        for _ in 0..2 {
+            let msg = b_session.control.recv().await.expect("recv").expect("open");
+            b_session.handle_control_message(msg).await.expect("handle");
+        }
+        assert_eq!(b_session.state(), State::BeingDriven);
+
+        // A drives the cursor deep into B's screen (arms back-out)...
+        a_session
+            .handle_capture_event(InputEvent::MouseDelta { dx: 400, dy: 0 })
+            .await
+            .expect("delta in");
+        let msg = b_session.control.recv().await.expect("recv").expect("open");
+        b_session.handle_control_message(msg).await.expect("handle");
+        assert_eq!(b_session.state(), State::BeingDriven);
+
+        // ...then back out through B's left (shared) edge.
+        a_session
+            .handle_capture_event(InputEvent::MouseDelta { dx: -450, dy: 0 })
+            .await
+            .expect("delta out");
+        let msg = b_session.control.recv().await.expect("recv").expect("open");
+        b_session.handle_control_message(msg).await.expect("handle");
         assert_eq!(
-            session.state(),
-            State::RemoteActive,
-            "a repeated clamped absolute reading alone must not trigger reclaim"
+            b_session.state(),
+            State::LocalActive,
+            "driven side hands back"
         );
 
-        // Real leftward motion — via deltas, since that's all the OS can
-        // report once pinned — measurably exceeding the reclaim
-        // threshold must reclaim, even though no `MouseMoveAbs` ever
-        // reported a position off the edge.
-        session
-            .handle_capture_event(InputEvent::MouseDelta { dx: -50, dy: 0 })
-            .await
-            .expect("reclaim delta");
-        assert_eq!(session.state(), State::LocalActive);
+        // B's `ReleaseBack` reaches A, which returns to LocalActive and
+        // drops suppression.
+        let msg = a_session.control.recv().await.expect("recv").expect("open");
+        a_session.handle_control_message(msg).await.expect("handle");
+        assert_eq!(a_session.state(), State::LocalActive);
         assert_eq!(
-            *suppressed.lock().expect("mutex poisoned"),
+            *a_suppressed.lock().expect("mutex poisoned"),
             vec![true, false]
         );
     }

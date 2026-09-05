@@ -38,16 +38,18 @@ use seam_core::traits::InputCapture;
 use super::cg_ffi::{
     CFMachPortCreateRunLoopSource, CFMachPortInvalidate, CFMachPortRef, CFRelease,
     CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRun, CFRunLoopStop,
+    CGAssociateMouseAndMouseCursorPosition, CGDisplayHideCursor, CGDisplayShowCursor,
     CGEventGetIntegerValueField, CGEventGetLocation, CGEventRef, CGEventTapCreate,
-    CGEventTapEnable, CGEventTapProxy, CGPoint, K_CG_EVENT_FLAGS_CHANGED, K_CG_EVENT_KEY_DOWN,
-    K_CG_EVENT_KEY_UP, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED,
-    K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN,
-    K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN,
-    K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL,
-    K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
-    K_CG_EVENT_TAP_OPTION_DEFAULT, K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP,
-    K_CG_KEYBOARD_EVENT_AUTOREPEAT, K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER,
-    K_CG_MOUSE_EVENT_DELTA_X, K_CG_MOUSE_EVENT_DELTA_Y, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+    CGEventTapEnable, CGEventTapProxy, CGMainDisplayID, CGPoint, K_CG_EVENT_FLAGS_CHANGED,
+    K_CG_EVENT_KEY_DOWN, K_CG_EVENT_KEY_UP, K_CG_EVENT_LEFT_MOUSE_DOWN,
+    K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED,
+    K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP,
+    K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_EVENT_RIGHT_MOUSE_UP,
+    K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
+    K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, K_CG_EVENT_TAP_OPTION_DEFAULT,
+    K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP, K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+    K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER, K_CG_MOUSE_EVENT_DELTA_X,
+    K_CG_MOUSE_EVENT_DELTA_Y, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
     K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, kCFRunLoopCommonModes,
 };
 use super::keycodes::cgkeycode_to_keycode;
@@ -83,6 +85,10 @@ unsafe impl Send for SendableRunLoop {}
 pub struct Capture {
     thread: Option<JoinHandle<()>>,
     run_loop: Option<SendableRunLoop>,
+    /// Mirror of `SUPPRESS`, but owned by this handle so `set_suppression`
+    /// only touches the (ref-counted) cursor hide/show and the pointer
+    /// association on an actual change — never re-hiding or re-showing.
+    suppressing: bool,
 }
 
 impl Capture {
@@ -93,6 +99,33 @@ impl Capture {
         Self {
             thread: None,
             run_loop: None,
+            suppressing: false,
+        }
+    }
+}
+
+/// Decouples (`coupled == false`) or re-couples the on-screen pointer from
+/// physical mouse input. See `CGAssociateMouseAndMouseCursorPosition` in
+/// `cg_ffi.rs` for why this is needed on top of the tap consuming events.
+fn set_cursor_coupled(coupled: bool) {
+    // SAFETY: plain C call taking a `bool`, no preconditions. The
+    // association is process-global; `stop`/`Drop` always restore it.
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(coupled);
+    }
+}
+
+/// Hides or shows the hardware cursor on the main display. Hide/show are
+/// ref-counted by the OS, so callers must issue exactly one show per hide
+/// — `Capture::set_suppression` gates on `self.suppressing` to guarantee
+/// that.
+fn set_cursor_hidden(hidden: bool) {
+    // SAFETY: plain C calls taking a display id, no preconditions.
+    unsafe {
+        if hidden {
+            CGDisplayHideCursor(CGMainDisplayID());
+        } else {
+            CGDisplayShowCursor(CGMainDisplayID());
         }
     }
 }
@@ -203,6 +236,10 @@ impl InputCapture for Capture {
     }
 
     fn stop(&mut self) -> Result<(), PlatformError> {
+        // Never tear down leaving the pointer decoupled, hidden, or events
+        // suppressed — this runs on every session end, including an
+        // `abort()` mid-handoff (via `Session`'s `Drop`).
+        let _ = self.set_suppression(false);
         if let Some(SendableRunLoop(run_loop)) = self.run_loop.take() {
             // SAFETY: `run_loop` came from `CFRunLoopGetCurrent()` on the
             // still-running capture thread; `CFRunLoopStop` is documented
@@ -217,11 +254,33 @@ impl InputCapture for Capture {
 
     fn set_suppression(&mut self, suppress: bool) -> Result<(), PlatformError> {
         SUPPRESS.store(suppress, Ordering::SeqCst);
+        if suppress != self.suppressing {
+            // Returning NULL from the tap only hides events from other
+            // apps; without decoupling, the WindowServer keeps moving the
+            // real cursor (it visibly drifts across the local screen the
+            // whole time the peer is driven, and hot corners / edge
+            // gestures can fire). Deltas keep flowing either way, so
+            // relayed motion is unaffected.
+            set_cursor_coupled(!suppress);
+            set_cursor_hidden(suppress);
+            self.suppressing = suppress;
+        }
         Ok(())
     }
 
     fn is_healthy(&self) -> bool {
         self.thread.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+impl Drop for Capture {
+    /// Backstop for `Session`'s own `Drop`: if a `Capture` is ever
+    /// dropped without `stop()` having been called, the event tap thread
+    /// must still be torn down and the pointer restored — a leaked,
+    /// suppressing `CGEventTap` swallows all input system-wide until the
+    /// process exits.
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -328,12 +387,11 @@ unsafe extern "C" fn tap_callback(
             let CGPoint { x, y } = unsafe { CGEventGetLocation(event) };
 
             // Tier 7.2: the raw per-event delta, straight from the HID
-            // report — unlike `CGEventGetLocation` above, this is NOT
-            // clamped at the screen edge, which is what lets
-            // `seam-core::session`'s `remote_drive_position` keep
-            // tracking real motion once `RemoteActive` pins our own
-            // (suppressed) cursor at whichever edge triggered the
-            // handoff and `CGEventGetLocation` stops changing.
+            // report — unlike `CGEventGetLocation` above, this keeps
+            // flowing (in every direction) once `RemoteActive` decouples
+            // and freezes our own cursor via
+            // `CGAssociateMouseAndMouseCursorPosition`, so it's what
+            // carries the peer's motion over the wire while driving.
             // SAFETY: same as above.
             let dx = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_X) };
             // SAFETY: same as above.

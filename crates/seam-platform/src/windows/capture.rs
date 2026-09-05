@@ -193,6 +193,10 @@ impl InputCapture for Capture {
     }
 
     fn stop(&mut self) -> Result<(), PlatformError> {
+        // Never tear down with suppression still latched on — this runs on
+        // every session end, including an `abort()` mid-handoff (via
+        // `Session`'s `Drop`).
+        SUPPRESS.store(false, Ordering::SeqCst);
         if let Some(thread_id) = self.thread_id.take() {
             // SAFETY: posting WM_QUIT to a thread ID we obtained from
             // `GetCurrentThreadId` on that same (still-running) thread is
@@ -217,6 +221,15 @@ impl InputCapture for Capture {
 
     fn is_healthy(&self) -> bool {
         self.thread.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+impl Drop for Capture {
+    /// Backstop for `Session`'s own `Drop`: a `Capture` dropped without
+    /// `stop()` would leave the low-level hooks installed and (if a
+    /// handoff was active) suppression latched on, swallowing all input.
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -272,14 +285,13 @@ const RECENTER_MARGIN_PX: i32 = 200;
 /// again, so delta keeps flowing indefinitely in the same direction
 /// rather than dying the instant the edge is reached.
 ///
-/// # Why this doesn't fight reclaim detection
-/// The warp is filtered from ever becoming a `MouseMoveAbs`/`CursorMoved`
-/// reading at all (see the `injected` check below) — `seam-core::session`
-/// tracks its own "virtual" position by integrating real `MouseDelta`s
-/// from the crossing point onward (`remote_drive_position`), which this
-/// recentering never touches. Without that filtering, a 200px warp would
-/// look exactly like a reclaim gesture and immediately kick us back to
-/// `LocalActive`.
+/// # Why this doesn't fight anything downstream
+/// The warp is filtered from ever becoming a `MouseMoveAbs` reading at all
+/// (see the `injected` check below); only the true `MouseDelta`s it keeps
+/// alive are forwarded, and those are what `seam-core::session` relays to
+/// the peer as continued motion while driving. Reclaim itself now lives on
+/// the driven side (`ControlMessage::ReleaseBack`), so a recenter warp
+/// can't be mistaken for a reclaim gesture.
 fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
     // `LLMHF_INJECTED` marks an event as having come from `SendInput`/
     // `SetCursorPos` rather than real hardware — exactly what

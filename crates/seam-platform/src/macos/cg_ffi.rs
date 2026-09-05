@@ -141,6 +141,17 @@ unsafe extern "C" {
     pub fn CGEventSetFlags(event: CGEventRef, flags: u64);
     pub fn CGEventPost(tap: u32, event: CGEventRef);
     pub fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+
+    // ── Decoupling the hardware pointer during suppression ──
+    // Consuming a mouse-moved event in the tap hides it from apps but does
+    // NOT stop the WindowServer moving the on-screen cursor; disassociating
+    // freezes the cursor (and `CGEventGetLocation`) while HID deltas keep
+    // flowing. `CGDisplayHideCursor`/`ShowCursor` are ref-counted and must
+    // be balanced.
+    pub fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    pub fn CGDisplayHideCursor(display: CGDirectDisplayID) -> i32;
+    pub fn CGDisplayShowCursor(display: CGDirectDisplayID) -> i32;
+
     pub fn CFRelease(cf: CFTypeRef);
 
     // ── Display enumeration ──
