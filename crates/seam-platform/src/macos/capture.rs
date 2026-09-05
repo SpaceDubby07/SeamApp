@@ -47,8 +47,8 @@ use super::cg_ffi::{
     K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
     K_CG_EVENT_TAP_OPTION_DEFAULT, K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP,
     K_CG_KEYBOARD_EVENT_AUTOREPEAT, K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
-    kCFRunLoopCommonModes,
+    K_CG_MOUSE_EVENT_DELTA_X, K_CG_MOUSE_EVENT_DELTA_Y, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, kCFRunLoopCommonModes,
 };
 use super::keycodes::cgkeycode_to_keycode;
 
@@ -225,6 +225,13 @@ impl InputCapture for Capture {
     }
 }
 
+/// A single raw HID mouse-move delta report is always tiny (well within
+/// `i32` range) — this only guards against a theoretical extreme value
+/// rather than anything expected in practice.
+fn clamp_to_i32(v: i64) -> i32 {
+    i32::try_from(v.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
+}
+
 fn forward(event: InputEvent) {
     SINK.with(|cell| {
         if let Some(sink) = cell.borrow().as_ref() {
@@ -319,6 +326,25 @@ unsafe extern "C" fn tap_callback(
         | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
             // SAFETY: `event` is valid for the duration of this callback.
             let CGPoint { x, y } = unsafe { CGEventGetLocation(event) };
+
+            // Tier 7.2: the raw per-event delta, straight from the HID
+            // report — unlike `CGEventGetLocation` above, this is NOT
+            // clamped at the screen edge, which is what lets
+            // `seam-core::session`'s `remote_drive_position` keep
+            // tracking real motion once `RemoteActive` pins our own
+            // (suppressed) cursor at whichever edge triggered the
+            // handoff and `CGEventGetLocation` stops changing.
+            // SAFETY: same as above.
+            let dx = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_X) };
+            // SAFETY: same as above.
+            let dy = unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_DELTA_Y) };
+            if dx != 0 || dy != 0 {
+                forward(InputEvent::MouseDelta {
+                    dx: clamp_to_i32(dx),
+                    dy: clamp_to_i32(dy),
+                });
+            }
+
             #[allow(clippy::cast_possible_truncation)]
             Some(InputEvent::MouseMoveAbs {
                 x: x as i32,

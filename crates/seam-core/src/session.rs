@@ -120,6 +120,17 @@ pub struct Session {
     /// update back and forth forever).
     last_applied_from_peer: Option<ClipboardEvent>,
     ping_seq: u64,
+    /// Tier 7.2: while `RemoteActive`, the OS clamps our own (suppressed)
+    /// cursor's reported absolute position at whichever edge triggered
+    /// the handoff — pushing further in that direction can't produce a
+    /// new `MouseMoveAbs` reading, only continued `MouseDelta`s (a real
+    /// hardware delta on macOS; a since-last-real-sample delta on Windows
+    /// — see each platform's `capture.rs`). This tracks where the cursor
+    /// would logically be if it weren't clamped, seeded at the exact
+    /// crossing point and integrated purely from `MouseDelta`s from then
+    /// on, so reclaim detection (which needs a real, unclamped distance
+    /// from that edge) keeps working. `None` whenever not `RemoteActive`.
+    remote_drive_position: Option<Point>,
     /// Files queued to offer once whatever's currently sending (if
     /// anything) finishes — v1 sends one file at a time (Tier 15's
     /// single-peer simplification applied to transfers; nothing about the
@@ -240,6 +251,7 @@ impl Session {
             pending_image: None,
             last_applied_from_peer: None,
             ping_seq: 0,
+            remote_drive_position: None,
             pending_sends: VecDeque::new(),
             current_outgoing: None,
             incoming_transfers: HashMap::new(),
@@ -386,13 +398,39 @@ impl Session {
         }
 
         if let InputEvent::MouseMoveAbs { x, y } = event {
+            let was_remote_active = self.state_machine.state() == State::RemoteActive;
             let actions = self
                 .state_machine
                 .handle(Input::CursorMoved(Point { x, y }), Instant::now());
             self.execute_actions(actions).await?;
+            if !was_remote_active && self.state_machine.state() == State::RemoteActive {
+                // Tier 7.2: seeds the virtual drive position (below) at
+                // the exact crossing point. Everything past this relies
+                // on `MouseDelta`, not further `MouseMoveAbs` readings —
+                // see `remote_drive_position`'s docs for why.
+                self.remote_drive_position = Some(Point { x, y });
+            }
+        } else if let InputEvent::MouseDelta { dx, dy } = event
+            && self.state_machine.state() == State::RemoteActive
+            && let Some(pos) = self.remote_drive_position.as_mut()
+        {
+            pos.x += dx;
+            pos.y += dy;
+            let actions = self
+                .state_machine
+                .handle(Input::CursorMoved(*pos), Instant::now());
+            self.execute_actions(actions).await?;
         }
 
-        if self.state_machine.state() == State::RemoteActive {
+        // `MouseMoveAbs` is deliberately never relayed: the receiving
+        // side was already placed via `Handoff`'s entry point, and once
+        // driving, our own absolute position is unreliable right at the
+        // edge that triggered the handoff (Tier 7.2) — `MouseDelta`
+        // (relayed here like every other event) is what carries all
+        // motion from here on.
+        if self.state_machine.state() == State::RemoteActive
+            && !matches!(event, InputEvent::MouseMoveAbs { .. })
+        {
             let msg = input_event_to_control_message(&event, self.local_bounds);
             self.control.send(&msg).await?;
         }
@@ -1590,6 +1628,105 @@ mod tests {
         // screen.
         assert_eq!(warps[0].0, 0);
         assert!((warps[0].1 - 540).abs() <= 1);
+    }
+
+    /// Tier 7.2: real hardware verification (M4's cross-machine test)
+    /// found that once `RemoteActive`, the OS clamps the local cursor's
+    /// reported position at the edge that triggered the handoff — every
+    /// further `MouseMoveAbs` reads the SAME stuck value no matter how
+    /// far the physical mouse keeps moving. Relaying that absolute
+    /// position would just repeatedly re-pin the peer's cursor at the
+    /// entry point; only `MouseDelta` (independent of the OS's clamped
+    /// absolute value on macOS, and computed since the last real sample
+    /// on Windows — see each platform's `capture.rs`) can carry
+    /// continued motion, so it's the only thing relayed once driving.
+    #[tokio::test]
+    async fn mouse_move_abs_is_never_relayed_but_delta_is_once_remote_active() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, ..) = session_with(a_control, a_node, layout).await;
+
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
+            .await
+            .expect("first move");
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+            .await
+            .expect("edge move");
+        assert_eq!(session.state(), State::RemoteActive);
+
+        // Drain the ModifierState + Handoff the crossing itself produced.
+        for _ in 0..2 {
+            b_control.recv().await.expect("recv").expect("not closed");
+        }
+
+        // The OS keeps reporting the same clamped position — must not be
+        // relayed as a fresh `MouseMove`.
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 541 })
+            .await
+            .expect("pinned move");
+
+        // A real delta must be relayed immediately, and — since the
+        // pinned move above must not have queued anything — must be the
+        // very next message on the wire.
+        session
+            .handle_capture_event(InputEvent::MouseDelta { dx: 5, dy: 0 })
+            .await
+            .expect("delta");
+        let msg = b_control.recv().await.expect("recv").expect("not closed");
+        assert_eq!(msg, ControlMessage::MouseDelta { dx: 5, dy: 0 });
+    }
+
+    /// The other half of the same fix: reclaim must key off REAL motion
+    /// (accumulated deltas), not the OS-visible absolute position, since
+    /// that position can be stuck at the edge indefinitely while the user
+    /// is very much still moving the mouse.
+    #[tokio::test]
+    async fn accumulated_delta_can_trigger_reclaim_even_though_os_position_stays_pinned() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, suppressed) = session_with(a_control, a_node, layout).await;
+        let _b_control = b_control;
+
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
+            .await
+            .expect("first move");
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+            .await
+            .expect("edge move");
+        assert_eq!(session.state(), State::RemoteActive);
+
+        // Repeating the exact same clamped absolute reading must never
+        // reclaim on its own, no matter how many times it repeats.
+        for _ in 0..5 {
+            session
+                .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+                .await
+                .expect("pinned move");
+        }
+        assert_eq!(
+            session.state(),
+            State::RemoteActive,
+            "a repeated clamped absolute reading alone must not trigger reclaim"
+        );
+
+        // Real leftward motion — via deltas, since that's all the OS can
+        // report once pinned — measurably exceeding the reclaim
+        // threshold must reclaim, even though no `MouseMoveAbs` ever
+        // reported a position off the edge.
+        session
+            .handle_capture_event(InputEvent::MouseDelta { dx: -10, dy: 0 })
+            .await
+            .expect("reclaim delta");
+        assert_eq!(session.state(), State::LocalActive);
+        assert_eq!(
+            *suppressed.lock().expect("mutex poisoned"),
+            vec![true, false]
+        );
     }
 
     #[tokio::test]

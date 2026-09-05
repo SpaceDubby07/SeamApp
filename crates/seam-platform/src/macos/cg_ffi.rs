@@ -81,6 +81,8 @@ pub const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 
 // ─────────────────────────── CGEventField ───────────────────────────
 pub const K_CG_MOUSE_EVENT_BUTTON_NUMBER: u32 = 3;
+pub const K_CG_MOUSE_EVENT_DELTA_X: u32 = 4;
+pub const K_CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
 pub const K_CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 pub const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: u32 = 11; // vertical

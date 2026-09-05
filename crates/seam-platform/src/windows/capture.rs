@@ -24,15 +24,17 @@ use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc::UnboundedSender;
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -59,6 +61,14 @@ thread_local! {
     // existed in the classic WM_KEYDOWN lParam, not the low-level hook
     // struct), so we track currently-held keys ourselves to derive it.
     static HELD_KEYS: RefCell<HashSet<KeyCode>> = RefCell::new(HashSet::new());
+
+    // Tier 7.2: the last real (non-injected) absolute position we saw,
+    // used to compute `InputEvent::MouseDelta` — `MSLLHOOKSTRUCT` carries
+    // no delta field of its own (unlike macOS's `CGEventGetIntegerValueField`
+    // with `kCGMouseEventDeltaX/Y`), so this is derived by diffing
+    // consecutive readings instead. See `recenter_if_pinned`'s docs for
+    // why this alone isn't enough once suppressed.
+    static LAST_REAL_POS: RefCell<Option<POINT>> = const { RefCell::new(None) };
 }
 
 /// Windows implementation of [`seam_core::traits::InputCapture`].
@@ -238,6 +248,111 @@ fn forward(event: InputEvent) {
     });
 }
 
+/// Tier 7.2: pulled back off whichever virtual-desktop edge a suppressed
+/// cursor is pinned against, once `recenter_if_pinned` warps it — large
+/// enough that the OS doesn't immediately re-clamp on the very next tiny
+/// real movement, small enough to stay well within any real multi-monitor
+/// layout.
+const RECENTER_MARGIN_PX: i32 = 200;
+
+/// Handles one `WM_MOUSEMOVE`: derives `MouseDelta` from the raw absolute
+/// reading (`MSLLHOOKSTRUCT` carries no delta field of its own, unlike
+/// macOS's `CGEventGetIntegerValueField` with `kCGMouseEventDeltaX/Y`),
+/// and — while suppressed — proactively un-clamps the cursor from
+/// whichever virtual-desktop edge it's pinned against.
+///
+/// # Why the recenter warp is needed at all
+/// Once `RemoteActive`, our own cursor sits suppressed at the edge that
+/// triggered the handoff. Windows clamps `MSLLHOOKSTRUCT.pt` to the
+/// virtual desktop's bounds, so once the real cursor is pinned at x=0 (or
+/// any other edge), further real hardware motion in that direction keeps
+/// arriving as `WM_MOUSEMOVE` but with the EXACT SAME `pt` every time —
+/// there is no lower value for the OS to report. Nudging the cursor back
+/// by `RECENTER_MARGIN_PX` gives the OS room to register fresh motion
+/// again, so delta keeps flowing indefinitely in the same direction
+/// rather than dying the instant the edge is reached.
+///
+/// # Why this doesn't fight reclaim detection
+/// The warp is filtered from ever becoming a `MouseMoveAbs`/`CursorMoved`
+/// reading at all (see the `injected` check below) — `seam-core::session`
+/// tracks its own "virtual" position by integrating real `MouseDelta`s
+/// from the crossing point onward (`remote_drive_position`), which this
+/// recentering never touches. Without that filtering, a 200px warp would
+/// look exactly like a reclaim gesture and immediately kick us back to
+/// `LocalActive`.
+fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
+    // `LLMHF_INJECTED` marks an event as having come from `SendInput`/
+    // `SetCursorPos` rather than real hardware — exactly what
+    // `recenter_if_pinned` generates when it warps us. Silently resync the
+    // delta baseline to it and stop: it must never be treated as real
+    // motion, or it would both double-count as a spurious `MouseDelta` and
+    // look like a false reclaim gesture.
+    if (info.flags & LLMHF_INJECTED) != 0 {
+        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(info.pt));
+        return None;
+    }
+
+    let previous = LAST_REAL_POS.with(|cell| cell.borrow_mut().replace(info.pt));
+    if let Some(previous) = previous {
+        let dx = info.pt.x - previous.x;
+        let dy = info.pt.y - previous.y;
+        if dx != 0 || dy != 0 {
+            forward(InputEvent::MouseDelta { dx, dy });
+        }
+    }
+
+    if SUPPRESS.load(Ordering::SeqCst) {
+        recenter_if_pinned(info.pt);
+    }
+
+    Some(InputEvent::MouseMoveAbs {
+        x: info.pt.x,
+        y: info.pt.y,
+    })
+}
+
+/// Warps the cursor `RECENTER_MARGIN_PX` off any virtual-desktop edge
+/// `pt` is currently pinned against. See `handle_mouse_move`'s docs for
+/// why this exists and why it's safe against feedback loops/false
+/// reclaims.
+fn recenter_if_pinned(pt: POINT) {
+    // SAFETY: `GetSystemMetrics` takes a plain metric index and has no
+    // preconditions.
+    let (left, top, width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+
+    let mut target = pt;
+    let mut pinned = false;
+    if pt.x <= left {
+        target.x = left + RECENTER_MARGIN_PX;
+        pinned = true;
+    } else if pt.x >= left + width - 1 {
+        target.x = left + width - 1 - RECENTER_MARGIN_PX;
+        pinned = true;
+    }
+    if pt.y <= top {
+        target.y = top + RECENTER_MARGIN_PX;
+        pinned = true;
+    } else if pt.y >= top + height - 1 {
+        target.y = top + height - 1 - RECENTER_MARGIN_PX;
+        pinned = true;
+    }
+
+    if pinned {
+        // SAFETY: `SetCursorPos` takes plain integer coordinates; the
+        // resulting synthetic `WM_MOUSEMOVE` is what `handle_mouse_move`
+        // filters via `LLMHF_INJECTED` above.
+        let _ = unsafe { SetCursorPos(target.x, target.y) };
+        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(target));
+    }
+}
+
 /// # Safety
 /// Called by the OS per the `WH_MOUSE_LL` contract: `ncode`/`wparam`/
 /// `lparam` are whatever the system passes to a low-level mouse hook
@@ -252,10 +367,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         // to fit u32 even though it's widened to usize on 64-bit targets.
         let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
         let event = match msg {
-            WM_MOUSEMOVE => Some(InputEvent::MouseMoveAbs {
-                x: info.pt.x,
-                y: info.pt.y,
-            }),
+            WM_MOUSEMOVE => handle_mouse_move(info),
             WM_LBUTTONDOWN => Some(InputEvent::MouseDown {
                 button: MouseButton::Left,
             }),
