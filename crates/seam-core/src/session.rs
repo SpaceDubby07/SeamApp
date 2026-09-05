@@ -164,7 +164,8 @@ pub struct Session {
 /// demo today; a Tauri command layer eventually) — nothing in `session` or
 /// `transfer` does UI work of its own (Tier 4.5: channels over shared
 /// mutexes, applied to the session/UI boundary too).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
 pub enum SessionEvent {
     /// The peer told us its screens (Tier 8.1's layout canvas needs real
     /// aspect ratios/resolutions to render tiles to scale) — sent once
@@ -861,7 +862,30 @@ impl Session {
     /// Forwards the peer's `ControlMessage::ScreenConfig` to the driver —
     /// nothing here needs it, it's purely so a layout canvas can render
     /// the peer's tile at its real resolution.
+    ///
+    /// `virtual_bounds` is in the PEER's own coordinate space — never
+    /// meaningful as a position in ours (Tier 8.1's layout canvas only
+    /// uses it for the tile's real width/height/aspect ratio). If we've
+    /// already placed the peer (the naive initial placement `Session::new`
+    /// callers make before either side's real size is known, or a prior
+    /// `LayoutUpdate`), correct that placement's SIZE to the peer's real
+    /// one while preserving its position — keeping it touching whichever
+    /// edge it was already on — and tell the driver via `LayoutChanged`
+    /// so a layout canvas doesn't have to reconcile size and position
+    /// from two separate events itself.
     fn handle_peer_screen_config(&mut self, displays: Vec<Display>, virtual_bounds: Rect) {
+        if let Some(current) = self.state_machine.peer_bounds() {
+            let corrected = Rect {
+                width: virtual_bounds.width,
+                height: virtual_bounds.height,
+                ..current
+            };
+            self.state_machine
+                .set_peer_placement(self.control.peer_node_id, corrected);
+            let _ = self.event_tx.send(SessionEvent::LayoutChanged {
+                peer_bounds: corrected,
+            });
+        }
         let _ = self.event_tx.send(SessionEvent::PeerScreenConfig {
             displays,
             virtual_bounds,

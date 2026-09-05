@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::protocol::{OsKind, PROTOCOL_VERSION};
@@ -31,7 +32,7 @@ mod txt_keys {
 
 /// A peer discovered via mDNS, resolved to enough detail to dial it
 /// directly with [`crate::net::control::ControlChannel::connect`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveredPeer {
     /// The peer's stable node identity, from its TXT record — the actual
     /// `Handshake` still carries the authoritative copy; this is only used
@@ -72,6 +73,13 @@ pub enum DiscoveryError {
 /// Owns the mDNS daemon thread `mdns-sd` spawns internally. Advertising and
 /// browsing are independent calls — a node normally does both (Tier 8.1's
 /// "discovered devices" panel while also being discoverable itself).
+///
+/// `Clone` is cheap and shares the same underlying daemon (`ServiceDaemon`
+/// itself is `Clone` for exactly this reason: it's just a channel handle
+/// to the one background thread) — handy for a caller that wants to keep
+/// one handle alive for the process's lifetime while moving another into
+/// a spawned task, without needing an `Arc`.
+#[derive(Clone)]
 pub struct Discovery {
     daemon: ServiceDaemon,
 }

@@ -15,5 +15,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+mod platform;
 #[cfg(windows)]
 pub mod windows;
+
+pub use platform::{Platform, current_platform, has_input_permission, request_input_permission};
