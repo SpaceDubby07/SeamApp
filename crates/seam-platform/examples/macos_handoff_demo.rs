@@ -1,60 +1,54 @@
-//! M4 demo (Tier 13 of the build guide): a real Windows<->Windows handoff
-//! over the network. Wires seam-platform's real Capture/Sink/Screens into
-//! seam-core's `Session`, connects two machines over the control channel,
-//! and lets you drive the cursor across the shared edge to see it land on
-//! the other machine.
+//! M4/M8 demo (Tier 13 of the build guide): the macOS side of a real
+//! cross-machine handoff, mirroring `windows_handoff_demo`. Run this on the
+//! Mac and `windows_handoff_demo` on the PC to test an actual
+//! Windows<->macOS session — the pairing you'll actually ship.
 //!
-//! REQUIRES TWO WINDOWS MACHINES (or two Windows VMs) on the same network.
-//! Windows' low-level input hooks are global and per-process-independent —
-//! running two instances of this demo on ONE machine means both processes
-//! see and react to the SAME physical mouse/keyboard simultaneously, which
-//! doesn't exercise anything meaningful. For single-machine protocol/state
-//! testing without real hardware, see `seam-core`'s `session::tests`
-//! (mock platforms driven over real loopback TCP — Tier 12.3's "two
-//! in-process nodes over loopback" pattern) instead.
+//! Requires Accessibility (and possibly Input Monitoring) permission —
+//! see `macos_capture_demo`'s doc comment. This demo checks and guides you
+//! through granting it before doing anything else.
 //!
-//! Usage, on machine A (the "listener"):
-//!   cargo run -p seam-platform --example windows_handoff_demo -- listen
+//! Usage, on the Mac (the "listener"):
+//!   cargo run -p seam-platform --example macos_handoff_demo -- listen
 //!
-//! On machine B (the "connector"), using A's LAN IP:
-//!   cargo run -p seam-platform --example windows_handoff_demo -- connect 192.168.1.50
+//! On the Mac (the "connector"), using the peer's LAN IP:
+//!   cargo run -p seam-platform --example macos_handoff_demo -- connect 192.168.1.50
 //!
 //! Or skip the IP entirely (M9, Tier 7.6) — both sides advertise
 //! themselves over mDNS regardless of role, so `discover` finds whichever
 //! peer answers first and connects to it:
-//!   cargo run -p seam-platform --example windows_handoff_demo -- discover
+//!   cargo run -p seam-platform --example macos_handoff_demo -- discover
 //!
 //! Both the control port (24800) and the bulk port (24801, Tier 6.5:
 //! control port + 1) are fixed — this demo doesn't take a custom port.
+//! Whichever side runs `listen` is placed to the left of whichever side
+//! runs `connect`, same convention as `windows_handoff_demo`.
 //!
-//! Push your cursor to the shared edge (A's right / B's left) to hand
-//! off. Ctrl+Alt+Shift+Escape forces control back to whichever machine
-//! you press it on, regardless of who's currently driving. Copying text or
-//! an image on either machine syncs it to the other's clipboard (M7).
+//! Push your cursor to the shared edge to hand off. Ctrl+Alt+Shift+Escape
+//! forces control back to whichever machine you press it on, regardless of
+//! who's currently driving. Copying text or an image on either machine
+//! syncs it to the other's clipboard (M7).
 //!
-//! Append `--remap windows-on-mac` to either invocation to load the
-//! Ctrl<->Cmd remap preset for that run (M6, Tier 7.3) — mostly useful for
-//! poking at the remap table's config persistence with two Windows boxes,
-//! since the real Ctrl<->Cmd swap only matters once one side is a Mac.
+//! Append `--remap windows-on-mac` to the invocation running ON the Mac
+//! when the peer is a Windows keyboard, to load the Ctrl<->Cmd remap
+//! preset (M6, Tier 7.3) — remapping happens on the receiving side, so
+//! this flag matters on whichever machine is being driven by a keyboard
+//! whose modifier layout doesn't match its own OS.
 //!
-//! The FIRST time these two machines connect, both TLS certificates are
-//! new to each other — this demo drops into the pairing flow (M8, Tier
-//! 7.6): it prints a 6-digit code and waits for you to press Enter after
-//! confirming the SAME code printed on the other machine, then pins the
-//! peer's fingerprint to config so every later run connects straight
-//! through. Running `connect`/`listen` again against an already-paired
-//! peer whose certificate has since changed (e.g. a re-imaged machine, or
-//! an actual attacker) hard-fails instead of silently reconnecting.
+//! First connection between two machines goes through the pairing flow
+//! (M8, Tier 7.6): both sides print a 6-digit code — confirm it matches on
+//! both screens, then press Enter on both to pin fingerprints. Later runs
+//! connect straight through; a changed peer certificate hard-fails
+//! instead of silently reconnecting.
 
 /// Control port (Tier 6.5). Fixed for this demo — no custom-port support.
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
 const CONTROL_PORT: u16 = 24800;
 
 /// Bulk port: control port + 1, by the same Tier 6.5 convention.
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
 const BULK_PORT: u16 = 24801;
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
 fn main() {
     use seam_core::config::Config;
     use seam_core::net::bulk::BulkChannel;
@@ -66,19 +60,29 @@ fn main() {
     use seam_core::session::Session;
     use seam_core::state::StateMachine;
     use seam_core::topology::{Layout, Rect};
-    use seam_core::traits::ScreenInfo;
-    use seam_platform::windows::{Capture, Clipboard, Screens, Sink};
+    use seam_core::traits::{PermissionGate, ScreenInfo};
+    use seam_platform::macos::{Capture, Clipboard, Permissions, Screens, Sink};
 
     tracing_subscriber::fmt::init();
+
+    // Without Accessibility permission `CGEventTapCreate` silently no-ops
+    // (Tier 11.1) — check up front so a missing grant shows a clear
+    // message instead of a session that starts but never sees input.
+    let permissions = Permissions::new();
+    if !permissions.has_input_permission() {
+        println!("Accessibility permission not yet granted.");
+        println!("Opening System Settings > Privacy & Security > Accessibility...");
+        let _ = permissions.request_input_permission();
+        println!("Grant permission there (to your terminal app), then re-run this demo.");
+        return;
+    }
 
     let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).cloned();
     let peer_arg = args.get(2).cloned();
 
-    // M6: node identity, display name, and the remap table now come from
-    // persisted config rather than being regenerated every run — pass
-    // `--remap windows-on-mac` to load the Ctrl<->Cmd preset when this
-    // Windows machine is driving a Mac peer.
+    // M6: node identity, display name, and the remap table come from
+    // persisted config rather than being regenerated every run.
     let config_path = Config::default_path().expect("could not determine config directory");
     let mut config = Config::load_or_create(&config_path).expect("failed to load config");
     if args.get(3).map(String::as_str) == Some("--remap")
@@ -117,7 +121,7 @@ fn main() {
             .advertise(
                 local_node,
                 &config.display_name,
-                OsKind::Windows,
+                OsKind::MacOs,
                 CONTROL_PORT,
             )
             .expect("failed to advertise via mDNS");
@@ -158,7 +162,7 @@ fn main() {
                     &control_listener,
                     local_node,
                     &config.display_name,
-                    OsKind::Windows,
+                    OsKind::MacOs,
                     &identity,
                     trust,
                 )
@@ -180,7 +184,7 @@ fn main() {
                     control_target,
                     local_node,
                     &config.display_name,
-                    OsKind::Windows,
+                    OsKind::MacOs,
                     &identity,
                     trust,
                 )
@@ -191,7 +195,7 @@ fn main() {
                 )
             }
             _ => {
-                eprintln!("usage: windows_handoff_demo listen | connect <peer-host> | discover");
+                eprintln!("usage: macos_handoff_demo listen | connect <peer-host> | discover");
                 std::process::exit(1);
             }
         };
@@ -204,8 +208,7 @@ fn main() {
 
         // Pairing (M8, Tier 7.6): only reached the first time we've ever
         // talked to this peer. A human confirms the same code shows on
-        // both screens before we pin the fingerprint — this is what
-        // actually defeats a MITM (see `net::pairing`'s doc comment).
+        // both screens before we pin the fingerprint.
         if is_pairing {
             let code = pairing_code(identity.fingerprint, control.peer_fingerprint);
             println!("\nPAIRING CODE: {code}");
@@ -296,7 +299,7 @@ fn main() {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "macos"))]
 fn main() {
-    println!("windows_handoff_demo is Windows-only; nothing to run on this platform.");
+    println!("macos_handoff_demo is macOS-only; nothing to run on this platform.");
 }
