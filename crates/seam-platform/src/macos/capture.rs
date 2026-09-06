@@ -38,14 +38,14 @@ use seam_core::traits::InputCapture;
 use super::cg_ffi::{
     CFMachPortCreateRunLoopSource, CFMachPortInvalidate, CFMachPortRef, CFRelease,
     CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRun, CFRunLoopStop,
-    CGDisplayBounds, CGDisplayHideCursor, CGDisplayShowCursor, CGEventGetIntegerValueField,
-    CGEventGetLocation, CGEventRef, CGEventTapCreate, CGEventTapEnable, CGEventTapProxy,
-    CGMainDisplayID, CGPoint, CGWarpMouseCursorPosition, K_CG_EVENT_FLAGS_CHANGED,
-    K_CG_EVENT_KEY_DOWN, K_CG_EVENT_KEY_UP, K_CG_EVENT_LEFT_MOUSE_DOWN,
-    K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED,
-    K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP,
-    K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_EVENT_RIGHT_MOUSE_UP,
-    K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
+    CGAssociateMouseAndMouseCursorPosition, CGDisplayBounds, CGDisplayHideCursor,
+    CGDisplayShowCursor, CGEventGetIntegerValueField, CGEventGetLocation, CGEventRef,
+    CGEventTapCreate, CGEventTapEnable, CGEventTapProxy, CGMainDisplayID, CGPoint,
+    CGWarpMouseCursorPosition, K_CG_EVENT_FLAGS_CHANGED, K_CG_EVENT_KEY_DOWN, K_CG_EVENT_KEY_UP,
+    K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP,
+    K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED,
+    K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
+    K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
     K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, K_CG_EVENT_TAP_OPTION_DEFAULT,
     K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP, K_CG_KEYBOARD_EVENT_AUTOREPEAT,
     K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER, K_CG_MOUSE_EVENT_DELTA_X,
@@ -59,13 +59,11 @@ use super::keycodes::cgkeycode_to_keycode;
 /// (`current_platform()` constructs exactly one `Platform` bundle).
 static SUPPRESS: AtomicBool = AtomicBool::new(false);
 
-/// Where the tap callback warps the (hidden) cursor back to on every move
-/// while suppressed — set to the main display's centre by
-/// `set_suppression`. Pinning it there (rather than
-/// `CGAssociateMouseAndMouseCursorPosition(false)`) keeps the window server
-/// from drifting the cursor off-screen, which on a sustained one-direction
-/// drag would starve `kCGMouseEventDeltaX/Y` and freeze the peer's cursor
-/// — the "moves onto Windows fine but can't come back" bug. `CGWarpMouse…`
+/// Where the tap callback warps the (hidden, disassociated) cursor back to
+/// on every move while suppressed — the main display's centre, set by
+/// `set_suppression`. Disassociation alone freezes the on-screen cursor
+/// but the OS's internal pointer location can still wander; re-warping to
+/// a fixed anchor keeps `CGEventGetLocation` pinned. `CGWarpMouse…`
 /// generates no event, so the warp never re-enters this tap.
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
@@ -112,6 +110,18 @@ impl Capture {
             run_loop: None,
             suppressing: false,
         }
+    }
+}
+
+/// Associates (`true`) or disassociates the on-screen pointer from
+/// physical mouse input. Disassociated while suppressed so warping the
+/// cursor back to the anchor doesn't hit the post-warp local-event
+/// suppression window (which would freeze the peer's cursor).
+fn set_cursor_associated(associated: bool) {
+    // SAFETY: plain C call taking a `bool`, no preconditions. Process-wide;
+    // `set_suppression(false)` / `stop` / `Drop` always restore it.
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(associated);
     }
 }
 
@@ -282,16 +292,21 @@ impl InputCapture for Capture {
         SUPPRESS.store(suppress, Ordering::SeqCst);
         if suppress != self.suppressing {
             if suppress {
-                // Pin the (now hidden) cursor at the display centre; the
-                // tap callback warps it back here on every move so it
-                // can't drift off-screen and stall the delta stream, and
-                // so it can't trip hot corners while the peer is driven.
+                // Disassociate first (so the warp below and the per-move
+                // warps in the tap callback don't trip the post-warp event
+                // suppression), then pin the hidden cursor at the display
+                // centre. Together this keeps the on-screen cursor still
+                // and off the hot corners while HID deltas keep flowing.
+                set_cursor_associated(false);
                 let (cx, cy) = main_display_centre();
                 ANCHOR_X.store(cx, Ordering::SeqCst);
                 ANCHOR_Y.store(cy, Ordering::SeqCst);
                 warp_cursor_to(cx, cy);
+                set_cursor_hidden(true);
+            } else {
+                set_cursor_hidden(false);
+                set_cursor_associated(true);
             }
-            set_cursor_hidden(suppress);
             self.suppressing = suppress;
         }
         Ok(())

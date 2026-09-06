@@ -142,12 +142,15 @@ unsafe extern "C" {
     pub fn CGEventPost(tap: u32, event: CGEventRef);
     pub fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
 
-    // ── Decoupling the hardware pointer during suppression ──
+    // ── Pinning the hardware pointer during suppression ──
     // Consuming a mouse-moved event in the tap hides it from apps but does
-    // NOT stop the WindowServer moving the on-screen cursor; disassociating
-    // freezes the cursor (and `CGEventGetLocation`) while HID deltas keep
-    // flowing. `CGDisplayHideCursor`/`ShowCursor` are ref-counted and must
-    // be balanced.
+    // NOT stop the window server moving the on-screen cursor. Disassociating
+    // (`connected = false`) stops the cursor moving AND removes the ~0.25s
+    // local-event suppression window that `CGWarpMouseCursorPosition`
+    // otherwise triggers while associated — so we can warp the cursor back
+    // to an anchor on every move without starving the HID delta stream.
+    // `CGDisplayHideCursor`/`ShowCursor` are ref-counted and must be
+    // balanced.
     pub fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     pub fn CGDisplayHideCursor(display: CGDirectDisplayID) -> i32;
     pub fn CGDisplayShowCursor(display: CGDirectDisplayID) -> i32;

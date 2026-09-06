@@ -128,6 +128,11 @@ pub struct Session {
     /// old local-side approach re-grab control constantly. `None` whenever
     /// not `BeingDriven`.
     driven_cursor: Option<Point>,
+    /// Count of `MouseDelta`s relayed since the current `RemoteActive`
+    /// began — purely so a throttled `debug!` on the driver can show, in
+    /// the log, that motion IS reaching the peer while driving (the send
+    /// path itself is otherwise silent). Reset on each `SendHandoff`.
+    relayed_while_driving: u64,
     /// Files queued to offer once whatever's currently sending (if
     /// anything) finishes — v1 sends one file at a time (Tier 15's
     /// single-peer simplification applied to transfers; nothing about the
@@ -354,6 +359,7 @@ impl Session {
             last_applied_from_peer: None,
             ping_seq: 0,
             driven_cursor: None,
+            relayed_while_driving: 0,
             pending_sends: VecDeque::new(),
             current_outgoing: None,
             incoming_transfers: HashMap::new(),
@@ -534,6 +540,20 @@ impl Session {
         {
             let msg = input_event_to_control_message(&event, self.local_bounds);
             self.control.send(&msg).await?;
+            if matches!(event, InputEvent::MouseDelta { .. }) {
+                self.relayed_while_driving += 1;
+                // First relayed delta, then roughly once a second of
+                // continuous movement — enough to show in the log that
+                // motion is reaching the peer, without spamming it.
+                if self.relayed_while_driving % 60 == 1 {
+                    tracing::debug!(
+                        relayed = self.relayed_while_driving,
+                        "relaying motion to peer while driving"
+                    );
+                }
+            } else {
+                tracing::debug!(?event, "relaying input to peer while driving");
+            }
         }
         Ok(())
     }
@@ -1437,6 +1457,7 @@ impl Session {
                     .await?;
             }
             Action::SendHandoff(entry) => {
+                self.relayed_while_driving = 0;
                 tracing::info!("handing off control to peer");
                 self.control
                     .send(&ControlMessage::Handoff { entry })
