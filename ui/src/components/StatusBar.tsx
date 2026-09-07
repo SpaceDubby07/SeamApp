@@ -10,6 +10,8 @@ interface Props {
   rttMicros: number | null;
   /** Whether edge handoff is currently locked to this screen. */
   locked: boolean;
+  /** The connection dropped and the app is retrying with backoff. */
+  reconnecting: boolean;
 }
 
 /** Tier 8.1 panel 6: the always-visible bottom bar — connection dot + peer
@@ -21,8 +23,20 @@ export function StatusBar({
   link,
   rttMicros,
   locked,
+  reconnecting,
 }: Props) {
   const connected = peerName !== null;
+
+  if (reconnecting) {
+    return (
+      <footer className="status-bar">
+        <span className="status-dot is-reconnecting" />
+        <span className="status-peer">
+          Reconnecting{peerName ? ` to ${peerName}` : ""}…
+        </span>
+      </footer>
+    );
+  }
 
   const latency =
     rttMicros === null ? "—" : `${Math.round(rttMicros / 1000)} ms`;

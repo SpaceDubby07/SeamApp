@@ -7,6 +7,7 @@ interface Props {
   peers: DiscoveredPeer[];
   connected: ConnectedInfo | null;
   pairingCode: string | null;
+  reconnecting: boolean;
   onConfigChanged: (config: Config) => void;
 }
 
@@ -15,6 +16,7 @@ export function ConnectionPanel({
   peers,
   connected,
   pairingCode,
+  reconnecting,
   onConfigChanged,
 }: Props) {
   const [manualAddr, setManualAddr] = useState("");
@@ -86,14 +88,25 @@ export function ConnectionPanel({
     );
   }
 
-  if (connected) {
+  if (connected || reconnecting) {
+    const name = connected?.peer_display_name;
     return (
       <section className="panel">
-        <h2>Connected</h2>
+        <h2>{reconnecting ? "Reconnecting" : "Connected"}</h2>
         <p>
-          Connected to <strong>{connected.peer_display_name}</strong>
+          {reconnecting ? (
+            <>
+              Connection lost — retrying{name ? <> to <strong>{name}</strong></> : null}…
+            </>
+          ) : (
+            <>
+              Connected to <strong>{name}</strong>
+            </>
+          )}
         </p>
-        <button onClick={() => ipc.disconnect()}>Disconnect</button>
+        <button onClick={() => ipc.disconnect()}>
+          {reconnecting ? "Cancel" : "Disconnect"}
+        </button>
         {pairedBlock}
       </section>
     );

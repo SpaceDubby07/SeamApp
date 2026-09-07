@@ -85,6 +85,12 @@ export const onConnected = (
 export const onDisconnected = (handler: () => void): Promise<UnlistenFn> =>
   listen<void>("disconnected", () => handler());
 
+/** The connection dropped and the app is retrying with backoff (M12). A
+ * following `connected` means it succeeded; `disconnected` means it gave
+ * up / the user cancelled. */
+export const onReconnecting = (handler: () => void): Promise<UnlistenFn> =>
+  listen<void>("reconnecting", () => handler());
+
 export const onSessionEvent = (
   handler: (event: SessionEvent) => void,
 ): Promise<UnlistenFn> =>

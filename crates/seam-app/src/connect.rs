@@ -1,6 +1,7 @@
-//! Shared connection bootstrap: pairing, bulk channel setup, and `Session`
-//! construction — used by both the outbound `connect_to_peer` command and
-//! the inbound accept loop, since everything past the initial control
+//! Shared connection bootstrap: pairing, bulk channel setup, `Session`
+//! construction, and — for outbound connections — the reconnect
+//! supervisor (M12). Used by both the `connect_to_peer` command and the
+//! inbound accept loop, since everything past the initial control
 //! handshake is identical either way.
 
 use std::time::Duration;
@@ -19,6 +20,11 @@ use seam_core::topology::{Layout, Rect};
 
 use crate::state::{AppState, BULK_PORT, CONTROL_PORT, CURRENT_OS};
 
+/// First backoff wait after a dropped connection.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+/// Ceiling the exponential backoff is clamped to.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
+
 /// Which side of the control handshake we were — determines how the bulk
 /// channel gets set up (Tier 6.1: it never re-runs `OnFirstUse`, only
 /// `Pinned` to whatever the control channel just authenticated).
@@ -32,30 +38,63 @@ pub enum Role {
     /// We initiated the connection.
     Connector {
         /// The peer's host, reused for the bulk channel (same fixed
-        /// port-plus-one convention as the control channel).
+        /// port-plus-one convention as the control channel) and, on a
+        /// drop, for the reconnect supervisor.
         host: String,
     },
 }
 
 /// Emitted once a session is up, so the UI can leave the connecting/
-/// pairing screen.
+/// pairing/reconnecting screen.
 #[derive(Serialize, Clone)]
 struct ConnectedInfo {
     peer_display_name: String,
 }
 
-/// Runs the pairing flow (if needed), sets up the bulk channel, builds and
-/// starts a `Session`, and stores its command sender in `AppState` —
-/// everything after the control handshake succeeds, for either role.
+/// Runs the pairing flow (if needed), sets up the bulk channel, builds a
+/// `Session`, wires it into `AppState`, and spawns the supervisor that
+/// runs it — reconnecting with backoff if this was an outbound connection
+/// and it drops unexpectedly.
 ///
 /// # Errors
 /// Returns a human-readable error if pairing is declined or any step
 /// (bulk connect/accept, `Session::new`, sending our screen config) fails.
+/// Once the supervisor is spawned this returns `Ok(())` immediately.
 pub async fn finish_connection(
     control: ControlChannel,
     role: Role,
     app: AppHandle,
 ) -> Result<(), String> {
+    // Only an outbound connection reconnects on its own — an accepted one
+    // is re-established by the peer dialling back in through the accept
+    // loop, which is always listening.
+    let reconnect_host = match &role {
+        Role::Connector { host } => Some(host.clone()),
+        Role::Listener { .. } => None,
+    };
+
+    let session = bootstrap_session(control, role, &app).await?;
+
+    let supervisor = tokio::spawn(supervise(session, reconnect_host, app.clone()));
+    *app.state::<AppState>()
+        .session_task
+        .lock()
+        .expect("mutex poisoned") = Some(supervisor);
+
+    Ok(())
+}
+
+/// Everything after the control handshake, up to a ready-to-run `Session`:
+/// the pairing prompt (skipped once a peer is pinned), the bulk channel,
+/// `Session::new`, the first screen-config exchange, and wiring the
+/// command channel + event forwarding + `connected` event into the app.
+/// Reused verbatim by [`reconnect_with_backoff`] — by then trust is
+/// `Pinned`, so the pairing block is inert.
+async fn bootstrap_session(
+    control: ControlChannel,
+    role: Role,
+    app: &AppHandle,
+) -> Result<Session, String> {
     let state = app.state::<AppState>();
 
     if state.is_connected() {
@@ -113,7 +152,8 @@ pub async fn finish_connection(
     // Naive initial placement — immediately to the right, non-overlapping
     // — good enough to start a session; the user drags the layout canvas
     // (Tier 8.1) into whatever's actually true, and `SessionCommand::
-    // UpdateLayout` takes it from there.
+    // UpdateLayout` takes it from there. On a reconnect this momentarily
+    // resets the canvas until the peer re-sends its `ScreenConfig`.
     let initial_peer_bounds = Rect {
         x: local_bounds.x + local_bounds.width.cast_signed(),
         ..local_bounds
@@ -151,8 +191,6 @@ pub async fn finish_connection(
 
     app.emit("connected", &ConnectedInfo { peer_display_name })
         .map_err(|e| e.to_string())?;
-    // The naive initial placement, so the layout canvas has a starting
-    // position before `PeerScreenConfig` corrects its size (below).
     app.emit(
         "session-event",
         &SessionEvent::LayoutChanged {
@@ -168,22 +206,110 @@ pub async fn finish_connection(
         }
     });
 
-    let ended_app = app.clone();
-    let session_task = tokio::spawn(async move {
-        if let Err(e) = session.run().await {
-            tracing::warn!(error = %e, "session ended");
-        }
-        let ended_state = ended_app.state::<AppState>();
-        *ended_state
+    Ok(session)
+}
+
+/// Owns a session for its whole life: runs it, and on an unexpected drop
+/// (an `Err` from `run`, as opposed to the `Ok(())` a user Disconnect
+/// produces) reconnects with exponential backoff — but only for an
+/// outbound connection (`reconnect_host` is `Some`). Emits `disconnected`
+/// once, when the session ends for good.
+async fn supervise(mut session: Session, reconnect_host: Option<String>, app: AppHandle) {
+    loop {
+        let outcome = session.run().await;
+
+        // This instance is finished. Clear its command channel right away
+        // so `is_connected()` is false during any backoff (and a stray
+        // `Shutdown` can't be posted into a dead channel).
+        *app.state::<AppState>()
             .session_command_tx
             .lock()
             .expect("mutex poisoned") = None;
-        *ended_state.session_task.lock().expect("mutex poisoned") = None;
-        let _ = ended_app.emit("disconnected", ());
-    });
-    *state.session_task.lock().expect("mutex poisoned") = Some(session_task);
 
-    Ok(())
+        match (&outcome, &reconnect_host) {
+            (Ok(()), _) => {
+                tracing::info!("session ended gracefully");
+                break;
+            }
+            (Err(e), None) => {
+                tracing::warn!(error = %e, "accepted session ended; not reconnecting");
+                break;
+            }
+            (Err(e), Some(host)) => {
+                tracing::warn!(error = %e, "connection lost; reconnecting with backoff");
+                let _ = app.emit("reconnecting", ());
+                session = reconnect_with_backoff(host, &app).await;
+                // loop back around and run the fresh session.
+            }
+        }
+    }
+
+    let state = app.state::<AppState>();
+    *state.session_command_tx.lock().expect("mutex poisoned") = None;
+    *state.session_task.lock().expect("mutex poisoned") = None;
+    let _ = app.emit("disconnected", ());
+}
+
+/// Retries [`reconnect_once`] with exponential backoff (0.5s → 20s cap)
+/// until it succeeds. Runs forever by design — M12's "leave it running
+/// for a week" — and is cancelled only by the supervisor task being
+/// aborted (which `disconnect` does when there's no live session to send
+/// `Shutdown` to).
+async fn reconnect_with_backoff(host: &str, app: &AppHandle) -> Session {
+    let mut delay = RECONNECT_INITIAL_DELAY;
+    let mut attempt = 1u32;
+    loop {
+        tokio::time::sleep(delay).await;
+        match reconnect_once(host, app).await {
+            Ok(session) => {
+                tracing::info!(attempt, "reconnected");
+                return session;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    error = %e,
+                    "reconnect attempt failed"
+                );
+                attempt += 1;
+                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+            }
+        }
+    }
+}
+
+/// One reconnect attempt: redo the control handshake (trust is `Pinned` by
+/// now, so no pairing prompt) and rebuild the session.
+async fn reconnect_once(host: &str, app: &AppHandle) -> Result<Session, String> {
+    let (node_id, display_name, trust) = {
+        let state = app.state::<AppState>();
+        let config = state.config.lock().expect("mutex poisoned");
+        (
+            config.node_id,
+            config.display_name.clone(),
+            config.trust_mode(),
+        )
+    };
+    let control = ControlChannel::connect(
+        format!("{host}:{CONTROL_PORT}"),
+        node_id,
+        &display_name,
+        CURRENT_OS,
+        &app.state::<AppState>().identity,
+        trust,
+    )
+    .await
+    .map_err(|e| format!("control reconnect failed: {e}"))?;
+
+    bootstrap_session(
+        control,
+        Role::Connector {
+            host: host.to_string(),
+        },
+        app,
+    )
+    .await
 }
 
 /// Binds the control and bulk ports once and accepts connections

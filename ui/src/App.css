@@ -515,6 +515,21 @@ button.primary:hover:not(:disabled) {
   background: var(--ok);
 }
 
+.status-dot.is-reconnecting {
+  background: var(--warn);
+  animation: status-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
 .status-peer {
   font-weight: 600;
   color: var(--text);

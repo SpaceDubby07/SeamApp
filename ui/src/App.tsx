@@ -29,6 +29,7 @@ function App() {
   const [link, setLink] = useState<LinkStatus | null>(null);
   const [rttMicros, setRttMicros] = useState<number | null>(null);
   const [locked, setLocked] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   useEffect(() => {
     ipc.getConfig().then(setConfig).catch(console.error);
@@ -40,10 +41,17 @@ function App() {
       ipc.onPairingRequested(setPairingCode),
       ipc.onConnected((info) => {
         setPairingCode(null);
+        setReconnecting(false);
         setConnected(info);
+      }),
+      ipc.onReconnecting(() => {
+        setReconnecting(true);
+        setLink(null);
+        setRttMicros(null);
       }),
       ipc.onDisconnected(() => {
         setConnected(null);
+        setReconnecting(false);
         setPeerBounds(null);
         setLink(null);
         setRttMicros(null);
@@ -101,6 +109,7 @@ function App() {
         peers={peers}
         connected={connected}
         pairingCode={pairingCode}
+        reconnecting={reconnecting}
         onConfigChanged={setConfig}
       />
       <InputPanel
@@ -117,6 +126,7 @@ function App() {
         link={link}
         rttMicros={rttMicros}
         locked={locked}
+        reconnecting={reconnecting}
       />
     </main>
   );
