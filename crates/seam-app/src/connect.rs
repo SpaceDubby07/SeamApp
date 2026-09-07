@@ -121,7 +121,11 @@ pub async fn finish_connection(
     let mut layout = Layout::new();
     layout.set_placement(local_node, local_bounds);
     layout.set_placement(peer_node, initial_peer_bounds);
-    let state_machine = StateMachine::new(local_node, local_bounds, layout);
+    let mut state_machine = StateMachine::new(local_node, local_bounds, layout);
+    state_machine.set_edge_settings(
+        config_snapshot.edge_settings.corner_dead_zone_px,
+        config_snapshot.edge_settings.handoff_cooldown_ms,
+    );
 
     let (mut session, handle) = Session::new(
         state_machine,

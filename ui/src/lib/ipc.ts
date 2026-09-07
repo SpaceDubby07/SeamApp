@@ -10,6 +10,8 @@ import type {
   ConnectedInfo,
   DiscoveredPeer,
   Display,
+  EdgeSettings,
+  Hotkey,
   LogLine,
   Rect,
   RemapTable,
@@ -24,6 +26,17 @@ export const setDisplayName = (name: string) =>
  * (Tier 7.3) — takes effect on the next injected event, no reconnect. */
 export const setRemap = (remap: RemapTable) =>
   invoke<void>("set_remap", { remap });
+/** Rebinds the emergency "return control here" combo (Tier 7.7). */
+export const setEscapeHotkey = (hotkey: Hotkey) =>
+  invoke<void>("set_escape_hotkey", { hotkey });
+/** Toggles lock-to-screen (Tier 8.1 panel 3). Needs an active session. */
+export const setLocked = (locked: boolean) =>
+  invoke<void>("set_locked", { locked });
+/** Persists + live-applies the Layout panel's edge-handoff tuning. */
+export const setEdgeSettings = (settings: EdgeSettings) =>
+  invoke<void>("set_edge_settings", { settings });
+/** Drops the pinned pairing so the next connection re-pairs (Tier 8.1). */
+export const forgetPeer = () => invoke<void>("forget_peer");
 export const listDiscoveredPeers = () =>
   invoke<DiscoveredPeer[]>("list_discovered_peers");
 export const getLocalScreens = () =>

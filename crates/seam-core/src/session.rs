@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::Config;
+use crate::config::{Config, Hotkey};
 use crate::error::PlatformError;
 use crate::net::bulk::BulkChannel;
 use crate::net::control::{ControlChannel, now_micros};
@@ -95,6 +95,11 @@ pub struct Session {
     /// inject on the peer's behalf, never to what we send. Each machine
     /// owns its own rules, so this is never synced over the wire.
     remap: RemapTable,
+    /// The combo that force-returns control here from anywhere (Tier 7.7).
+    /// Checked in [`Session::handle_capture_event`] before suppression, so
+    /// it works even while `RemoteActive`. Live-updated via
+    /// [`SessionCommand::UpdateEscapeHotkey`].
+    escape_hotkey: Hotkey,
     /// Hard cap on outgoing clipboard content (Tier 7.4); see
     /// [`Config::clipboard_max_bytes`].
     clipboard_max_bytes: u64,
@@ -168,6 +173,11 @@ pub struct Session {
     /// [`Session::sync_link_status`] only emits on an actual change rather
     /// than after every state-machine feed.
     last_link: Option<LinkStatus>,
+    /// Last lock state reported via [`SessionEvent::Status`] — tracked
+    /// alongside `last_link` because toggling the lock doesn't change the
+    /// control owner (`Locked` still maps to [`LinkStatus::Local`]) but
+    /// the status bar's lock indicator still needs the update.
+    last_locked: bool,
     /// Most recent control-channel round-trip (from the last pong), in
     /// microseconds. Replayed into every `Status` event so a control
     /// change that wasn't itself triggered by a pong still carries a
@@ -294,6 +304,9 @@ pub enum SessionEvent {
         /// Most recent control-channel round-trip, in microseconds —
         /// `None` until the first pong comes back.
         rtt_micros: Option<u64>,
+        /// Whether edge handoff is currently locked to this screen
+        /// (Tier 8.1 panel 3's lock-to-screen).
+        locked: bool,
     },
 }
 
@@ -331,6 +344,21 @@ pub enum SessionCommand {
     /// edits apply to the running session without a reconnect. Remapping
     /// is receive-side only, so this never touches the wire or the peer.
     UpdateRemap(RemapTable),
+    /// Rebinds the emergency "return control here" combo (Tier 7.7),
+    /// effective on the next captured key.
+    UpdateEscapeHotkey(Hotkey),
+    /// Toggles lock-to-screen (Tier 8.1 panel 3): `true` freezes edge
+    /// handoff (`LocalActive` → `Locked`), `false` releases it. A no-op
+    /// unless currently `LocalActive`/`Locked`.
+    SetLocked(bool),
+    /// Applies the Layout panel's edge-handoff tuning — corner dead zone
+    /// and post-handoff cooldown — to the live state machine.
+    UpdateEdgeSettings {
+        /// Corner exclusion zone in pixels.
+        corner_dead_zone_px: u32,
+        /// Post-handoff cooldown in milliseconds.
+        handoff_cooldown_ms: u64,
+    },
 }
 
 /// The other end of a running [`Session`]'s command/event channels —
@@ -414,6 +442,7 @@ impl Session {
             local_bounds,
             injected_modifiers: Modifiers::default(),
             remap: config.remap.clone(),
+            escape_hotkey: config.escape_hotkey,
             clipboard_max_bytes: config.clipboard_max_bytes,
             next_clipboard_seq: 0,
             last_seen_peer_clipboard_seq: 0,
@@ -432,6 +461,7 @@ impl Session {
             commands_open: true,
             event_tx,
             last_link: None,
+            last_locked: false,
             last_rtt_micros: None,
         };
         let handle = SessionHandle {
@@ -464,11 +494,14 @@ impl Session {
         let rtt_micros = now_micros().saturating_sub(sent_at_micros);
         tracing::debug!(seq, rtt_micros, "pong received");
         self.last_rtt_micros = Some(rtt_micros);
-        if let Some(link) = LinkStatus::from_state(self.state_machine.state()) {
+        let state = self.state_machine.state();
+        if let Some(link) = LinkStatus::from_state(state) {
             self.last_link = Some(link);
+            self.last_locked = state == State::Locked;
             let _ = self.event_tx.send(SessionEvent::Status {
                 link,
                 rtt_micros: Some(rtt_micros),
+                locked: self.last_locked,
             });
         }
     }
@@ -479,13 +512,17 @@ impl Session {
     /// "who's driving" indicator updates the instant control moves,
     /// rather than only on the next pong up to a ping interval later.
     fn sync_link_status(&mut self) {
-        let link = LinkStatus::from_state(self.state_machine.state());
-        if link != self.last_link {
+        let state = self.state_machine.state();
+        let link = LinkStatus::from_state(state);
+        let locked = state == State::Locked;
+        if link != self.last_link || locked != self.last_locked {
             self.last_link = link;
+            self.last_locked = locked;
             if let Some(link) = link {
                 let _ = self.event_tx.send(SessionEvent::Status {
                     link,
                     rtt_micros: self.last_rtt_micros,
+                    locked,
                 });
             }
         }
@@ -597,14 +634,9 @@ impl Session {
         // RemoteActive" without a separate OS hotkey registration.
         let is_escape_combo = matches!(
             event,
-            InputEvent::KeyDown {
-                code: KeyCode::Escape,
-                repeat: false
-            }
-        ) && {
-            let held = self.state_machine.held_modifiers();
-            held.shift && held.ctrl && held.alt
-        };
+            InputEvent::KeyDown { code, repeat: false }
+                if self.escape_hotkey.matches(code, self.state_machine.held_modifiers())
+        );
 
         if is_escape_combo {
             let actions = self
@@ -1417,6 +1449,29 @@ impl Session {
                 );
                 self.remap = remap;
             }
+            SessionCommand::UpdateEscapeHotkey(hotkey) => {
+                tracing::info!(?hotkey, "escape hotkey rebound live");
+                self.escape_hotkey = hotkey;
+            }
+            SessionCommand::SetLocked(locked) => {
+                tracing::info!(locked, "lock-to-screen toggled");
+                let actions = self
+                    .state_machine
+                    .handle(Input::LockToggled(locked), Instant::now());
+                self.execute_actions(actions).await?;
+            }
+            SessionCommand::UpdateEdgeSettings {
+                corner_dead_zone_px,
+                handoff_cooldown_ms,
+            } => {
+                tracing::info!(
+                    corner_dead_zone_px,
+                    handoff_cooldown_ms,
+                    "edge settings updated live"
+                );
+                self.state_machine
+                    .set_edge_settings(corner_dead_zone_px, handoff_cooldown_ms);
+            }
         }
         Ok(())
     }
@@ -1704,7 +1759,7 @@ fn clamp_i16(v: i32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::{InputEvent, Session, SessionCommand, SessionEvent};
-    use crate::config::Config;
+    use crate::config::{Config, Hotkey};
     use crate::error::PlatformError;
     use crate::net::bulk::BulkChannel;
     use crate::net::control::ControlChannel;
@@ -2374,6 +2429,80 @@ mod tests {
             })
             .await
             .expect("escape combo");
+        assert_eq!(session.state(), State::LocalActive);
+    }
+
+    /// `SessionCommand::UpdateEscapeHotkey` rebinds the combo live: the old
+    /// one stops working, the new one force-returns control (Tier 7.7, the
+    /// Input panel's click-to-record binding).
+    #[tokio::test]
+    async fn update_escape_hotkey_rebinds_the_emergency_combo() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, _suppressed) = session_with(a_control, a_node, layout).await;
+        let _b_control = b_control;
+
+        // Rebind to Ctrl+Meta+Q.
+        session
+            .handle_session_command(SessionCommand::UpdateEscapeHotkey(Hotkey {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: true,
+                key: KeyCode::Q,
+            }))
+            .await
+            .expect("rebind");
+
+        // Drive the peer, then try the OLD default combo — no longer bound.
+        for code in [KeyCode::LeftShift, KeyCode::LeftCtrl, KeyCode::LeftAlt] {
+            session
+                .handle_capture_event(InputEvent::KeyDown {
+                    code,
+                    repeat: false,
+                })
+                .await
+                .expect("modifier");
+        }
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
+            .await
+            .expect("center");
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+            .await
+            .expect("edge");
+        assert_eq!(session.state(), State::RemoteActive);
+        session
+            .handle_capture_event(InputEvent::KeyDown {
+                code: KeyCode::Escape,
+                repeat: false,
+            })
+            .await
+            .expect("old combo");
+        assert_eq!(session.state(), State::RemoteActive, "old combo is unbound");
+
+        // Now the new combo: release the stale modifiers, hold Ctrl+Meta, Q.
+        for code in [KeyCode::LeftShift, KeyCode::LeftAlt] {
+            session
+                .handle_capture_event(InputEvent::KeyUp { code })
+                .await
+                .expect("release");
+        }
+        session
+            .handle_capture_event(InputEvent::KeyDown {
+                code: KeyCode::LeftMeta,
+                repeat: false,
+            })
+            .await
+            .expect("meta down");
+        session
+            .handle_capture_event(InputEvent::KeyDown {
+                code: KeyCode::Q,
+                repeat: false,
+            })
+            .await
+            .expect("new combo");
         assert_eq!(session.state(), State::LocalActive);
     }
 

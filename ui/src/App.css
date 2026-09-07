@@ -377,6 +377,37 @@ button.primary:hover:not(:disabled) {
   flex: 0 0 auto;
 }
 
+.hotkey-label {
+  flex: 1;
+  padding: 0.4em 0.7em;
+  border-radius: 8px;
+  background: #f0f0f0;
+  font-size: 0.85em;
+}
+
+.paired-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+}
+
+.edge-settings {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.edge-settings .field {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.edge-settings input {
+  width: 100%;
+}
+
 .status-bar {
   position: fixed;
   left: 0;
@@ -456,6 +487,10 @@ button.primary:hover:not(:disabled) {
     color: #f6f6f6;
     background-color: #1a1a1a99;
     border-color: #444;
+  }
+
+  .hotkey-label {
+    background: #1f1f1f;
   }
 }
 

@@ -1,10 +1,75 @@
-import { useState } from "react";
-import type { Config, KeyCode, RemapTable } from "../lib/types";
+import { useEffect, useState } from "react";
+import type { Config, Hotkey, KeyCode, RemapTable } from "../lib/types";
 import * as ipc from "../lib/ipc";
 
 interface Props {
   config: Config | null;
   onConfigChanged: (config: Config) => void;
+  /** Whether a session is live — the lock toggle needs one. */
+  connected: boolean;
+  /** Current lock-to-screen state, from the status stream. */
+  locked: boolean;
+}
+
+// Browser KeyboardEvent.code → seam_core::protocol::KeyCode variant name.
+// Only the keys worth binding an emergency hotkey to; returns null for a
+// bare modifier or anything unmapped.
+function codeToKeyCode(code: string): KeyCode | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code;
+  if (/^F([1-9]|1[0-2])$/.test(code)) return code;
+  if (/^Numpad[0-9]$/.test(code)) return code;
+  const direct: Record<string, KeyCode> = {
+    Escape: "Escape",
+    Tab: "Tab",
+    CapsLock: "CapsLock",
+    Space: "Space",
+    Enter: "Enter",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    Insert: "Insert",
+    Home: "Home",
+    End: "End",
+    PageUp: "PageUp",
+    PageDown: "PageDown",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+    Minus: "Minus",
+    Equal: "Equal",
+    BracketLeft: "LeftBracket",
+    BracketRight: "RightBracket",
+    Backslash: "Backslash",
+    Semicolon: "Semicolon",
+    Quote: "Quote",
+    Comma: "Comma",
+    Period: "Period",
+    Slash: "Slash",
+    Backquote: "Backquote",
+    NumLock: "NumLock",
+    NumpadAdd: "NumpadAdd",
+    NumpadSubtract: "NumpadSubtract",
+    NumpadMultiply: "NumpadMultiply",
+    NumpadDivide: "NumpadDivide",
+    NumpadDecimal: "NumpadDecimal",
+    NumpadEnter: "NumpadEnter",
+    PrintScreen: "PrintScreen",
+    ScrollLock: "ScrollLock",
+    Pause: "Pause",
+    ContextMenu: "ContextMenu",
+  };
+  return direct[code] ?? null;
+}
+
+function hotkeyLabel(hk: Hotkey): string {
+  const parts: string[] = [];
+  if (hk.ctrl) parts.push("Ctrl");
+  if (hk.shift) parts.push("Shift");
+  if (hk.alt) parts.push("Alt");
+  if (hk.meta) parts.push("Cmd");
+  parts.push(hk.key);
+  return parts.join(" + ");
 }
 
 const EMPTY_TABLE: RemapTable = {
@@ -136,9 +201,16 @@ function KeySelect({
  * and scroll-direction toggles. Every edit is persisted and pushed into a
  * running session immediately (see `ipc.setRemap`). Escape-hotkey binding
  * and lock-to-screen are not wired yet. */
-export function InputPanel({ config, onConfigChanged }: Props) {
+export function InputPanel({
+  config,
+  onConfigChanged,
+  connected,
+  locked,
+}: Props) {
   const [error, setError] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
   const table = config?.remap ?? EMPTY_TABLE;
+  const hotkey = config?.escape_hotkey ?? null;
 
   function commit(next: RemapTable) {
     if (!config) return;
@@ -146,6 +218,40 @@ export function InputPanel({ config, onConfigChanged }: Props) {
     onConfigChanged({ ...config, remap: next });
     ipc.setRemap(next).catch((e) => setError(String(e)));
   }
+
+  function commitHotkey(next: Hotkey) {
+    if (!config) return;
+    setError(null);
+    onConfigChanged({ ...config, escape_hotkey: next });
+    ipc.setEscapeHotkey(next).catch((e) => setError(String(e)));
+  }
+
+  // Click-to-record: capture the next real key press while armed.
+  useEffect(() => {
+    if (!recording) return;
+    function onKey(e: KeyboardEvent) {
+      e.preventDefault();
+      e.stopPropagation();
+      const key = codeToKeyCode(e.code);
+      if (!key) return; // bare modifier or unmapped — keep waiting
+      if (!(e.ctrlKey || e.shiftKey || e.altKey || e.metaKey)) {
+        setError("Add at least one modifier (Ctrl / Shift / Alt / Cmd).");
+        setRecording(false);
+        return;
+      }
+      commitHotkey({
+        ctrl: e.ctrlKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+        meta: e.metaKey,
+        key,
+      });
+      setRecording(false);
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recording, config]);
 
   const isPreset =
     table.invert_scroll_y &&
@@ -208,6 +314,44 @@ export function InputPanel({ config, onConfigChanged }: Props) {
           }
         />
         Invert horizontal scroll
+      </label>
+
+      <h3>Escape hotkey</h3>
+      <div className="row">
+        <code className="hotkey-label">
+          {recording
+            ? "Press a combo…"
+            : hotkey
+              ? hotkeyLabel(hotkey)
+              : "—"}
+        </code>
+        <button
+          disabled={!config}
+          onClick={() => {
+            setError(null);
+            setRecording((r) => !r);
+          }}
+        >
+          {recording ? "Cancel" : "Record…"}
+        </button>
+      </div>
+      <p className="muted">
+        Force-returns control to this machine from anywhere — works even
+        while a peer is driving.
+      </p>
+
+      <h3>Lock to screen</h3>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={locked}
+          disabled={!connected}
+          onChange={(e) => {
+            setError(null);
+            ipc.setLocked(e.target.checked).catch((err) => setError(String(err)));
+          }}
+        />
+        Disable edge handoff {connected ? "" : "(connect to a peer first)"}
       </label>
 
       <h3>Key mappings</h3>

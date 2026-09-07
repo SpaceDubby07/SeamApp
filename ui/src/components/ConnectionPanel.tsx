@@ -43,6 +43,28 @@ export function ConnectionPanel({
     }
   }
 
+  async function handleForget() {
+    if (!config) return;
+    onConfigChanged({ ...config, paired_peer: null });
+    try {
+      await ipc.forgetPeer();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  const pairedPeer = config?.paired_peer ?? null;
+  const pairedBlock = pairedPeer && (
+    <div className="paired-row">
+      <span className="muted">
+        Paired · <code>{pairedPeer.fingerprint.slice(0, 12)}…</code>
+      </span>
+      <button className="link-btn" onClick={handleForget}>
+        Forget
+      </button>
+    </div>
+  );
+
   if (pairingCode) {
     return (
       <section className="panel">
@@ -72,6 +94,7 @@ export function ConnectionPanel({
           Connected to <strong>{connected.peer_display_name}</strong>
         </p>
         <button onClick={() => ipc.disconnect()}>Disconnect</button>
+        {pairedBlock}
       </section>
     );
   }
@@ -86,6 +109,8 @@ export function ConnectionPanel({
           onChange={(e) => handleNameChange(e.target.value)}
         />
       </label>
+
+      {pairedBlock}
 
       <h3>Discovered devices</h3>
       {peers.length === 0 ? (

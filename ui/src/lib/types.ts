@@ -42,9 +42,25 @@ export interface RemapTable {
   invert_scroll_x: boolean;
 }
 
+// Mirrors seam_core::config::Hotkey. Modifiers matched exactly.
+export interface Hotkey {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  meta: boolean;
+  key: KeyCode;
+}
+
+// Mirrors seam_core::config::EdgeSettings.
+export interface EdgeSettings {
+  corner_dead_zone_px: number;
+  handoff_cooldown_ms: number;
+}
+
 export interface PairedPeer {
   node_id: NodeId;
-  fingerprint: number[];
+  // seam_core::net::tls::Fingerprint serializes as a 64-char hex string.
+  fingerprint: string;
 }
 
 export interface Config {
@@ -55,6 +71,8 @@ export interface Config {
   paired_peer: PairedPeer | null;
   accept_policy: AcceptPolicy;
   download_dir: string | null;
+  escape_hotkey: Hotkey;
+  edge_settings: EdgeSettings;
 }
 
 export interface DiscoveredPeer {
@@ -96,7 +114,12 @@ export type SessionEvent =
   | { type: "Rejected"; transfer_id: TransferId; reason: string }
   | { type: "Completed"; transfer_id: TransferId; path: string }
   | { type: "Failed"; transfer_id: TransferId; reason: string }
-  | { type: "Status"; link: LinkStatus; rtt_micros: number | null };
+  | {
+      type: "Status";
+      link: LinkStatus;
+      rtt_micros: number | null;
+      locked: boolean;
+    };
 
 export interface ConnectedInfo {
   peer_display_name: string;

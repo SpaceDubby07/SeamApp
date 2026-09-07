@@ -375,8 +375,12 @@ fn main() {
                     SessionEvent::LayoutChanged { peer_bounds } => {
                         println!("Layout changed: peer is now at {peer_bounds:?}");
                     }
-                    SessionEvent::Status { link, rtt_micros } => {
-                        println!("Status: {link:?}, rtt {rtt_micros:?} us");
+                    SessionEvent::Status {
+                        link,
+                        rtt_micros,
+                        locked,
+                    } => {
+                        println!("Status: {link:?}, rtt {rtt_micros:?} us, locked={locked}");
                     }
                 }
             }

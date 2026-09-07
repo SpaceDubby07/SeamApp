@@ -2,7 +2,7 @@
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use seam_core::config::Config;
+use seam_core::config::{Config, EdgeSettings, Hotkey};
 use seam_core::net::control::ControlChannel;
 use seam_core::net::discovery::DiscoveredPeer;
 use seam_core::remap::RemapTable;
@@ -51,6 +51,70 @@ pub fn set_remap(remap: RemapTable, state: State<'_, AppState>) -> Result<(), St
     // to update right now.
     let _ = send_session_command(&state, SessionCommand::UpdateRemap(remap));
     Ok(())
+}
+
+/// Rebinds the emergency escape hotkey (Tier 7.7, the Input panel's
+/// click-to-record field). Persisted, and pushed into a live session so
+/// the new combo works immediately.
+///
+/// # Errors
+/// Returns an error only if the config file can't be written.
+#[tauri::command]
+pub fn set_escape_hotkey(hotkey: Hotkey, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut config = state.config.lock().expect("mutex poisoned");
+        config.escape_hotkey = hotkey;
+        config.save(&state.config_path).map_err(|e| e.to_string())?;
+    }
+    let _ = send_session_command(&state, SessionCommand::UpdateEscapeHotkey(hotkey));
+    Ok(())
+}
+
+/// Toggles lock-to-screen (Tier 8.1 panel 3). Session-only — there's
+/// nothing to lock without an active handoff, and it's a transient state,
+/// not persisted. A no-op if not connected.
+///
+/// # Errors
+/// Returns an error if there's no active session.
+#[tauri::command]
+pub fn set_locked(locked: bool, state: State<'_, AppState>) -> Result<(), String> {
+    send_session_command(&state, SessionCommand::SetLocked(locked))
+}
+
+/// Applies the Layout panel's edge-handoff tuning (corner dead zone,
+/// post-handoff cooldown). Persisted, and pushed into a live session.
+///
+/// # Errors
+/// Returns an error only if the config file can't be written.
+#[tauri::command]
+pub fn set_edge_settings(settings: EdgeSettings, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut config = state.config.lock().expect("mutex poisoned");
+        config.edge_settings = settings;
+        config.save(&state.config_path).map_err(|e| e.to_string())?;
+    }
+    let _ = send_session_command(
+        &state,
+        SessionCommand::UpdateEdgeSettings {
+            corner_dead_zone_px: settings.corner_dead_zone_px,
+            handoff_cooldown_ms: settings.handoff_cooldown_ms,
+        },
+    );
+    Ok(())
+}
+
+/// Drops the pinned pairing (Tier 8.1's "Forget" option). The next
+/// connection to any peer runs the full trust-on-first-use pairing flow
+/// again. Doesn't disconnect an in-progress session — it only affects the
+/// *next* handshake.
+///
+/// # Errors
+/// Returns an error only if the config file can't be written.
+#[tauri::command]
+pub fn forget_peer(state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.lock().expect("mutex poisoned");
+    config.paired_peer = None;
+    config.save(&state.config_path).map_err(|e| e.to_string())
 }
 
 /// Peers currently visible over mDNS (Tier 8.1's "discovered devices"

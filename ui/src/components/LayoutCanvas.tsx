@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import type { Rect } from "../lib/types";
+import type { EdgeSettings, Rect } from "../lib/types";
 
 interface Props {
   localName: string;
@@ -8,6 +8,9 @@ interface Props {
   /** `null` until the peer's `ScreenConfig` has arrived. */
   peerBounds: Rect | null;
   onPeerBoundsChange: (bounds: Rect) => void;
+  /** `null` until config has loaded. */
+  edgeSettings: EdgeSettings | null;
+  onEdgeSettingsChange: (settings: EdgeSettings) => void;
 }
 
 const CANVAS_WIDTH = 640;
@@ -56,6 +59,8 @@ export function LayoutCanvas({
   peerName,
   peerBounds,
   onPeerBoundsChange,
+  edgeSettings,
+  onEdgeSettingsChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [dragPreview, setDragPreview] = useState<Rect | null>(null);
@@ -181,6 +186,42 @@ export function LayoutCanvas({
           </div>
         )}
       </div>
+
+      {edgeSettings && (
+        <div className="edge-settings">
+          <label className="field">
+            Corner dead zone (px)
+            <input
+              type="number"
+              min={0}
+              max={200}
+              value={edgeSettings.corner_dead_zone_px}
+              onChange={(e) =>
+                onEdgeSettingsChange({
+                  ...edgeSettings,
+                  corner_dead_zone_px: Math.max(0, Number(e.target.value) || 0),
+                })
+              }
+            />
+          </label>
+          <label className="field">
+            Handoff cooldown (ms)
+            <input
+              type="number"
+              min={0}
+              max={2000}
+              step={50}
+              value={edgeSettings.handoff_cooldown_ms}
+              onChange={(e) =>
+                onEdgeSettingsChange({
+                  ...edgeSettings,
+                  handoff_cooldown_ms: Math.max(0, Number(e.target.value) || 0),
+                })
+              }
+            />
+          </label>
+        </div>
+      )}
     </section>
   );
 }

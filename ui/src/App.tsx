@@ -12,6 +12,7 @@ import type {
   ConnectedInfo,
   DiscoveredPeer,
   Display,
+  EdgeSettings,
   LinkStatus,
   Rect,
 } from "./lib/types";
@@ -27,6 +28,7 @@ function App() {
   const [peerBounds, setPeerBounds] = useState<Rect | null>(null);
   const [link, setLink] = useState<LinkStatus | null>(null);
   const [rttMicros, setRttMicros] = useState<number | null>(null);
+  const [locked, setLocked] = useState(false);
 
   useEffect(() => {
     ipc.getConfig().then(setConfig).catch(console.error);
@@ -45,6 +47,7 @@ function App() {
         setPeerBounds(null);
         setLink(null);
         setRttMicros(null);
+        setLocked(false);
       }),
       ipc.onSessionEvent((event) => {
         // `LayoutChanged` always carries our own naive initial placement
@@ -55,6 +58,7 @@ function App() {
           setPeerBounds(event.peer_bounds);
         } else if (event.type === "Status") {
           setLink(event.link);
+          setLocked(event.locked);
           if (event.rtt_micros !== null) setRttMicros(event.rtt_micros);
         }
       }),
@@ -68,6 +72,12 @@ function App() {
   function handleLayoutDrag(bounds: Rect) {
     setPeerBounds(bounds);
     ipc.updateLayout(bounds).catch(console.error);
+  }
+
+  function handleEdgeSettingsChange(settings: EdgeSettings) {
+    if (!config) return;
+    setConfig({ ...config, edge_settings: settings });
+    ipc.setEdgeSettings(settings).catch(console.error);
   }
 
   const [, localBounds] = localScreens ?? [[], null];
@@ -89,9 +99,16 @@ function App() {
           peerName={connected?.peer_display_name ?? null}
           peerBounds={peerBounds}
           onPeerBoundsChange={handleLayoutDrag}
+          edgeSettings={config?.edge_settings ?? null}
+          onEdgeSettingsChange={handleEdgeSettingsChange}
         />
       )}
-      <InputPanel config={config} onConfigChanged={setConfig} />
+      <InputPanel
+        config={config}
+        onConfigChanged={setConfig}
+        connected={connected !== null}
+        locked={locked}
+      />
       <TransfersPanel connected={connected !== null} />
       <LogPanel />
       <StatusBar
@@ -99,7 +116,7 @@ function App() {
         peerName={connected?.peer_display_name ?? null}
         link={link}
         rttMicros={rttMicros}
-        locked={false}
+        locked={locked}
       />
     </main>
   );

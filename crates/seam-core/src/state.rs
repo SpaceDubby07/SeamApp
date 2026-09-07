@@ -16,8 +16,9 @@ use crate::topology::{
     detect_edge_reclaim,
 };
 
-/// How long after a handoff before the reverse handoff is allowed to fire.
-/// Without this, the boundary flickers (Tier 7.2).
+/// Default time after a handoff before the reverse handoff is allowed to
+/// fire. Without this, the boundary flickers (Tier 7.2). Overridable per
+/// machine via [`StateMachine::set_edge_settings`] (the Layout panel).
 const HANDOFF_COOLDOWN: Duration = Duration::from_millis(200);
 
 /// Default corner dead zone, in pixels, so hitting a corner UI element
@@ -176,6 +177,10 @@ pub struct StateMachine {
     /// back to where you left off rather than dumping you at the edge.
     remembered_cursor: HashMap<NodeId, Point>,
     corner_dead_zone_px: u32,
+    /// Post-handoff cooldown before the reverse handoff can fire. Defaults
+    /// to [`HANDOFF_COOLDOWN`]; set from config via
+    /// [`Self::set_edge_settings`].
+    handoff_cooldown: Duration,
 }
 
 impl StateMachine {
@@ -198,7 +203,15 @@ impl StateMachine {
             held_modifiers: Modifiers::default(),
             remembered_cursor: HashMap::new(),
             corner_dead_zone_px: DEFAULT_CORNER_DEAD_ZONE_PX,
+            handoff_cooldown: HANDOFF_COOLDOWN,
         }
+    }
+
+    /// Applies the Layout panel's edge-handoff tuning (Tier 8.1). Takes
+    /// effect on the next crossing check; leaves the current state alone.
+    pub fn set_edge_settings(&mut self, corner_dead_zone_px: u32, handoff_cooldown_ms: u64) {
+        self.corner_dead_zone_px = corner_dead_zone_px;
+        self.handoff_cooldown = Duration::from_millis(handoff_cooldown_ms);
     }
 
     /// The current state.
@@ -375,7 +388,7 @@ impl StateMachine {
             return Vec::new();
         };
         if let Some(cooldown_started) = self.last_handoff_at
-            && now.duration_since(cooldown_started) < HANDOFF_COOLDOWN
+            && now.duration_since(cooldown_started) < self.handoff_cooldown
         {
             return Vec::new();
         }
@@ -783,6 +796,35 @@ mod tests {
             t0 + Duration::from_millis(250),
         );
         assert_eq!(sm.state(), State::RemoteActive, "actions were {actions:?}");
+    }
+
+    /// The Layout panel's edge-handoff tuning (Tier 8.1) is honoured: a
+    /// longer configured cooldown keeps a reverse handoff blocked past the
+    /// point the 200ms default would have allowed it.
+    #[test]
+    fn set_edge_settings_lengthens_the_handoff_cooldown() {
+        let (mut sm, _, peer) = two_node_machine();
+        sm.set_edge_settings(20, 1000);
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+        let t0 = Instant::now();
+        sm.handle(Input::CursorMoved(Point { x: 960, y: 540 }), t0);
+        sm.handle(Input::CursorMoved(Point { x: 1919, y: 540 }), t0);
+        assert_eq!(sm.state(), State::RemoteActive);
+        sm.handle(Input::ReceivedReleaseBack, t0);
+        assert_eq!(sm.state(), State::LocalActive);
+
+        // 250ms in — past the default cooldown, still inside the 1s one.
+        sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            t0 + Duration::from_millis(250),
+        );
+        assert_eq!(sm.state(), State::LocalActive, "still cooling down");
+
+        sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            t0 + Duration::from_millis(1100),
+        );
+        assert_eq!(sm.state(), State::RemoteActive);
     }
 
     /// Reclaim now happens on the driven side: the machine being driven

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::net::tls::{Fingerprint, Trust};
+use crate::protocol::{KeyCode, Modifiers};
 use crate::remap::RemapTable;
 use crate::topology::NodeId;
 use crate::transfer::AcceptPolicy;
@@ -63,6 +64,102 @@ pub struct Config {
     /// compatibility reason as `accept_policy`.
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
+    /// The key combo that force-returns control to the local machine from
+    /// anywhere (Tier 7.7, the Input panel's click-to-record binding).
+    /// `#[serde(default)]` → a config written before this field existed
+    /// gets [`Hotkey::default`] (Shift+Ctrl+Alt+Escape).
+    #[serde(default)]
+    pub escape_hotkey: Hotkey,
+    /// Edge-handoff tuning (Tier 8.1's per-edge settings, applied globally
+    /// in v1's single-shared-edge topology). `#[serde(default)]` for the
+    /// same forward-compat reason.
+    #[serde(default)]
+    pub edge_settings: EdgeSettings,
+}
+
+/// A modifier + key combo, as bound to the emergency "return control
+/// here" action. Modifiers are matched exactly (all four flags), so
+/// Ctrl+Shift+Alt+Q doesn't also fire a Ctrl+Q binding.
+// Four independent physical modifier states, mirroring `Modifiers`
+// field-for-field — not a mode selector, so clippy's enum suggestion
+// doesn't apply (same call as on `Modifiers` itself).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hotkey {
+    /// Ctrl must be held (either physical Ctrl).
+    #[serde(default)]
+    pub ctrl: bool,
+    /// Shift must be held.
+    #[serde(default)]
+    pub shift: bool,
+    /// Alt/Option must be held.
+    #[serde(default)]
+    pub alt: bool,
+    /// Cmd/Win must be held.
+    #[serde(default)]
+    pub meta: bool,
+    /// The non-modifier key that triggers it.
+    pub key: KeyCode,
+}
+
+impl Default for Hotkey {
+    /// Shift+Ctrl+Alt+Escape — the historical hardcoded combo (Tier 7.7).
+    fn default() -> Self {
+        Self {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            meta: false,
+            key: KeyCode::Escape,
+        }
+    }
+}
+
+impl Hotkey {
+    /// Whether a `key` press with `held` physical modifiers is this combo.
+    #[must_use]
+    pub fn matches(&self, key: KeyCode, held: Modifiers) -> bool {
+        self.key == key
+            && held.ctrl == self.ctrl
+            && held.shift == self.shift
+            && held.alt == self.alt
+            && held.meta == self.meta
+    }
+}
+
+/// Edge-handoff tuning. Per-edge in the build guide's UI sketch; a single
+/// global instance here, since v1 pairs exactly two machines across one
+/// shared edge (Tier 15 keeps the door open for per-edge later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeSettings {
+    /// Corner exclusion zone, in pixels: a crossing whose cursor is within
+    /// this of a corner is ignored, so reaching for a corner UI element
+    /// doesn't trigger a handoff (Tier 7.2).
+    #[serde(default = "default_corner_dead_zone_px")]
+    pub corner_dead_zone_px: u32,
+    /// How long after a handoff before the reverse handoff can fire, in
+    /// milliseconds — stops the boundary flickering (Tier 7.2).
+    #[serde(default = "default_handoff_cooldown_ms")]
+    pub handoff_cooldown_ms: u64,
+}
+
+impl Default for EdgeSettings {
+    fn default() -> Self {
+        Self {
+            corner_dead_zone_px: default_corner_dead_zone_px(),
+            handoff_cooldown_ms: default_handoff_cooldown_ms(),
+        }
+    }
+}
+
+/// Tier 7.2's default 20px corner dead zone.
+fn default_corner_dead_zone_px() -> u32 {
+    20
+}
+
+/// Tier 7.2's default 200ms post-handoff cooldown.
+fn default_handoff_cooldown_ms() -> u64 {
+    200
 }
 
 /// The peer this machine has paired with: its node identity and the
@@ -108,6 +205,8 @@ impl Config {
             paired_peer: None,
             accept_policy: AcceptPolicy::default(),
             download_dir: None,
+            escape_hotkey: Hotkey::default(),
+            edge_settings: EdgeSettings::default(),
         }
     }
 
@@ -293,5 +392,23 @@ mod tests {
             loaded.clipboard_max_bytes,
             super::default_clipboard_max_bytes()
         );
+    }
+
+    /// A config written before the Input/Layout panels existed (no
+    /// `escape_hotkey` / `edge_settings` sections) still loads, falling
+    /// back to the defaults via `#[serde(default)]`.
+    #[test]
+    fn config_without_hotkey_or_edge_settings_still_loads_with_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let old_toml = format!(
+            "node_id = \"{}\"\ndisplay_name = \"old machine\"\n\n[remap]\nrules = []\ninvert_scroll_y = false\ninvert_scroll_x = false\n",
+            uuid::Uuid::new_v4()
+        );
+        std::fs::write(&path, old_toml).expect("write old config");
+
+        let loaded = Config::load_or_create(&path).expect("load");
+        assert_eq!(loaded.escape_hotkey, super::Hotkey::default());
+        assert_eq!(loaded.edge_settings, super::EdgeSettings::default());
     }
 }
