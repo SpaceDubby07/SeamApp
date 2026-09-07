@@ -43,6 +43,17 @@ pub use crate::protocol::InputEvent;
 /// entirely rather than partially synced, same as an oversized image.
 const CLIPBOARD_TEXT_INLINE_MAX_BYTES: usize = 256 * 1024;
 
+/// How often the session sends a heartbeat `Ping` (Tier 8's health
+/// supervisor). Also the cadence of the silence check below.
+const PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// If no control message of any kind arrives for this long, the peer is
+/// declared dead and the session ends with an error so the app's
+/// supervisor can reconnect — without this, a half-open TCP connection
+/// (peer's machine slept, no FIN) hangs until the OS retransmit timeout,
+/// which is minutes. Three missed [`PING_INTERVAL`] heartbeats.
+const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// An accepted `ClipboardContent::ImageOffer` awaiting its matching
 /// `BulkMessage::ClipboardBlob`. Only one can be outstanding at a time — a
 /// newer offer simply replaces it, matching the "ignore anything not the
@@ -189,6 +200,13 @@ pub struct Session {
     /// the `Err` a dropped connection produces. The `&'static str` is the
     /// reason, for the log line.
     stop_reason: Option<&'static str>,
+    /// When the last control message of any kind arrived. The health
+    /// check in [`Session::run`] compares it against `peer_silence_timeout`
+    /// to catch a half-open connection fast. Seeded when `run` starts.
+    last_control_activity: Instant,
+    /// How long the peer can be silent before the health check ends the
+    /// session. [`PEER_SILENCE_TIMEOUT`] in production; tests shorten it.
+    peer_silence_timeout: Duration,
 }
 
 /// Which machine is driving input right now, for the status bar (Tier 8.1
@@ -475,6 +493,8 @@ impl Session {
             last_locked: false,
             last_rtt_micros: None,
             stop_reason: None,
+            last_control_activity: Instant::now(),
+            peer_silence_timeout: PEER_SILENCE_TIMEOUT,
         };
         let handle = SessionHandle {
             command_tx,
@@ -493,6 +513,19 @@ impl Session {
     #[cfg(test)]
     fn stop_reason(&self) -> Option<&'static str> {
         self.stop_reason
+    }
+
+    /// Test-only: when the last control message arrived.
+    #[cfg(test)]
+    fn last_control_activity(&self) -> Instant {
+        self.last_control_activity
+    }
+
+    /// Test-only: shorten the health check's silence tolerance so a
+    /// "peer went silent" test doesn't take six real seconds.
+    #[cfg(test)]
+    fn set_peer_silence_timeout(&mut self, timeout: Duration) {
+        self.peer_silence_timeout = timeout;
     }
 
     /// The peer's current bounds on the shared layout canvas (Tier 8.1),
@@ -552,14 +585,24 @@ impl Session {
     /// executing whatever actions it returns.
     ///
     /// # Errors
-    /// Returns an error if the underlying network or platform calls fail,
-    /// or once the peer disconnects (reconnect isn't implemented yet).
+    /// Returns an error once the peer disconnects or goes silent (the
+    /// app's supervisor turns that into a reconnect), or if an underlying
+    /// network/platform call fails. Returns `Ok(())` on a graceful stop
+    /// (`SessionCommand::Shutdown` or a peer `Goodbye`).
     pub async fn run(mut self) -> Result<(), SessionError> {
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(2));
+        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick fires immediately; skip it so we don't ping before
         // the peer has even seen us as connected.
         ping_interval.tick().await;
+        // Checks the peer hasn't gone silent (half-open connection). A
+        // third of the silence timeout, so production lands at the same
+        // 2s cadence as the ping while tests can shrink it.
+        let mut health_interval = tokio::time::interval(self.peer_silence_timeout / 3);
+        health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        health_interval.tick().await;
+        // Don't count the pre-`run` construction gap against the peer.
+        self.last_control_activity = Instant::now();
 
         // Once the bulk channel closes, `recv()` would return `None`
         // immediately forever — this guard stops polling it rather than
@@ -629,6 +672,21 @@ impl Session {
                             sent_at_micros: now_micros(),
                         })
                         .await?;
+                }
+                _ = health_interval.tick() => {
+                    if self.last_control_activity.elapsed() > self.peer_silence_timeout {
+                        tracing::warn!(
+                            silent_for_ms = u64::try_from(
+                                self.last_control_activity.elapsed().as_millis()
+                            ).unwrap_or(u64::MAX),
+                            "peer went silent; ending session so the supervisor can reconnect"
+                        );
+                        let actions =
+                            self.state_machine.handle(Input::ConnectionLost, Instant::now());
+                        // Releases modifiers/suppression, then the
+                        // `StartReconnect` action returns `Err` out of here.
+                        self.execute_actions(actions).await?;
+                    }
                 }
             }
 
@@ -729,6 +787,8 @@ impl Session {
         msg: ControlMessage,
     ) -> Result<(), SessionError> {
         let now = Instant::now();
+        // Any message — even the peer's own `Ping` — proves it's alive.
+        self.last_control_activity = now;
         match msg {
             ControlMessage::Ping {
                 seq,
@@ -2608,6 +2668,64 @@ mod tests {
         .await
         .expect("timed out waiting for Goodbye");
         assert!(saw_goodbye, "peer never received a Goodbye");
+    }
+
+    /// Health supervisor (Tier 8, M12): a peer that goes silent — no
+    /// messages at all, not even its own pings — ends the session with an
+    /// error so the app's reconnect supervisor takes over, rather than
+    /// hanging on a half-open socket until the OS retransmit timeout.
+    #[tokio::test]
+    async fn silent_peer_ends_the_session_with_an_error() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let (a_bulk, _b_bulk) = bulk_loopback_pair().await;
+        let a_layout = adjacent_layout(a_node, b_node, true);
+
+        // `KeepAlivePlatform` retains the capture/clipboard senders so
+        // `run` doesn't immediately exit on a closed channel — we want it
+        // to reach the health check.
+        let (mut session, _handle) = Session::new(
+            StateMachine::new(a_node, bounds(), a_layout),
+            a_control,
+            a_bulk,
+            Box::new(KeepAlivePlatform::default()),
+            Box::new(RecordingSink::default()),
+            Box::new(KeepAlivePlatform::default()),
+            &Config::new_default(),
+        )
+        .expect("session construction");
+        session.set_peer_silence_timeout(Duration::from_millis(150));
+
+        // Hold the peer's sockets open but never read or write them —
+        // `a`'s pings buffer, and `a` sees nothing come back.
+        let _b_control = b_control;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), session.run()).await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "expected the session to end with an error once the peer went silent, got {outcome:?}"
+        );
+    }
+
+    /// Any control message — including the peer's own `Ping` — resets the
+    /// silence timer that the health supervisor watches.
+    #[tokio::test]
+    async fn any_control_message_refreshes_the_liveness_timestamp() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, _sink, _suppressed) = session_with(a_control, a_node, layout).await;
+        let _b_control = b_control;
+
+        let before = session.last_control_activity();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        session
+            .handle_control_message(ControlMessage::Ping {
+                seq: 1,
+                sent_at_micros: 0,
+            })
+            .await
+            .expect("ping");
+
+        assert!(session.last_control_activity() > before);
     }
 
     /// The receive side of the same flow: a peer `Goodbye` tears the
