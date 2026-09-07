@@ -254,6 +254,162 @@ button.primary:hover:not(:disabled) {
   font-size: 0.85em;
 }
 
+.drop-zone {
+  border: 2px dashed #ccc;
+  border-radius: 10px;
+  padding: 1.75rem 1rem;
+  text-align: center;
+  color: #888;
+  font-size: 0.9rem;
+  transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+}
+
+.drop-zone.is-over {
+  border-color: #396cd8;
+  background: rgba(57, 108, 216, 0.08);
+  color: #396cd8;
+}
+
+.xfer-list {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.xfer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.xfer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.xfer-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.xfer-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #eee;
+  overflow: hidden;
+}
+
+.xfer-bar-fill {
+  height: 100%;
+  background: #396cd8;
+  transition: width 0.2s linear;
+}
+
+.xfer-done .xfer-name {
+  font-weight: 400;
+}
+
+.xfer-status {
+  font-size: 0.8rem;
+  text-transform: capitalize;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.xfer-status-completed {
+  color: #2ea043;
+}
+
+.xfer-status-failed,
+.xfer-status-rejected {
+  color: #c0392b;
+}
+
+.status-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.8rem;
+  color: #555;
+  background: rgba(246, 246, 246, 0.85);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid #e2e2e2;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c0392b;
+  flex: 0 0 auto;
+}
+
+.status-dot.is-connected {
+  background: #2ea043;
+}
+
+.status-peer {
+  font-weight: 600;
+  color: #333;
+}
+
+.status-sep {
+  color: #bbb;
+}
+
+.status-lock {
+  color: #b06a00;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-bar {
+    color: #aaa;
+    background: rgba(30, 30, 30, 0.85);
+    border-color: #3a3a3a;
+  }
+
+  .status-peer {
+    color: #ddd;
+  }
+
+  .status-sep {
+    color: #555;
+  }
+
+  .status-lock {
+    color: #e0a44a;
+  }
+
+  .drop-zone {
+    border-color: #444;
+  }
+
+  .drop-zone.is-over {
+    border-color: #5a8dee;
+    background: rgba(90, 141, 238, 0.12);
+    color: #9cc0ff;
+  }
+
+  .xfer-bar {
+    background: #3a3a3a;
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;

@@ -158,6 +158,19 @@ pub fn send_file(path: String, state: State<'_, AppState>) -> Result<(), String>
     )
 }
 
+/// Cancels an in-flight transfer (Tier 8.1 panel 4's per-row cancel
+/// button), sent or received — the peer is told so its side stops too.
+///
+/// # Errors
+/// Returns an error if there's no active session.
+#[tauri::command]
+pub fn cancel_transfer(
+    transfer_id: seam_core::protocol::TransferId,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_session_command(&state, SessionCommand::CancelTransfer(transfer_id))
+}
+
 /// Answers a `session-event` of type `OfferReceived`.
 ///
 /// # Errors

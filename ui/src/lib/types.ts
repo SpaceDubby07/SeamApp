@@ -67,16 +67,28 @@ export interface FileManifest {
 
 export type TransferId = string; // a UUID
 
+// Which machine is driving input right now — mirrors
+// seam_core::session::LinkStatus.
+export type LinkStatus = "Local" | "Driving" | "Driven";
+
 // Mirrors seam_core::session::SessionEvent, tagged with `#[serde(tag =
 // "type")]` on the Rust side.
 export type SessionEvent =
   | { type: "PeerScreenConfig"; displays: Display[]; virtual_bounds: Rect }
   | { type: "LayoutChanged"; peer_bounds: Rect }
   | { type: "OfferReceived"; transfer_id: TransferId; manifest: FileManifest }
-  | { type: "Progress"; transfer_id: TransferId; bytes_done: number; total: number }
+  | {
+      type: "Progress";
+      transfer_id: TransferId;
+      name: string;
+      incoming: boolean;
+      bytes_done: number;
+      total: number;
+    }
   | { type: "Rejected"; transfer_id: TransferId; reason: string }
   | { type: "Completed"; transfer_id: TransferId; path: string }
-  | { type: "Failed"; transfer_id: TransferId; reason: string };
+  | { type: "Failed"; transfer_id: TransferId; reason: string }
+  | { type: "Status"; link: LinkStatus; rtt_micros: number | null };
 
 export interface ConnectedInfo {
   peer_display_name: string;

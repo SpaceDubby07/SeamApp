@@ -164,6 +164,45 @@ pub struct Session {
     /// Where transfer progress/completion/offers are reported to whatever
     /// is driving this session.
     event_tx: UnboundedSender<SessionEvent>,
+    /// Last control owner reported via [`SessionEvent::Status`], so
+    /// [`Session::sync_link_status`] only emits on an actual change rather
+    /// than after every state-machine feed.
+    last_link: Option<LinkStatus>,
+    /// Most recent control-channel round-trip (from the last pong), in
+    /// microseconds. Replayed into every `Status` event so a control
+    /// change that wasn't itself triggered by a pong still carries a
+    /// latency reading.
+    last_rtt_micros: Option<u64>,
+}
+
+/// Which machine is driving input right now, for the status bar (Tier 8.1
+/// panel 6's "which machine currently has control"). A flattened view of
+/// the handoff [`State`] machine — `Disconnected` has no `LinkStatus`, the
+/// session is torn down by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum LinkStatus {
+    /// This machine has control and its own cursor is live ([`State::LocalActive`]).
+    Local,
+    /// This machine has control and is driving the peer ([`State::RemoteActive`]).
+    Driving,
+    /// The peer has control and is driving this machine ([`State::BeingDriven`]).
+    Driven,
+}
+
+impl LinkStatus {
+    /// The flattened status for a handoff [`State`], or `None` for
+    /// `Disconnected` (nothing to show — the session is ending).
+    fn from_state(state: State) -> Option<Self> {
+        match state {
+            // `Locked` still means this machine holds control — handoff is
+            // just disabled. The status bar shows "locked" from a separate
+            // indicator, not by changing the control owner.
+            State::LocalActive | State::Locked => Some(Self::Local),
+            State::RemoteActive => Some(Self::Driving),
+            State::BeingDriven => Some(Self::Driven),
+            State::Disconnected => None,
+        }
+    }
 }
 
 /// Reported out of a running [`Session`] to whatever's driving it (a CLI
@@ -205,10 +244,17 @@ pub enum SessionEvent {
         manifest: FileManifest,
     },
     /// Bytes sent (outgoing) or received (incoming) so far, for a progress
-    /// bar. Emitted at most once per chunk.
+    /// bar. Emitted at most once per chunk. Carries `name`/`incoming` on
+    /// every tick (not just once) so the Transfers panel can render a row
+    /// for a transfer it never saw an `OfferReceived` for — an outgoing
+    /// send, or an incoming one under [`AcceptPolicy::AlwaysAccept`].
     Progress {
         /// Which transfer this is progress for.
         transfer_id: TransferId,
+        /// The file's name, for the transfer row's label.
+        name: String,
+        /// `true` if we're receiving this file, `false` if sending it.
+        incoming: bool,
         /// Bytes transferred so far.
         bytes_done: u64,
         /// Total size of the file being transferred.
@@ -237,6 +283,17 @@ pub enum SessionEvent {
         transfer_id: TransferId,
         /// Human-readable reason, for logging/display.
         reason: String,
+    },
+    /// Connection health for the status bar (Tier 8.1 panel 6). Sent on
+    /// every pong (~every 2 s, so the latency reading stays fresh) and
+    /// immediately whenever control changes hands, so the "who's driving"
+    /// indicator never lags a transition by up to a ping interval.
+    Status {
+        /// Which machine is driving input right now.
+        link: LinkStatus,
+        /// Most recent control-channel round-trip, in microseconds —
+        /// `None` until the first pong comes back.
+        rtt_micros: Option<u64>,
     },
 }
 
@@ -369,6 +426,8 @@ impl Session {
             command_rx,
             commands_open: true,
             event_tx,
+            last_link: None,
+            last_rtt_micros: None,
         };
         let handle = SessionHandle {
             command_tx,
@@ -390,6 +449,41 @@ impl Session {
     #[must_use]
     pub fn peer_bounds(&self) -> Option<Rect> {
         self.state_machine.peer_bounds()
+    }
+
+    /// Records a heartbeat round-trip and pushes a fresh
+    /// [`SessionEvent::Status`] so the status bar's latency reading stays
+    /// current even while control isn't moving (which is all
+    /// [`Session::sync_link_status`] reacts to).
+    fn on_pong(&mut self, seq: u64, sent_at_micros: u64) {
+        let rtt_micros = now_micros().saturating_sub(sent_at_micros);
+        tracing::debug!(seq, rtt_micros, "pong received");
+        self.last_rtt_micros = Some(rtt_micros);
+        if let Some(link) = LinkStatus::from_state(self.state_machine.state()) {
+            self.last_link = Some(link);
+            let _ = self.event_tx.send(SessionEvent::Status {
+                link,
+                rtt_micros: Some(rtt_micros),
+            });
+        }
+    }
+
+    /// Emits a [`SessionEvent::Status`] iff the control owner changed
+    /// since the last one. Called after every batch of state-machine
+    /// actions (see [`Session::execute_actions`]) so the status bar's
+    /// "who's driving" indicator updates the instant control moves,
+    /// rather than only on the next pong up to a ping interval later.
+    fn sync_link_status(&mut self) {
+        let link = LinkStatus::from_state(self.state_machine.state());
+        if link != self.last_link {
+            self.last_link = link;
+            if let Some(link) = link {
+                let _ = self.event_tx.send(SessionEvent::Status {
+                    link,
+                    rtt_micros: self.last_rtt_micros,
+                });
+            }
+        }
     }
 
     /// Runs the session until the connection ends or an unrecoverable
@@ -587,8 +681,7 @@ impl Session {
                 seq,
                 sent_at_micros,
             } => {
-                let rtt_micros = now_micros().saturating_sub(sent_at_micros);
-                tracing::debug!(seq, rtt_micros, "pong received");
+                self.on_pong(seq, sent_at_micros);
             }
             ControlMessage::ModifierState { mods } => {
                 self.sync_injected_modifiers(mods)?;
@@ -1168,6 +1261,7 @@ impl Session {
         };
         let transfer_id = outgoing.transfer_id;
         let total = outgoing.manifest.size;
+        let name = outgoing.manifest.name.clone();
 
         match outgoing.read_next_chunk().await {
             Ok(Some((offset, data))) => {
@@ -1184,6 +1278,8 @@ impl Session {
                     .map_or(total, |t| t.bytes_sent);
                 let _ = self.event_tx.send(SessionEvent::Progress {
                     transfer_id,
+                    name,
+                    incoming: false,
                     bytes_done,
                     total,
                 });
@@ -1328,6 +1424,7 @@ impl Session {
             return Ok(());
         };
         let total = incoming.manifest.size;
+        let name = incoming.manifest.name.clone();
         if let Err(e) = incoming.write_chunk(offset, &data).await {
             tracing::warn!(?transfer_id, error = %e, "failed to write incoming chunk");
             self.incoming_transfers.remove(&transfer_id);
@@ -1340,6 +1437,8 @@ impl Session {
         let bytes_done = self.incoming_transfers[&transfer_id].bytes_received;
         let _ = self.event_tx.send(SessionEvent::Progress {
             transfer_id,
+            name,
+            incoming: true,
             bytes_done,
             total,
         });
@@ -1446,6 +1545,7 @@ impl Session {
         for action in actions {
             self.execute_action(action).await?;
         }
+        self.sync_link_status();
         Ok(())
     }
 
@@ -2802,7 +2902,8 @@ mod tests {
                             SessionEvent::Progress { .. }
                             | SessionEvent::OfferReceived { .. }
                             | SessionEvent::PeerScreenConfig { .. }
-                            | SessionEvent::LayoutChanged { .. } => {}
+                            | SessionEvent::LayoutChanged { .. }
+                            | SessionEvent::Status { .. } => {}
                         }
                     }
                 }

@@ -35,6 +35,8 @@ export const updateLayout = (peerBounds: Rect) =>
 export const sendFile = (path: string) => invoke<void>("send_file", { path });
 export const respondToOffer = (transferId: string, accept: boolean) =>
   invoke<void>("respond_to_offer", { transferId, accept });
+export const cancelTransfer = (transferId: string) =>
+  invoke<void>("cancel_transfer", { transferId });
 export const disconnect = () => invoke<void>("disconnect");
 
 // ── Logs ──

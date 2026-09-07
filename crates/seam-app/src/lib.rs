@@ -161,6 +161,7 @@ pub fn run() {
             commands::update_layout,
             commands::send_file,
             commands::respond_to_offer,
+            commands::cancel_transfer,
             commands::disconnect,
             commands::get_logs,
             commands::clear_logs,

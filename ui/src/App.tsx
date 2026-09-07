@@ -3,12 +3,15 @@ import "./App.css";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { LayoutCanvas } from "./components/LayoutCanvas";
 import { LogPanel } from "./components/LogPanel";
+import { StatusBar } from "./components/StatusBar";
+import { TransfersPanel } from "./components/TransfersPanel";
 import * as ipc from "./lib/ipc";
 import type {
   Config,
   ConnectedInfo,
   DiscoveredPeer,
   Display,
+  LinkStatus,
   Rect,
 } from "./lib/types";
 
@@ -21,6 +24,8 @@ function App() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [connected, setConnected] = useState<ConnectedInfo | null>(null);
   const [peerBounds, setPeerBounds] = useState<Rect | null>(null);
+  const [link, setLink] = useState<LinkStatus | null>(null);
+  const [rttMicros, setRttMicros] = useState<number | null>(null);
 
   useEffect(() => {
     ipc.getConfig().then(setConfig).catch(console.error);
@@ -37,6 +42,8 @@ function App() {
       ipc.onDisconnected(() => {
         setConnected(null);
         setPeerBounds(null);
+        setLink(null);
+        setRttMicros(null);
       }),
       ipc.onSessionEvent((event) => {
         // `LayoutChanged` always carries our own naive initial placement
@@ -45,6 +52,9 @@ function App() {
         // the one event the canvas needs for both position and size.
         if (event.type === "LayoutChanged") {
           setPeerBounds(event.peer_bounds);
+        } else if (event.type === "Status") {
+          setLink(event.link);
+          if (event.rtt_micros !== null) setRttMicros(event.rtt_micros);
         }
       }),
     ]);
@@ -80,7 +90,15 @@ function App() {
           onPeerBoundsChange={handleLayoutDrag}
         />
       )}
+      <TransfersPanel connected={connected !== null} />
       <LogPanel />
+      <StatusBar
+        localName={config?.display_name ?? "This device"}
+        peerName={connected?.peer_display_name ?? null}
+        link={link}
+        rttMicros={rttMicros}
+        locked={false}
+      />
     </main>
   );
 }
