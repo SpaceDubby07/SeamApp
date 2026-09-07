@@ -12,6 +12,7 @@ import type {
   Display,
   LogLine,
   Rect,
+  RemapTable,
   SessionEvent,
 } from "./types";
 
@@ -19,6 +20,10 @@ import type {
 export const getConfig = () => invoke<Config>("get_config");
 export const setDisplayName = (name: string) =>
   invoke<void>("set_display_name", { name });
+/** Persists the remap/scroll table and pushes it into a live session
+ * (Tier 7.3) — takes effect on the next injected event, no reconnect. */
+export const setRemap = (remap: RemapTable) =>
+  invoke<void>("set_remap", { remap });
 export const listDiscoveredPeers = () =>
   invoke<DiscoveredPeer[]>("list_discovered_peers");
 export const getLocalScreens = () =>

@@ -326,6 +326,11 @@ pub enum SessionCommand {
     },
     /// Cancels a transfer, sent or received.
     CancelTransfer(TransferId),
+    /// Swaps in a new remap table (Tier 7.3), effective on the very next
+    /// injected event — so the Input panel's key-swap / scroll-inversion
+    /// edits apply to the running session without a reconnect. Remapping
+    /// is receive-side only, so this never touches the wire or the peer.
+    UpdateRemap(RemapTable),
 }
 
 /// The other end of a running [`Session`]'s command/event channels —
@@ -1402,6 +1407,15 @@ impl Session {
                 if was_outgoing {
                     self.start_next_pending_send().await?;
                 }
+            }
+            SessionCommand::UpdateRemap(remap) => {
+                tracing::info!(
+                    rules = remap.rules.len(),
+                    invert_scroll_x = remap.invert_scroll_x,
+                    invert_scroll_y = remap.invert_scroll_y,
+                    "remap table updated live"
+                );
+                self.remap = remap;
             }
         }
         Ok(())
@@ -2544,6 +2558,52 @@ mod tests {
         assert_eq!(
             *sink.injected.lock().expect("mutex poisoned"),
             vec![InputEvent::Scroll { dx: 2, dy: -5 }]
+        );
+    }
+
+    /// `SessionCommand::UpdateRemap` swaps the table on a running session:
+    /// a key relayed *after* the command is remapped, without a reconnect
+    /// (the Input panel applies edits live — Tier 8.1 panel 3).
+    #[tokio::test]
+    async fn update_remap_command_takes_effect_on_the_next_injected_key() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        // Start with an identity table so there's a real before/after.
+        let (mut session, sink, _suppressed) =
+            session_with_remap(a_control, a_node, layout, RemapTable::default()).await;
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::Handoff {
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            })
+            .await
+            .expect("handoff");
+
+        session
+            .handle_session_command(SessionCommand::UpdateRemap(
+                RemapTable::windows_keyboard_on_mac(),
+            ))
+            .await
+            .expect("update remap");
+
+        session
+            .handle_control_message(ControlMessage::KeyDown {
+                code: KeyCode::LeftCtrl,
+                repeat: false,
+            })
+            .await
+            .expect("relayed keydown");
+
+        assert_eq!(
+            *sink.injected.lock().expect("mutex poisoned"),
+            vec![InputEvent::KeyDown {
+                code: KeyCode::LeftMeta,
+                repeat: false,
+            }]
         );
     }
 

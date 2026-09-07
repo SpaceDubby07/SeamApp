@@ -334,6 +334,49 @@ button.primary:hover:not(:disabled) {
   color: #c0392b;
 }
 
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0;
+  font-size: 0.9rem;
+}
+
+.check input {
+  flex: 0 0 auto;
+}
+
+.remap-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.remap-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.remap-row select {
+  flex: 1;
+  border-radius: 8px;
+  border: 1px solid #ddd;
+  padding: 0.4em 0.6em;
+  font-family: inherit;
+  font-size: 0.9em;
+  color: #0f0f0f;
+  background-color: #fff;
+}
+
+.remap-arrow {
+  color: #888;
+  flex: 0 0 auto;
+}
+
 .status-bar {
   position: fixed;
   left: 0;
@@ -407,6 +450,12 @@ button.primary:hover:not(:disabled) {
 
   .xfer-bar {
     background: #3a3a3a;
+  }
+
+  .remap-row select {
+    color: #f6f6f6;
+    background-color: #1a1a1a99;
+    border-color: #444;
   }
 }
 

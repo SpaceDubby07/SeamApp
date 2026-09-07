@@ -23,15 +23,23 @@ export interface Display {
 
 export type AcceptPolicy = "Ask" | "AlwaysAccept" | "AlwaysDeny";
 
+// A physical key code. Named variants of seam_core::protocol::KeyCode
+// serialize as their bare name ("LeftCtrl", "Digit4", …); the catch-all
+// `Unknown(u32)` serializes as `{ Unknown: n }` — the remap editor only
+// deals in named keys, so this is typed loosely as string.
+export type KeyCode = string;
+
+// Mirrors seam_core::remap::RemapTableRepr (the on-wire / on-disk shape of
+// RemapTable — its `rules` HashMap travels as a list of pairs).
 export interface RemapRule {
-  from: string;
-  to: string;
+  physical: KeyCode;
+  injected: KeyCode;
 }
 
 export interface RemapTable {
   rules: RemapRule[];
-  invert_scroll_x: boolean;
   invert_scroll_y: boolean;
+  invert_scroll_x: boolean;
 }
 
 export interface PairedPeer {

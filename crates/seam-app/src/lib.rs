@@ -152,6 +152,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_display_name,
+            commands::set_remap,
             commands::list_discovered_peers,
             commands::get_local_screens,
             commands::has_input_permission,

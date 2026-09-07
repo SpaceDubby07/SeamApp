@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 import { ConnectionPanel } from "./components/ConnectionPanel";
+import { InputPanel } from "./components/InputPanel";
 import { LayoutCanvas } from "./components/LayoutCanvas";
 import { LogPanel } from "./components/LogPanel";
 import { StatusBar } from "./components/StatusBar";
@@ -90,6 +91,7 @@ function App() {
           onPeerBoundsChange={handleLayoutDrag}
         />
       )}
+      <InputPanel config={config} onConfigChanged={setConfig} />
       <TransfersPanel connected={connected !== null} />
       <LogPanel />
       <StatusBar

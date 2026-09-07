@@ -5,6 +5,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use seam_core::config::Config;
 use seam_core::net::control::ControlChannel;
 use seam_core::net::discovery::DiscoveredPeer;
+use seam_core::remap::RemapTable;
 use seam_core::session::SessionCommand;
 use seam_core::topology::{Display, Rect};
 
@@ -28,6 +29,28 @@ pub fn set_display_name(name: String, state: State<'_, AppState>) -> Result<(), 
     let mut config = state.config.lock().expect("mutex poisoned");
     config.display_name = name;
     config.save(&state.config_path).map_err(|e| e.to_string())
+}
+
+/// Replaces the modifier-remap / scroll-inversion table (Tier 7.3, the
+/// Input panel). Persisted immediately, and — if a session is live —
+/// pushed into it via [`SessionCommand::UpdateRemap`] so the change takes
+/// effect on the next injected event without a reconnect. A missing
+/// session is not an error: the new table is saved and picked up by the
+/// next connection.
+///
+/// # Errors
+/// Returns an error only if the config file can't be written.
+#[tauri::command]
+pub fn set_remap(remap: RemapTable, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut config = state.config.lock().expect("mutex poisoned");
+        config.remap = remap.clone();
+        config.save(&state.config_path).map_err(|e| e.to_string())?;
+    }
+    // Best-effort live apply; "not connected" just means there's nothing
+    // to update right now.
+    let _ = send_session_command(&state, SessionCommand::UpdateRemap(remap));
+    Ok(())
 }
 
 /// Peers currently visible over mDNS (Tier 8.1's "discovered devices"
