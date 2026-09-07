@@ -277,25 +277,33 @@ pub fn respond_to_offer(
     )
 }
 
-/// Ends the active session by aborting its `run()` task outright —
-/// `Session` has no graceful shutdown path yet (M12's reliability work
-/// covers a real `Goodbye`-then-close), so this drops the control/bulk
-/// sockets without telling the peer; it'll notice via its own
-/// connection-closed handling. A no-op if nothing's connected.
+/// Ends the active session cleanly (M12): sends
+/// [`SessionCommand::Shutdown`], which makes `run` send the peer a
+/// `Goodbye`, release modifiers/suppression, and return `Ok(())` — then
+/// `finish_connection`'s wrapper task clears state and emits
+/// `disconnected`. A no-op if nothing's connected.
 ///
-/// Aborting is safe: `Session`'s `Drop` still runs when the task's future
-/// is dropped, so suppression is lifted, modifiers are released, and the
-/// capture hook is torn down. But abort skips `run`'s own post-exit
-/// bookkeeping in `finish_connection` (which is what normally emits
-/// `disconnected`), so we emit it here — otherwise the UI never leaves
-/// the connected state.
+/// If the command can't be delivered (no session, or its channel is
+/// already gone), this falls back to aborting the task and emitting
+/// `disconnected` here, so the UI never gets stuck in the connected
+/// state. `Session`'s `Drop` still runs on abort, so suppression/
+/// modifiers/capture are torn down either way.
 #[tauri::command]
 pub fn disconnect(state: State<'_, AppState>, app: AppHandle) {
-    if let Some(task) = state.session_task.lock().expect("mutex poisoned").take() {
-        task.abort();
+    let requested = state
+        .session_command_tx
+        .lock()
+        .expect("mutex poisoned")
+        .as_ref()
+        .is_some_and(|tx| tx.send(SessionCommand::Shutdown).is_ok());
+
+    if !requested {
+        if let Some(task) = state.session_task.lock().expect("mutex poisoned").take() {
+            task.abort();
+        }
+        *state.session_command_tx.lock().expect("mutex poisoned") = None;
+        let _ = app.emit("disconnected", ());
     }
-    *state.session_command_tx.lock().expect("mutex poisoned") = None;
-    let _ = app.emit("disconnected", ());
 }
 
 /// Recent log lines for the frontend's Log panel. Pass the highest `seq`

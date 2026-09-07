@@ -101,6 +101,12 @@ pub enum Input {
     ReceivedEmergencyRelease,
     /// The connection to the active peer was lost.
     ConnectionLost,
+    /// The session is shutting down cleanly (the user hit Disconnect, or
+    /// the peer sent `Goodbye`). Like [`Input::ConnectionLost`]'s cleanup
+    /// — drop to `Disconnected`, release modifiers/suppression if we were
+    /// driving or being driven — but with no reconnect, since this end is
+    /// stopping on purpose (M12).
+    Shutdown,
 }
 
 /// One thing the caller should do in response to an `Input`. The state
@@ -307,6 +313,7 @@ impl StateMachine {
             Input::ReceivedReleaseBack => self.on_received_release_back(),
             Input::ReceivedEmergencyRelease => self.on_emergency_release(),
             Input::ConnectionLost => self.on_connection_lost(),
+            Input::Shutdown => self.on_shutdown(),
         }
     }
 
@@ -558,6 +565,26 @@ impl StateMachine {
         actions.push(Action::StartReconnect);
         actions
     }
+
+    /// Clean shutdown: identical cleanup to [`Self::on_connection_lost`]
+    /// (release modifiers and suppression on the way out of a driving
+    /// state — Tier 7.1's non-negotiable invariant) but without the
+    /// `StartReconnect` action, since this end is stopping deliberately.
+    fn on_shutdown(&mut self) -> Vec<Action> {
+        if self.state == State::Disconnected {
+            return Vec::new();
+        }
+        let was_active_or_driven = matches!(self.state, State::RemoteActive | State::BeingDriven);
+        self.state = State::Disconnected;
+        self.peer = None;
+        self.clear_driven_tracking();
+
+        if was_active_or_driven {
+            vec![Action::SetSuppression(false), Action::ReleaseAllModifiers]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +691,30 @@ mod tests {
                 "state {state:?} failed to disable suppression on disconnect"
             );
             assert!(actions.contains(&Action::StartReconnect));
+        }
+    }
+
+    #[test]
+    fn shutdown_releases_modifiers_and_suppression_but_does_not_reconnect() {
+        for state in [State::RemoteActive, State::BeingDriven] {
+            let (mut sm, _, peer) = two_node_machine();
+            sm.force_state(state, Some(peer));
+
+            let actions = sm.handle(Input::Shutdown, Instant::now());
+
+            assert_eq!(sm.state(), State::Disconnected, "state was {state:?}");
+            assert!(
+                actions.contains(&Action::ReleaseAllModifiers),
+                "state {state:?} failed to release modifiers on shutdown"
+            );
+            assert!(
+                actions.contains(&Action::SetSuppression(false)),
+                "state {state:?} failed to disable suppression on shutdown"
+            );
+            assert!(
+                !actions.contains(&Action::StartReconnect),
+                "shutdown must not schedule a reconnect"
+            );
         }
     }
 

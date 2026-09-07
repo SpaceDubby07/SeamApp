@@ -183,6 +183,12 @@ pub struct Session {
     /// change that wasn't itself triggered by a pong still carries a
     /// latency reading.
     last_rtt_micros: Option<u64>,
+    /// Set once a graceful shutdown has been requested (the user hit
+    /// Disconnect, or the peer sent `Goodbye`). [`Session::run`] checks it
+    /// after each event and returns `Ok(())` — a clean stop, distinct from
+    /// the `Err` a dropped connection produces. The `&'static str` is the
+    /// reason, for the log line.
+    stop_reason: Option<&'static str>,
 }
 
 /// Which machine is driving input right now, for the status bar (Tier 8.1
@@ -359,6 +365,11 @@ pub enum SessionCommand {
         /// Post-handoff cooldown in milliseconds.
         handoff_cooldown_ms: u64,
     },
+    /// Ends the session cleanly (the user hit Disconnect): tells the peer
+    /// with a `Goodbye`, releases modifiers/suppression, and lets
+    /// [`Session::run`] return `Ok(())`. Replaces the old `task.abort()`
+    /// path (M12).
+    Shutdown,
 }
 
 /// The other end of a running [`Session`]'s command/event channels —
@@ -463,6 +474,7 @@ impl Session {
             last_link: None,
             last_locked: false,
             last_rtt_micros: None,
+            stop_reason: None,
         };
         let handle = SessionHandle {
             command_tx,
@@ -475,6 +487,12 @@ impl Session {
     #[must_use]
     pub fn state(&self) -> State {
         self.state_machine.state()
+    }
+
+    /// Test-only: the graceful-stop reason, once one has been requested.
+    #[cfg(test)]
+    fn stop_reason(&self) -> Option<&'static str> {
+        self.stop_reason
     }
 
     /// The peer's current bounds on the shared layout canvas (Tier 8.1),
@@ -612,6 +630,15 @@ impl Session {
                         })
                         .await?;
                 }
+            }
+
+            if let Some(reason) = self.stop_reason {
+                // A graceful stop — the state machine has already dropped
+                // to `Disconnected` and released modifiers/suppression;
+                // `Session`'s `Drop` runs the same teardown again
+                // (idempotent) as `self` falls out of scope here.
+                tracing::info!(reason, "session ended gracefully");
+                return Ok(());
             }
         }
     }
@@ -794,9 +821,7 @@ impl Session {
             } => {
                 self.handle_layout_update(sender_bounds, peer_bounds);
             }
-            ControlMessage::Goodbye { reason } => {
-                tracing::info!(reason, "peer sent goodbye");
-            }
+            ControlMessage::Goodbye { reason } => self.on_peer_goodbye(&reason).await?,
         }
         Ok(())
     }
@@ -1472,7 +1497,37 @@ impl Session {
                 self.state_machine
                     .set_edge_settings(corner_dead_zone_px, handoff_cooldown_ms);
             }
+            SessionCommand::Shutdown => self.begin_shutdown().await?,
         }
+        Ok(())
+    }
+
+    /// The receive half of M12's graceful stop: a peer `Goodbye` tears the
+    /// session down cleanly (releasing modifiers if we were being driven)
+    /// and arms `run`'s exit, rather than just being logged.
+    async fn on_peer_goodbye(&mut self, reason: &str) -> Result<(), SessionError> {
+        tracing::info!(reason, "peer sent goodbye; closing session");
+        let actions = self.state_machine.handle(Input::Shutdown, Instant::now());
+        self.execute_actions(actions).await?;
+        self.stop_reason = Some("peer goodbye");
+        Ok(())
+    }
+
+    /// The local half of M12's graceful stop: tell the peer with a
+    /// `Goodbye` (best-effort — if the socket's already gone it'll see the
+    /// close anyway), release modifiers/suppression via the state machine,
+    /// and arm `run`'s clean `Ok(())` exit.
+    async fn begin_shutdown(&mut self) -> Result<(), SessionError> {
+        tracing::info!("local shutdown requested");
+        let _ = self
+            .control
+            .send(&ControlMessage::Goodbye {
+                reason: "peer disconnected".to_string(),
+            })
+            .await;
+        let actions = self.state_machine.handle(Input::Shutdown, Instant::now());
+        self.execute_actions(actions).await?;
+        self.stop_reason = Some("local shutdown");
         Ok(())
     }
 
@@ -2504,6 +2559,91 @@ mod tests {
             .await
             .expect("new combo");
         assert_eq!(session.state(), State::LocalActive);
+    }
+
+    /// `SessionCommand::Shutdown` (M12 graceful stop): tells the peer with
+    /// a `Goodbye`, releases modifiers on the way out of a driving state,
+    /// drops to `Disconnected`, and arms `run`'s clean exit.
+    #[tokio::test]
+    async fn shutdown_command_sends_goodbye_releases_modifiers_and_stops() {
+        let (a_control, a_node, mut b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout).await;
+
+        // Drive the peer so shutdown has a modifier-release path to take.
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 960, y: 540 })
+            .await
+            .expect("center");
+        session
+            .handle_capture_event(InputEvent::MouseMoveAbs { x: 1919, y: 540 })
+            .await
+            .expect("edge");
+        assert_eq!(session.state(), State::RemoteActive);
+        let releases_before = *sink.releases.lock().expect("mutex poisoned");
+
+        session
+            .handle_session_command(SessionCommand::Shutdown)
+            .await
+            .expect("shutdown");
+
+        assert_eq!(session.stop_reason(), Some("local shutdown"));
+        assert_eq!(session.state(), State::Disconnected);
+        assert!(
+            *sink.releases.lock().expect("mutex poisoned") > releases_before,
+            "shutdown while driving must release modifiers"
+        );
+
+        // A `Goodbye` reached the peer (after whatever handshake/handoff
+        // traffic preceded it).
+        let saw_goodbye = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match b_control.recv().await {
+                    Ok(Some(ControlMessage::Goodbye { .. })) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break false,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for Goodbye");
+        assert!(saw_goodbye, "peer never received a Goodbye");
+    }
+
+    /// The receive side of the same flow: a peer `Goodbye` tears the
+    /// session down cleanly rather than being merely logged.
+    #[tokio::test]
+    async fn peer_goodbye_releases_modifiers_and_stops() {
+        let (a_control, a_node, b_control, b_node) = loopback_pair().await;
+        let layout = adjacent_layout(a_node, b_node, true);
+        let (mut session, sink, _suppressed) = session_with(a_control, a_node, layout).await;
+        let _b_control = b_control;
+
+        session
+            .handle_control_message(ControlMessage::Handoff {
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            })
+            .await
+            .expect("handoff");
+        assert_eq!(session.state(), State::BeingDriven);
+        let releases_before = *sink.releases.lock().expect("mutex poisoned");
+
+        session
+            .handle_control_message(ControlMessage::Goodbye {
+                reason: "peer disconnected".to_string(),
+            })
+            .await
+            .expect("goodbye");
+
+        assert_eq!(session.stop_reason(), Some("peer goodbye"));
+        assert_eq!(session.state(), State::Disconnected);
+        assert!(
+            *sink.releases.lock().expect("mutex poisoned") > releases_before,
+            "a Goodbye while being driven must release modifiers"
+        );
     }
 
     #[tokio::test]
