@@ -85,13 +85,6 @@ function App() {
   return (
     <main className="app">
       <h1>Seam</h1>
-      <ConnectionPanel
-        config={config}
-        peers={peers}
-        connected={connected}
-        pairingCode={pairingCode}
-        onConfigChanged={setConfig}
-      />
       {localBounds && (
         <LayoutCanvas
           localName={config?.display_name ?? "This device"}
@@ -103,6 +96,13 @@ function App() {
           onEdgeSettingsChange={handleEdgeSettingsChange}
         />
       )}
+      <ConnectionPanel
+        config={config}
+        peers={peers}
+        connected={connected}
+        pairingCode={pairingCode}
+        onConfigChanged={setConfig}
+      />
       <InputPanel
         config={config}
         onConfigChanged={setConfig}

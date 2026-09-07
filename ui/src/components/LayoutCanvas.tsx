@@ -13,9 +13,9 @@ interface Props {
   onEdgeSettingsChange: (settings: EdgeSettings) => void;
 }
 
-const CANVAS_WIDTH = 640;
-const CANVAS_HEIGHT = 380;
-const CANVAS_PADDING = 40;
+const CANVAS_WIDTH = 700;
+const CANVAS_HEIGHT = 400;
+const CANVAS_PADDING = 44;
 
 function unionBounds(a: Rect, b: Rect | null): Rect {
   if (!b) return a;
