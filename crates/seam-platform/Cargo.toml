@@ -21,6 +21,7 @@ windows = { version = "0.60", features = [
     "Win32_Graphics_Gdi",              # EnumDisplayMonitors
     "Win32_UI_HiDpi",                  # per-monitor DPI awareness
     "Win32_System_Threading",          # GetCurrentThreadId, for stop()'s WM_QUIT
+    "Win32_System_SystemInformation",  # GetTickCount, for the capture hook watchdog
     "Win32_System_DataExchange",       # OpenClipboard/SetClipboardData/AddClipboardFormatListener
     "Win32_System_Memory",             # GlobalAlloc/GlobalLock for clipboard payloads
     "Win32_System_Ole",                # CF_UNICODETEXT and friends

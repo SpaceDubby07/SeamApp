@@ -20,7 +20,11 @@ pub type CFAllocatorRef = *const c_void;
 pub type CFStringRef = *const c_void;
 pub type CFRunLoopRef = *mut c_void;
 pub type CFRunLoopSourceRef = *mut c_void;
+pub type CFRunLoopTimerRef = *mut c_void;
 pub type CFMachPortRef = *mut c_void;
+pub type CFOptionFlags = u64;
+pub type CFAbsoluteTime = f64;
+pub type CFTimeInterval = f64;
 pub type CGEventRef = *mut c_void;
 pub type CGEventTapProxy = *mut c_void;
 pub type CGEventSourceRef = *const c_void;
@@ -112,6 +116,10 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     pub fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    /// `false` once macOS has disabled the tap — after sleep/wake, a
+    /// screen lock, fast user switch, or a callback-timeout that didn't
+    /// deliver the pseudo-event. The watchdog timer polls this.
+    pub fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
     // ── Reading event data ──
     pub fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
@@ -172,6 +180,9 @@ unsafe extern "C" {
     pub fn AXIsProcessTrusted() -> bool;
 }
 
+/// `CFRunLoopTimerCallBack` — `void (*)(CFRunLoopTimerRef, void *info)`.
+pub type CFRunLoopTimerCallBack = unsafe extern "C" fn(timer: CFRunLoopTimerRef, info: *mut c_void);
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
@@ -184,6 +195,19 @@ unsafe extern "C" {
     pub fn CFRunLoopRun();
     pub fn CFRunLoopStop(rl: CFRunLoopRef);
     pub fn CFMachPortInvalidate(port: CFMachPortRef);
+
+    pub fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime;
+    pub fn CFRunLoopTimerCreate(
+        allocator: CFAllocatorRef,
+        fire_date: CFAbsoluteTime,
+        interval: CFTimeInterval,
+        flags: CFOptionFlags,
+        order: CFIndex,
+        callout: CFRunLoopTimerCallBack,
+        context: *mut c_void,
+    ) -> CFRunLoopTimerRef;
+    pub fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
+    pub fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 
     pub static kCFRunLoopCommonModes: CFStringRef;
 }

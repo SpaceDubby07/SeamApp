@@ -36,20 +36,21 @@ use seam_core::protocol::{InputEvent, KeyCode, MouseButton};
 use seam_core::traits::InputCapture;
 
 use super::cg_ffi::{
-    CFMachPortCreateRunLoopSource, CFMachPortInvalidate, CFMachPortRef, CFRelease,
-    CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRun, CFRunLoopStop,
+    CFAbsoluteTimeGetCurrent, CFMachPortCreateRunLoopSource, CFMachPortInvalidate, CFMachPortRef,
+    CFRelease, CFRunLoopAddSource, CFRunLoopAddTimer, CFRunLoopGetCurrent, CFRunLoopRef,
+    CFRunLoopRun, CFRunLoopStop, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate, CFRunLoopTimerRef,
     CGAssociateMouseAndMouseCursorPosition, CGDisplayBounds, CGDisplayHideCursor,
     CGDisplayShowCursor, CGEventGetIntegerValueField, CGEventGetLocation, CGEventRef,
-    CGEventTapCreate, CGEventTapEnable, CGEventTapProxy, CGMainDisplayID, CGPoint,
-    CGWarpMouseCursorPosition, K_CG_EVENT_FLAGS_CHANGED, K_CG_EVENT_KEY_DOWN, K_CG_EVENT_KEY_UP,
-    K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP,
-    K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED,
-    K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
-    K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
-    K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, K_CG_EVENT_TAP_OPTION_DEFAULT,
-    K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP, K_CG_KEYBOARD_EVENT_AUTOREPEAT,
-    K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER, K_CG_MOUSE_EVENT_DELTA_X,
-    K_CG_MOUSE_EVENT_DELTA_Y, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+    CGEventTapCreate, CGEventTapEnable, CGEventTapIsEnabled, CGEventTapProxy, CGMainDisplayID,
+    CGPoint, CGWarpMouseCursorPosition, K_CG_EVENT_FLAGS_CHANGED, K_CG_EVENT_KEY_DOWN,
+    K_CG_EVENT_KEY_UP, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED,
+    K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN,
+    K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN,
+    K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL,
+    K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
+    K_CG_EVENT_TAP_OPTION_DEFAULT, K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP,
+    K_CG_KEYBOARD_EVENT_AUTOREPEAT, K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER,
+    K_CG_MOUSE_EVENT_DELTA_X, K_CG_MOUSE_EVENT_DELTA_Y, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
     K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, kCFRunLoopCommonModes,
 };
 use super::keycodes::cgkeycode_to_keycode;
@@ -68,12 +69,20 @@ static SUPPRESS: AtomicBool = AtomicBool::new(false);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 
+/// How often the watchdog timer checks the tap is still enabled. macOS
+/// disables the tap across sleep/wake, a screen lock, and fast user
+/// switching (delivering `kCGEventTapDisabledByUserInput` — but only if
+/// its run loop is being serviced, which it may not be right at wake); a
+/// 1s poll re-enables it regardless of whether the pseudo-event arrived.
+const WATCHDOG_INTERVAL_SECS: f64 = 1.0;
+
 thread_local! {
     // The tap callback runs on the thread that created it (CGEventTap
     // delivers callbacks via that thread's run loop), so this only needs
     // to be visible there.
     static SINK: RefCell<Option<UnboundedSender<InputEvent>>> = const { RefCell::new(None) };
     static TAP_PORT: RefCell<CFMachPortRef> = const { RefCell::new(std::ptr::null_mut()) };
+    static WATCHDOG_TIMER: RefCell<CFRunLoopTimerRef> = const { RefCell::new(std::ptr::null_mut()) };
     // Which modifier KeyCodes we currently believe are held — see the
     // module docs on why flagsChanged needs toggle-tracking rather than a
     // flags-bitmask diff.
@@ -234,20 +243,47 @@ impl InputCapture for Capture {
                 // SAFETY: `tap` is a freshly created, not-yet-enabled tap.
                 unsafe { CGEventTapEnable(tap, true) };
 
+                // Watchdog: re-enables the tap after macOS disables it
+                // across sleep/wake, a lock, or fast user switching
+                // (Tier 12's sleep/wake recovery). Repeats forever; torn
+                // down after the run loop stops, below.
+                // SAFETY: `tap_watchdog` matches `CFRunLoopTimerCallBack`;
+                // a null context is allowed; `flags`/`order` of 0 are the
+                // documented defaults.
+                let watchdog = unsafe {
+                    CFRunLoopTimerCreate(
+                        std::ptr::null(),
+                        CFAbsoluteTimeGetCurrent() + WATCHDOG_INTERVAL_SECS,
+                        WATCHDOG_INTERVAL_SECS,
+                        0,
+                        0,
+                        tap_watchdog,
+                        std::ptr::null_mut(),
+                    )
+                };
+                WATCHDOG_TIMER.with(|cell| *cell.borrow_mut() = watchdog);
+                // SAFETY: `run_loop` and `watchdog` are both valid; adding
+                // a timer to this thread's own run loop is the documented
+                // pattern.
+                unsafe { CFRunLoopAddTimer(run_loop, watchdog, kCFRunLoopCommonModes) };
+
                 let _ = ready_tx.send(Ok(run_loop as usize));
 
                 // SAFETY: no preconditions; this blocks until
                 // `CFRunLoopStop` is called on `run_loop` from `stop()`.
                 unsafe { CFRunLoopRun() };
 
-                // SAFETY: `tap` is still the same valid, non-null port
+                // SAFETY: `watchdog` and `tap` are the same valid ports
                 // created above and not yet invalidated.
                 unsafe {
+                    CFRunLoopTimerInvalidate(watchdog);
+                    CFRelease(watchdog.cast());
                     CFMachPortInvalidate(tap);
                     CFRelease(tap.cast());
                 }
                 SINK.with(|cell| *cell.borrow_mut() = None);
                 TAP_PORT.with(|cell| *cell.borrow_mut() = std::ptr::null_mut());
+                WATCHDOG_TIMER.with(|cell| *cell.borrow_mut() = std::ptr::null_mut());
                 HELD_MODIFIERS.with(|cell| cell.borrow_mut().clear());
             })
             .map_err(|e| PlatformError::HookRegistrationFailed(e.to_string()))?;
@@ -434,6 +470,31 @@ fn handle_mouse_moved(event: CGEventRef) -> InputEvent {
         x: x as i32,
         y: y as i32,
     }
+}
+
+/// Watchdog run-loop timer callback (fires on the capture thread every
+/// [`WATCHDOG_INTERVAL_SECS`]). If macOS has disabled the tap — sleep/
+/// wake, screen lock, fast user switch — re-enable it. `CGEventTapEnable`
+/// on an already-enabled tap is a no-op, so the common case costs one
+/// `CGEventTapIsEnabled` call.
+///
+/// # Safety
+/// Matches the `CFRunLoopTimerCallBack` ABI; both args are unused.
+unsafe extern "C" fn tap_watchdog(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
+    TAP_PORT.with(|cell| {
+        let tap = *cell.borrow();
+        if tap.is_null() {
+            return;
+        }
+        // SAFETY: `tap` is the live port this same thread created and has
+        // not invalidated (that only happens after the run loop stops,
+        // which also invalidates this timer first).
+        if !unsafe { CGEventTapIsEnabled(tap) } {
+            tracing::warn!("macOS disabled the event tap (sleep/wake, lock, or load); re-enabling");
+            // SAFETY: as above.
+            unsafe { CGEventTapEnable(tap, true) };
+        }
+    });
 }
 
 /// # Safety

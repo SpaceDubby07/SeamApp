@@ -13,28 +13,36 @@
 //! channel — see Tier 5.5 of the build guide.
 //!
 //! Unlike macOS, Windows gives no notification when a low-level hook is
-//! dropped for being too slow, so `is_healthy()` here only reports whether
-//! the pump thread itself is still alive — it can't detect a silently
-//! unregistered hook the way the macOS event-tap-disabled callback can.
+//! dropped — for being too slow (`LowLevelHooksTimeout`), or across a
+//! sleep/wake or a session switch. A `WM_TIMER` watchdog on the pump
+//! thread covers all of those: it compares [`GetLastInputInfo`]'s
+//! system-wide last-input time against the last time our own hooks fired,
+//! and reinstalls the hooks if the system saw input we didn't (Tier 12's
+//! sleep/wake recovery). `is_healthy()` still only reports whether the
+//! pump thread is alive.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
+    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -50,12 +58,36 @@ use super::keycodes::vk_to_keycode;
 /// (which the `HOOKPROC` signature has no room for anyway).
 static SUPPRESS: AtomicBool = AtomicBool::new(false);
 
+/// `GetTickCount()` (ms since boot) when a hook callback last fired.
+/// Compared by the watchdog against [`GetLastInputInfo`]. Written from the
+/// capture thread only; read there too — an atomic just to avoid UB on the
+/// wrapping `u32`.
+static LAST_HOOK_TICK: AtomicU32 = AtomicU32::new(0);
+
+/// Watchdog cadence (ms). One `WM_TIMER` per this interval.
+const WATCHDOG_INTERVAL_MS: u32 = 2000;
+/// If the system saw input this many ms more recently than our hooks did,
+/// the hooks are presumed dead and get reinstalled. Comfortably above the
+/// watchdog interval so an idle machine never trips it.
+const WATCHDOG_GRACE_MS: u32 = 5000;
+/// Above this, treat the gap as a `GetTickCount` wrap (~49.7 days) rather
+/// than a real miss.
+const WATCHDOG_WRAP_GUARD_MS: u32 = u32::MAX / 2;
+/// Arbitrary non-zero timer id for `SetTimer`/`KillTimer`.
+const WATCHDOG_TIMER_ID: usize = 1;
+
 thread_local! {
     // The hook callbacks run on the thread that called `SetWindowsHookExW`
     // (Windows delivers low-level hook events synchronously on that
     // thread's message queue), so this only needs to be visible there —
     // no lock needed on the hot path.
     static SINK: RefCell<Option<UnboundedSender<InputEvent>>> = const { RefCell::new(None) };
+
+    // The currently-installed hooks, so the watchdog (same thread) can
+    // swap them and `stop`'s teardown can unhook whatever is live now
+    // rather than the originals.
+    static MOUSE_HOOK: RefCell<Option<HHOOK>> = const { RefCell::new(None) };
+    static KEYBOARD_HOOK: RefCell<Option<HHOOK>> = const { RefCell::new(None) };
 
     // `KBDLLHOOKSTRUCT` carries no "is this a repeat" bit (that only
     // existed in the classic WM_KEYDOWN lParam, not the low-level hook
@@ -116,8 +148,11 @@ impl InputCapture for Capture {
                 let keyboard_hook =
                     unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
 
-                let (mouse_hook, keyboard_hook) = match (mouse_hook, keyboard_hook) {
-                    (Ok(m), Ok(k)) => (m, k),
+                match (mouse_hook, keyboard_hook) {
+                    (Ok(m), Ok(k)) => {
+                        MOUSE_HOOK.with(|c| *c.borrow_mut() = Some(m));
+                        KEYBOARD_HOOK.with(|c| *c.borrow_mut() = Some(k));
+                    }
                     (m, k) => {
                         // Clean up whichever one *did* register before
                         // reporting failure.
@@ -136,9 +171,19 @@ impl InputCapture for Capture {
                              interactively (not as a service)?"
                                 .to_string(),
                         ));
+                        SINK.with(|cell| *cell.borrow_mut() = None);
                         return;
                     }
-                };
+                }
+
+                // Seed the watchdog baseline so a tick before any real
+                // input doesn't read as a miss, and start its timer.
+                // SAFETY: `GetTickCount` has no preconditions.
+                LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+                // SAFETY: a null `hwnd` + null `TIMERPROC` posts plain
+                // `WM_TIMER` messages to this thread's queue, retrieved by
+                // the `GetMessageW` loop below; the id is arbitrary.
+                unsafe { SetTimer(None, WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None) };
 
                 // SAFETY: `GetCurrentThreadId` has no preconditions.
                 let thread_id = unsafe { GetCurrentThreadId() };
@@ -147,13 +192,17 @@ impl InputCapture for Capture {
                 // Message pump. Low-level hooks are only delivered while
                 // this thread is pumping messages — this loop IS the
                 // capture, not just bookkeeping. `GetMessageW` blocks until
-                // a message (including our own WM_QUIT from `stop()`)
-                // arrives.
+                // a message (including our own WM_QUIT from `stop()` and
+                // the watchdog's `WM_TIMER`) arrives.
                 let mut msg = MSG::default();
                 // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
                 // fills in; `None, 0, 0` means "any message for this
                 // thread".
                 while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
+                    if msg.message == WM_TIMER && msg.wParam.0 == WATCHDOG_TIMER_ID {
+                        watchdog_tick();
+                        continue;
+                    }
                     // SAFETY: `msg` was just populated by GetMessageW above.
                     unsafe {
                         let _ = TranslateMessage(&raw const msg);
@@ -161,12 +210,17 @@ impl InputCapture for Capture {
                     }
                 }
 
-                // SAFETY: both handles came from successful
-                // SetWindowsHookExW calls on this same thread and have not
-                // been unhooked yet.
+                // SAFETY: `None` id-matches the timer set with a null hwnd
+                // above; the hooks in the thread-locals are whatever the
+                // watchdog last installed (or the originals) and are live.
                 unsafe {
-                    let _ = UnhookWindowsHookEx(mouse_hook);
-                    let _ = UnhookWindowsHookEx(keyboard_hook);
+                    let _ = KillTimer(None, WATCHDOG_TIMER_ID);
+                    if let Some(m) = MOUSE_HOOK.with(|c| c.borrow_mut().take()) {
+                        let _ = UnhookWindowsHookEx(m);
+                    }
+                    if let Some(k) = KEYBOARD_HOOK.with(|c| c.borrow_mut().take()) {
+                        let _ = UnhookWindowsHookEx(k);
+                    }
                 }
                 SINK.with(|cell| *cell.borrow_mut() = None);
                 HELD_KEYS.with(|cell| cell.borrow_mut().clear());
@@ -365,6 +419,69 @@ fn recenter_if_pinned(pt: POINT) {
     }
 }
 
+/// One watchdog tick (runs on the pump thread, off `WM_TIMER`). If the
+/// system has seen input more recently than our hooks have — the
+/// signature of a silently dropped low-level hook after a
+/// `LowLevelHooksTimeout`, a sleep/wake, or a session switch — reinstall
+/// both hooks.
+fn watchdog_tick() {
+    let mut lii = LASTINPUTINFO {
+        cbSize: u32::try_from(size_of::<LASTINPUTINFO>()).unwrap_or_default(),
+        ..Default::default()
+    };
+    // SAFETY: `lii` is a fully-initialized `LASTINPUTINFO` with its
+    // `cbSize` set, exactly as `GetLastInputInfo` requires.
+    if unsafe { GetLastInputInfo(&raw mut lii) }.as_bool() {
+        let ours = LAST_HOOK_TICK.load(Ordering::Relaxed);
+        let gap = lii.dwTime.wrapping_sub(ours);
+        if gap > WATCHDOG_GRACE_MS && gap < WATCHDOG_WRAP_GUARD_MS {
+            tracing::warn!(
+                gap_ms = gap,
+                "low-level hooks look dead (sleep/wake, session switch, or timeout); reinstalling"
+            );
+            reinstall_hooks();
+        }
+    }
+}
+
+/// Tears down the current hooks and installs fresh ones. Old-before-new,
+/// so a stuck event can't be delivered twice (a sub-ms hookless gap is
+/// the lesser evil, and the next tick retries a partial failure). The
+/// per-key/per-position state in the thread-locals survives the swap.
+fn reinstall_hooks() {
+    // SAFETY: each handle in the thread-locals is a live hook this thread
+    // installed; unhooking on the installing thread is required and sound.
+    unsafe {
+        if let Some(m) = MOUSE_HOOK.with(|c| c.borrow_mut().take()) {
+            let _ = UnhookWindowsHookEx(m);
+        }
+        if let Some(k) = KEYBOARD_HOOK.with(|c| c.borrow_mut().take()) {
+            let _ = UnhookWindowsHookEx(k);
+        }
+    }
+    // SAFETY: same signature/`hmod` reasoning as the initial install in
+    // `start`.
+    let m = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) };
+    // SAFETY: as above.
+    let k = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
+    let ok = m.is_ok() && k.is_ok();
+    MOUSE_HOOK.with(|c| *c.borrow_mut() = m.ok());
+    KEYBOARD_HOOK.with(|c| *c.borrow_mut() = k.ok());
+    // SAFETY: no preconditions.
+    LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+    if ok {
+        tracing::info!("low-level hooks reinstalled");
+    } else {
+        tracing::error!("hook reinstall failed; retrying on the next watchdog tick");
+    }
+}
+
+/// Records that a hook callback just fired, for [`watchdog_tick`].
+fn stamp_hook_activity() {
+    // SAFETY: `GetTickCount` has no preconditions.
+    LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+}
+
 /// # Safety
 /// Called by the OS per the `WH_MOUSE_LL` contract: `ncode`/`wparam`/
 /// `lparam` are whatever the system passes to a low-level mouse hook
@@ -373,6 +490,7 @@ fn recenter_if_pinned(pt: POINT) {
 /// that pointer is valid.
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode == HC_ACTION.cast_signed() {
+        stamp_hook_activity();
         // SAFETY: see function-level SAFETY comment above.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         // The hook's wParam carries a WM_* message id, always small enough
@@ -475,6 +593,7 @@ fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
 /// SAFETY comment — the same reasoning applies to `KBDLLHOOKSTRUCT` here.
 unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode == HC_ACTION.cast_signed() {
+        stamp_hook_activity();
         // SAFETY: see function-level SAFETY comment above.
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         // The hook's wParam carries a WM_* message id, always small enough
