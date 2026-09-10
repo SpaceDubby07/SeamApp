@@ -97,6 +97,16 @@ pub struct Session {
     capture_rx: UnboundedReceiver<InputEvent>,
     clipboard_rx: UnboundedReceiver<ClipboardEvent>,
     local_bounds: Rect,
+    /// The peer's individual displays and whole virtual desktop, in the
+    /// PEER's own coordinate space, as last received in a
+    /// `ControlMessage::ScreenConfig`. Kept so that every time the layout
+    /// placement changes we can re-translate the per-display rectangles
+    /// into our space and hand them to the state machine for seam
+    /// resolution. Empty until the first `ScreenConfig` arrives.
+    peer_displays: Vec<Display>,
+    /// The peer's whole virtual-desktop bounds in its own coordinate space
+    /// (the origin the entries in `peer_displays` are relative to).
+    peer_virtual_bounds: Rect,
     /// What we last told the being-driven-side OS to reflect via
     /// `ModifierState` sync (Tier 7.1) — compared against each new
     /// `ModifierState` to know which keys to inject. Deliberately excludes
@@ -469,6 +479,13 @@ impl Session {
             capture_rx,
             clipboard_rx,
             local_bounds,
+            peer_displays: Vec::new(),
+            peer_virtual_bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
             injected_modifiers: Modifiers::default(),
             remap: config.remap.clone(),
             escape_hotkey: config.escape_hotkey,
@@ -1152,6 +1169,11 @@ impl Session {
         displays: Vec<Display>,
         virtual_bounds: Rect,
     ) -> Result<(), SessionError> {
+        // Also feed our own displays to the state machine: seam resolution
+        // needs this side's real per-monitor layout, not just the union
+        // `local_bounds` it was constructed with.
+        self.state_machine
+            .set_local_displays(displays.iter().map(|d| d.bounds).collect());
         self.control
             .send(&ControlMessage::ScreenConfig {
                 displays,
@@ -1159,6 +1181,40 @@ impl Session {
             })
             .await?;
         Ok(())
+    }
+
+    /// Re-translates the peer's per-display rectangles (last seen in a
+    /// `ScreenConfig`, in the peer's own coordinates) into our coordinate
+    /// space and hands them to the state machine, so seam resolution works
+    /// against real monitors on both ends. Call after anything that changes
+    /// either the stored peer displays or the layout placement.
+    ///
+    /// The translation: the peer's whole desktop currently sits at
+    /// `peer_bounds()` in our space and at `peer_virtual_bounds` in its
+    /// own, so every peer display shifts by the difference of those two
+    /// origins.
+    fn refresh_peer_display_seams(&mut self) {
+        let Some(peer_here) = self.state_machine.peer_bounds() else {
+            self.state_machine.set_peer_displays(Vec::new());
+            return;
+        };
+        if self.peer_displays.is_empty() {
+            self.state_machine.set_peer_displays(Vec::new());
+            return;
+        }
+        let dx = peer_here.x - self.peer_virtual_bounds.x;
+        let dy = peer_here.y - self.peer_virtual_bounds.y;
+        let translated = self
+            .peer_displays
+            .iter()
+            .map(|d| Rect {
+                x: d.bounds.x + dx,
+                y: d.bounds.y + dy,
+                width: d.bounds.width,
+                height: d.bounds.height,
+            })
+            .collect();
+        self.state_machine.set_peer_displays(translated);
     }
 
     /// Forwards the peer's `ControlMessage::ScreenConfig` to the driver —
@@ -1176,6 +1232,8 @@ impl Session {
     /// so a layout canvas doesn't have to reconcile size and position
     /// from two separate events itself.
     fn handle_peer_screen_config(&mut self, displays: Vec<Display>, virtual_bounds: Rect) {
+        self.peer_displays.clone_from(&displays);
+        self.peer_virtual_bounds = virtual_bounds;
         if let Some(current) = self.state_machine.peer_bounds() {
             let corrected = Rect {
                 width: virtual_bounds.width,
@@ -1188,6 +1246,7 @@ impl Session {
                 peer_bounds: corrected,
             });
         }
+        self.refresh_peer_display_seams();
         let _ = self.event_tx.send(SessionEvent::PeerScreenConfig {
             displays,
             virtual_bounds,
@@ -1222,6 +1281,7 @@ impl Session {
         };
         self.state_machine
             .set_peer_placement(self.control.peer_node_id, sender_bounds_here);
+        self.refresh_peer_display_seams();
         let _ = self.event_tx.send(SessionEvent::LayoutChanged {
             peer_bounds: sender_bounds_here,
         });
@@ -1477,6 +1537,7 @@ impl Session {
             SessionCommand::UpdateLayout { peer_bounds } => {
                 self.state_machine
                     .set_peer_placement(self.control.peer_node_id, peer_bounds);
+                self.refresh_peer_display_seams();
                 self.control
                     .send(&ControlMessage::LayoutUpdate {
                         sender_bounds: self.local_bounds,

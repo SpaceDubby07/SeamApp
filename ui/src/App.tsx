@@ -26,6 +26,7 @@ function App() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [connected, setConnected] = useState<ConnectedInfo | null>(null);
   const [peerBounds, setPeerBounds] = useState<Rect | null>(null);
+  const [peerScreens, setPeerScreens] = useState<[Display[], Rect] | null>(null);
   const [link, setLink] = useState<LinkStatus | null>(null);
   const [rttMicros, setRttMicros] = useState<number | null>(null);
   const [locked, setLocked] = useState(false);
@@ -53,6 +54,7 @@ function App() {
         setConnected(null);
         setReconnecting(false);
         setPeerBounds(null);
+        setPeerScreens(null);
         setLink(null);
         setRttMicros(null);
         setLocked(false);
@@ -64,6 +66,8 @@ function App() {
         // the one event the canvas needs for both position and size.
         if (event.type === "LayoutChanged") {
           setPeerBounds(event.peer_bounds);
+        } else if (event.type === "PeerScreenConfig") {
+          setPeerScreens([event.displays, event.virtual_bounds]);
         } else if (event.type === "Status") {
           setLink(event.link);
           setLocked(event.locked);
@@ -88,7 +92,8 @@ function App() {
     ipc.setEdgeSettings(settings).catch(console.error);
   }
 
-  const [, localBounds] = localScreens ?? [[], null];
+  const [localDisplays, localBounds] = localScreens ?? [[], null];
+  const [peerDisplays, peerVirtualBounds] = peerScreens ?? [null, null];
 
   return (
     <main className="app">
@@ -96,8 +101,11 @@ function App() {
       {localBounds && (
         <LayoutCanvas
           localName={config?.display_name ?? "This device"}
+          localDisplays={localDisplays}
           localBounds={localBounds}
           peerName={connected?.peer_display_name ?? null}
+          peerDisplays={peerDisplays}
+          peerVirtualBounds={peerVirtualBounds}
           peerBounds={peerBounds}
           onPeerBoundsChange={handleLayoutDrag}
           edgeSettings={config?.edge_settings ?? null}

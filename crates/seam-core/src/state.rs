@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{InputEvent, KeyCode, Modifiers};
 use crate::topology::{
-    Edge, EdgePoint, Layout, NodeId, Point, Rect, compute_entry_point, detect_edge_crossing,
-    detect_edge_reclaim,
+    Edge, EdgePoint, Layout, NodeId, Point, Rect, Seam, compute_entry_point, detect_edge_crossing,
+    detect_edge_reclaim, detect_seam_crossing, resolve_seams,
 };
 
 /// Default time after a handoff before the reverse handoff is allowed to
@@ -26,7 +26,7 @@ const HANDOFF_COOLDOWN: Duration = Duration::from_millis(200);
 const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 
 /// How far (in pixels) the peer-driven cursor must travel *past its inset
-/// entry point* (see [`StateMachine::entry_inset_px`]), inward, before a
+/// entry point* (see [`StateMachine::entry_inset_px_for`]), inward, before a
 /// push back out through the entry edge counts as "give control back"
 /// rather than entry jitter or fast-flick overshoot.
 ///
@@ -167,6 +167,24 @@ pub struct StateMachine {
     local_node: NodeId,
     local_bounds: Rect,
     layout: Layout,
+    /// This machine's individual displays, in local virtual-desktop
+    /// coordinates. Defaults to a single rectangle equal to `local_bounds`
+    /// (the pre-multi-monitor behaviour); `Session` replaces it with the
+    /// real list once platform screen enumeration has run.
+    local_display_rects: Vec<Rect>,
+    /// The peer's individual displays, translated into OUR coordinate space
+    /// (peer origin + the layout offset). Empty until the peer's
+    /// `ScreenConfig` and a layout placement have both arrived — until then
+    /// seam resolution falls back to the peer's whole-desktop bounds.
+    peer_display_rects: Vec<Rect>,
+    /// Resolved handoff boundaries (see [`crate::topology::Seam`]),
+    /// recomputed whenever the displays or the layout change so the
+    /// cursor-move hot path never has to.
+    cached_seams: Vec<Seam>,
+    /// While `BeingDriven`: the local display the peer's cursor entered on,
+    /// so reclaim (back-out) detection measures against that monitor rather
+    /// than the whole virtual desktop. `None` in every other state.
+    driven_seam_display: Option<Rect>,
     /// The peer we're either driving (`RemoteActive`) or being driven by
     /// (`BeingDriven`). `None` in every other state.
     peer: Option<NodeId>,
@@ -176,7 +194,7 @@ pub struct StateMachine {
     /// state.
     driven_entry_edge: Option<Edge>,
     /// While `BeingDriven`: how far inside `driven_entry_edge` the cursor
-    /// was placed on entry (see [`Self::entry_inset_px`]). The back-out
+    /// was placed on entry (see [`Self::entry_inset_px_for`]). The back-out
     /// detector arms at `driven_entry_inset + DRIVEN_BACKOUT_ARM_PX` from
     /// the edge. `0` in every other state.
     driven_entry_inset: i32,
@@ -207,11 +225,15 @@ impl StateMachine {
     /// shared canvas used to resolve which peer sits across a given edge.
     #[must_use]
     pub fn new(local_node: NodeId, local_bounds: Rect, layout: Layout) -> Self {
-        Self {
+        let mut sm = Self {
             state: State::Disconnected,
             local_node,
             local_bounds,
             layout,
+            local_display_rects: vec![local_bounds],
+            peer_display_rects: Vec::new(),
+            cached_seams: Vec::new(),
+            driven_seam_display: None,
             peer: None,
             driven_entry_edge: None,
             driven_entry_inset: 0,
@@ -223,7 +245,44 @@ impl StateMachine {
             remembered_cursor: HashMap::new(),
             corner_dead_zone_px: DEFAULT_CORNER_DEAD_ZONE_PX,
             handoff_cooldown: HANDOFF_COOLDOWN,
-        }
+        };
+        sm.recompute_seams();
+        sm
+    }
+
+    /// Recomputes [`Self::cached_seams`] from the current local displays,
+    /// peer displays, and layout placement. Cheap (a handful of rectangle
+    /// comparisons), but kept off the cursor-move path all the same — call
+    /// this from every setter that changes an input to seam resolution, not
+    /// from `handle`.
+    fn recompute_seams(&mut self) {
+        let peer_rects: Vec<Rect> = if self.peer_display_rects.is_empty() {
+            // No per-display info yet — fall back to the peer's whole
+            // virtual desktop as a single rectangle, which reproduces the
+            // pre-multi-monitor "one tile per machine" behaviour exactly.
+            self.peer_bounds().into_iter().collect()
+        } else {
+            self.peer_display_rects.clone()
+        };
+        self.cached_seams = resolve_seams(&self.local_display_rects, &peer_rects);
+    }
+
+    /// Sets this machine's individual displays (local virtual-desktop
+    /// coordinates). Takes effect on the next crossing/reclaim check.
+    pub fn set_local_displays(&mut self, displays: Vec<Rect>) {
+        self.local_display_rects = if displays.is_empty() {
+            vec![self.local_bounds]
+        } else {
+            displays
+        };
+        self.recompute_seams();
+    }
+
+    /// Sets the peer's individual displays, already translated into OUR
+    /// coordinate space. Takes effect on the next crossing/reclaim check.
+    pub fn set_peer_displays(&mut self, displays_in_local_space: Vec<Rect>) {
+        self.peer_display_rects = displays_in_local_space;
+        self.recompute_seams();
     }
 
     /// Applies the Layout panel's edge-handoff tuning (Tier 8.1). Takes
@@ -256,6 +315,7 @@ impl StateMachine {
     /// move a shared edge out from under an active handoff).
     pub fn set_peer_placement(&mut self, peer: NodeId, bounds: Rect) {
         self.layout.set_placement(peer, bounds);
+        self.recompute_seams();
     }
 
     /// The peer's current bounds on the shared layout canvas, if placed.
@@ -336,6 +396,9 @@ impl StateMachine {
         }
         self.peer = Some(peer);
         self.state = State::LocalActive;
+        // Now that we know who the peer is, its layout placement can
+        // resolve into seams (before this `peer_bounds()` was `None`).
+        self.recompute_seams();
         vec![Action::StartHeartbeat, Action::SyncClipboard]
     }
 
@@ -367,6 +430,12 @@ impl StateMachine {
         let Some(edge) = self.driven_entry_edge else {
             return Vec::new();
         };
+        // Reclaim is measured against the seam monitor the peer entered on,
+        // not the whole virtual desktop — otherwise "push back out through
+        // the edge" would mean the union's outer edge, which on a
+        // multi-monitor machine the cursor can't even reach from that
+        // monitor.
+        let bounds = self.driven_seam_display.unwrap_or(self.local_bounds);
         let prev = self.last_driven_cursor.replace(pos);
 
         if !self.driven_backout_armed {
@@ -375,7 +444,7 @@ impl StateMachine {
             // point (a fast flick that overshot toward the edge stays
             // unarmed, and so can't bounce straight back).
             let arm_from_edge = self.driven_entry_inset + DRIVEN_BACKOUT_ARM_PX;
-            if detect_edge_reclaim(self.local_bounds, edge, pos, arm_from_edge) {
+            if detect_edge_reclaim(bounds, edge, pos, arm_from_edge) {
                 self.driven_backout_armed = true;
             }
             return Vec::new();
@@ -384,9 +453,7 @@ impl StateMachine {
         let Some(prev) = prev else {
             return Vec::new();
         };
-        if detect_edge_crossing(self.local_bounds, prev, pos, self.corner_dead_zone_px)
-            != Some(edge)
-        {
+        if detect_edge_crossing(bounds, prev, pos, self.corner_dead_zone_px) != Some(edge) {
             return Vec::new();
         }
 
@@ -404,6 +471,7 @@ impl StateMachine {
     fn clear_driven_tracking(&mut self) {
         self.driven_entry_edge = None;
         self.driven_entry_inset = 0;
+        self.driven_seam_display = None;
         self.last_driven_cursor = None;
         self.driven_backout_armed = false;
     }
@@ -418,16 +486,13 @@ impl StateMachine {
     ///
     /// Tracks the configured corner dead zone (so the Layout panel's one
     /// "edge margin" control governs both), floored at
-    /// [`MIN_ENTRY_INSET_PX`] and capped at a third of the smaller screen
-    /// dimension so a large dead zone on a small screen can't warp past
-    /// the middle.
-    fn entry_inset_px(&self) -> i32 {
-        let cap = self
-            .local_bounds
-            .width
-            .min(self.local_bounds.height)
-            .cast_signed()
-            / 3;
+    /// [`MIN_ENTRY_INSET_PX`] and capped at a third of the smaller
+    /// dimension of `bounds` so a large dead zone can't warp past the
+    /// middle. `bounds` is the *seam monitor*, not the whole virtual
+    /// desktop, so the cap tracks the panel the cursor actually lands on
+    /// (e.g. a 1080-wide portrait display).
+    fn entry_inset_px_for(&self, bounds: Rect) -> i32 {
+        let cap = bounds.width.min(bounds.height).cast_signed() / 3;
         self.corner_dead_zone_px
             .cast_signed()
             .max(MIN_ENTRY_INSET_PX)
@@ -443,22 +508,23 @@ impl StateMachine {
         {
             return Vec::new();
         }
-        let Some(edge) =
-            detect_edge_crossing(self.local_bounds, prev, pos, self.corner_dead_zone_px)
+        if self.peer.is_none() {
+            return Vec::new();
+        }
+        // Match the cursor against a resolved seam — one specific local
+        // display edge that borders the peer — rather than the outer edge
+        // of the whole virtual desktop. On a single-monitor machine the two
+        // are identical; on a multi-monitor one this is what stops an
+        // interior edge between two local monitors, or an outer edge facing
+        // nothing, from triggering a handoff. `cached_seams` is kept in
+        // step by `recompute_seams`, so the hot path only reads it.
+        let Some(&seam) =
+            detect_seam_crossing(&self.cached_seams, prev, pos, self.corner_dead_zone_px)
         else {
             return Vec::new();
         };
-        let Some(peer) = self.peer else {
-            return Vec::new();
-        };
-        // In v1 there's exactly one peer, but this still goes through the
-        // real layout graph rather than assuming "the" peer is across
-        // every edge — Tier 15's note on keeping a third machine cheap.
-        if self.layout.neighbor(self.local_node, edge) != Some(peer) {
-            return Vec::new();
-        }
 
-        let entry = compute_entry_point(self.local_bounds, pos, edge);
+        let entry = compute_entry_point(seam.local_display, pos, seam.edge);
         self.state = State::RemoteActive;
         self.last_handoff_at = Some(now);
         self.remembered_cursor.insert(self.local_node, pos);
@@ -546,11 +612,22 @@ impl StateMachine {
     fn on_received_handoff(&mut self, from: NodeId, entry: EdgePoint) -> Vec<Action> {
         self.state = State::BeingDriven;
         self.peer = Some(from);
-        let bounds = self.local_bounds;
+        // Land on the seam monitor that borders the driver, not somewhere
+        // in the whole virtual desktop: pick the resolved seam matching the
+        // entry edge (falling back to the largest seam, then to the whole
+        // desktop if we somehow have none). `entry.pos` is normalized
+        // against the driver's seam monitor, so it maps 1:1 onto ours.
+        let bounds = self
+            .cached_seams
+            .iter()
+            .find(|s| s.edge == entry.edge)
+            .or_else(|| self.cached_seams.first())
+            .map_or(self.local_bounds, |s| s.local_display);
+        self.driven_seam_display = Some(bounds);
         // Land the cursor `inset` px INSIDE the entry edge, not on it (see
-        // `entry_inset_px`). `pos` still fixes the coordinate *along* the
+        // `entry_inset_px_for`). `pos` still fixes the coordinate *along* the
         // edge; the inset is the offset *into* the screen.
-        let inset = self.entry_inset_px();
+        let inset = self.entry_inset_px_for(bounds);
         let along_h = bounds.y + (entry.pos * bounds.height as f32) as i32;
         let along_v = bounds.x + (entry.pos * bounds.width as f32) as i32;
         let right = bounds.x + bounds.width.cast_signed() - 1;
@@ -1233,5 +1310,147 @@ mod tests {
             caps: true,
             ..Modifiers::default()
         })));
+    }
+
+    // ───────────────────────── Multi-monitor seams ────────────────────────
+    //
+    // A machine with three monitors laid out left-to-right — 1920×1080,
+    // 1080×1920 portrait, 3840×2160 — with the single-monitor peer placed
+    // flush to the LEFT of the leftmost one. Only that first monitor's left
+    // edge is a handoff surface.
+
+    fn three_monitor_machine() -> (StateMachine, NodeId, NodeId) {
+        let local = NodeId::new();
+        let peer = NodeId::new();
+        let union = Rect {
+            x: 0,
+            y: 0,
+            width: 6840,
+            height: 2160,
+        };
+        let mut layout = Layout::new();
+        layout.set_placement(local, union);
+        layout.set_placement(
+            peer,
+            Rect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let mut sm = StateMachine::new(local, union, layout);
+        sm.set_local_displays(vec![
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 1080,
+                height: 1920,
+            },
+            Rect {
+                x: 3000,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+        ]);
+        sm.set_peer_displays(vec![Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }]);
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+        (sm, local, peer)
+    }
+
+    #[test]
+    fn interior_edge_between_local_monitors_does_not_hand_off() {
+        let (mut sm, _, _) = three_monitor_machine();
+        // Slide right off the first monitor into the portrait one — an
+        // interior boundary at x≈1919. The old union-rectangle check would
+        // have seen "not at the union's right edge" and done nothing here
+        // too, but the point is it must ALSO do nothing at x=1919 where the
+        // first monitor actually ends.
+        sm.handle(Input::CursorMoved(Point { x: 900, y: 540 }), Instant::now());
+        let actions = sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            Instant::now(),
+        );
+        assert!(
+            actions.is_empty(),
+            "interior edge triggered a handoff: {actions:?}"
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+    }
+
+    #[test]
+    fn seam_monitor_outer_edge_hands_off_and_normalizes_against_that_monitor() {
+        let (mut sm, local, _) = three_monitor_machine();
+        // Leave low on the first (1080-tall) monitor's left edge — clear of
+        // the 20px corner dead zone.
+        sm.handle(Input::CursorMoved(Point { x: 40, y: 950 }), Instant::now());
+        let actions = sm.handle(Input::CursorMoved(Point { x: 0, y: 1000 }), Instant::now());
+        assert_eq!(sm.state(), State::RemoteActive);
+        let entry = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendHandoff(e) => Some(*e),
+                _ => None,
+            })
+            .expect("a handoff was sent");
+        assert_eq!(entry.edge, crate::topology::Edge::Right);
+        // 1000/1080 ≈ 0.93 down the seam monitor — NOT 1000/2160 ≈ 0.46 as
+        // it would be if normalized against the whole virtual desktop.
+        assert!(
+            (entry.pos - 0.926).abs() < 0.02,
+            "pos {} — normalized against the union, not the seam monitor",
+            entry.pos
+        );
+        assert_eq!(
+            sm.remembered_cursor.get(&local),
+            Some(&Point { x: 0, y: 1000 })
+        );
+    }
+
+    #[test]
+    fn exiting_being_driven_through_a_seam_monitor_releases_modifiers() {
+        // The non-negotiable invariant on the multi-monitor path: a handoff
+        // onto the seam monitor, then a push back out, must still release
+        // every modifier.
+        let (mut sm, _, peer) = three_monitor_machine();
+        let warp = sm.handle(
+            Input::ReceivedHandoff {
+                from: peer,
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            },
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::BeingDriven);
+        // Lands inside the seam monitor's left edge (x≈20), and at y=540 —
+        // half of the 1080-tall seam monitor, not half of the 2160 union.
+        assert_eq!(warp[0], Action::WarpCursor { x: 20, y: 540 });
+
+        // Arm by moving well inside, then push back out through the left edge.
+        sm.handle(
+            Input::DrivenCursorMoved(Point { x: 300, y: 540 }),
+            Instant::now(),
+        );
+        let out = sm.handle(
+            Input::DrivenCursorMoved(Point { x: 0, y: 540 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+        assert!(out.contains(&Action::ReleaseAllModifiers), "got {out:?}");
+        assert!(out.contains(&Action::SendReleaseBack));
     }
 }

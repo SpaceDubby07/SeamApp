@@ -1,12 +1,21 @@
 import { useMemo, useRef, useState } from "react";
-import type { EdgeSettings, Rect } from "../lib/types";
+import type { Display, EdgeSettings, Rect } from "../lib/types";
 
 interface Props {
   localName: string;
+  /** This machine's individual monitors, in local virtual-desktop coords. */
+  localDisplays: Display[];
+  /** This machine's whole virtual desktop (fallback if `localDisplays` is empty). */
   localBounds: Rect;
   peerName: string | null;
-  /** `null` until the peer's `ScreenConfig` has arrived. */
+  /** The peer's individual monitors, in the PEER's own coords. `null` until
+   *  its `ScreenConfig` has arrived. */
+  peerDisplays: Display[] | null;
+  /** The peer's whole virtual desktop, in the PEER's own coords. */
+  peerVirtualBounds: Rect | null;
+  /** Where the peer's virtual desktop sits in OUR coords (from `LayoutChanged`). */
   peerBounds: Rect | null;
+  /** Called with the peer's new whole-desktop bounds, in our coords. */
   onPeerBoundsChange: (bounds: Rect) => void;
   /** `null` until config has loaded. */
   edgeSettings: EdgeSettings | null;
@@ -17,174 +26,253 @@ const CANVAS_WIDTH = 700;
 const CANVAS_HEIGHT = 400;
 const CANVAS_PADDING = 44;
 
-function unionBounds(a: Rect, b: Rect | null): Rect {
-  if (!b) return a;
-  const x = Math.min(a.x, b.x);
-  const y = Math.min(a.y, b.y);
-  const right = Math.max(a.x + a.width, b.x + b.width);
-  const bottom = Math.max(a.y + a.height, b.y + b.height);
-  return { x, y, width: right - x, height: bottom - y };
+interface Placed {
+  rect: Rect;
+  label: string;
+  isPrimary: boolean;
 }
 
-/** Snaps `dragged` to touch whichever edge of `anchor` it's nearest to,
- * once it's within `thresholdPx` (in the SAME real-pixel space as both
- * rects) of doing so — Tier 8.1's "snap-to-edge when dragged near
- * another tile." Falls back to the un-snapped position otherwise. */
-function snapToEdge(dragged: Rect, anchor: Rect, thresholdPx: number): Rect {
-  const candidates: { rect: Rect; distance: number }[] = [
-    {
-      rect: { ...dragged, x: anchor.x + anchor.width, y: dragged.y },
-      distance: Math.abs(dragged.x - (anchor.x + anchor.width)),
-    },
-    {
-      rect: { ...dragged, x: anchor.x - dragged.width, y: dragged.y },
-      distance: Math.abs(dragged.x + dragged.width - anchor.x),
-    },
-    {
-      rect: { ...dragged, x: dragged.x, y: anchor.y + anchor.height },
-      distance: Math.abs(dragged.y - (anchor.y + anchor.height)),
-    },
-    {
-      rect: { ...dragged, x: dragged.x, y: anchor.y - dragged.height },
-      distance: Math.abs(dragged.y + dragged.height - anchor.y),
-    },
-  ];
-  const best = candidates.reduce((a, b) => (a.distance < b.distance ? a : b));
-  return best.distance <= thresholdPx ? best.rect : dragged;
+function unionOf(rects: Rect[]): Rect | null {
+  if (rects.length === 0) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const r of rects) {
+    minX = Math.min(minX, r.x);
+    minY = Math.min(minY, r.y);
+    maxX = Math.max(maxX, r.x + r.width);
+    maxY = Math.max(maxY, r.y + r.height);
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function translated(r: Rect, dx: number, dy: number): Rect {
+  return { x: r.x + dx, y: r.y + dy, width: r.width, height: r.height };
+}
+
+/** Do `a` and `b` overlap along the axis perpendicular to a vertical shared
+ *  edge (i.e. do their y-ranges overlap)? */
+function overlapsY(a: Rect, b: Rect): boolean {
+  return a.y < b.y + b.height && b.y < a.y + a.height;
+}
+function overlapsX(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.width && b.x < a.x + a.width;
+}
+
+/** The single-axis translation that would snap the peer group flush against
+ *  a local monitor, if one is within `threshold` real px. */
+function bestSnap(peers: Rect[], locals: Rect[], threshold: number): { dx: number; dy: number } {
+  let best: { dist: number; dx: number; dy: number } = { dist: threshold, dx: 0, dy: 0 };
+  for (const p of peers) {
+    for (const l of locals) {
+      // Horizontal: peer's left to local's right, peer's right to local's left.
+      if (overlapsY(p, l)) {
+        for (const d of [
+          l.x + l.width - p.x, // p.left -> l.right
+          l.x - (p.x + p.width), // p.right -> l.left
+        ]) {
+          if (Math.abs(d) < best.dist) best = { dist: Math.abs(d), dx: d, dy: 0 };
+        }
+      }
+      // Vertical: peer's top to local's bottom, peer's bottom to local's top.
+      if (overlapsX(p, l)) {
+        for (const d of [
+          l.y + l.height - p.y,
+          l.y - (p.y + p.height),
+        ]) {
+          if (Math.abs(d) < best.dist) best = { dist: Math.abs(d), dx: 0, dy: d };
+        }
+      }
+    }
+  }
+  return { dx: best.dx, dy: best.dy };
+}
+
+/** Indices of the (localRect, peerRect) pair that form the handoff seam —
+ *  flush within 1px with a real shared span — or null. Mirrors
+ *  `seam_core::topology::resolve_seams` closely enough for a visual hint. */
+function seamPair(peers: Rect[], locals: Rect[]): { local: number; peer: number } | null {
+  for (let li = 0; li < locals.length; li++) {
+    const l = locals[li];
+    // Skip an edge that has another local monitor beyond it — interior.
+    const interiorRight = locals.some((o) => o !== l && o.x + o.width > l.x + l.width && overlapsY(l, o));
+    const interiorLeft = locals.some((o) => o !== l && o.x < l.x && overlapsY(l, o));
+    const interiorBelow = locals.some((o) => o !== l && o.y + o.height > l.y + l.height && overlapsX(l, o));
+    const interiorAbove = locals.some((o) => o !== l && o.y < l.y && overlapsX(l, o));
+    for (let pi = 0; pi < peers.length; pi++) {
+      const p = peers[pi];
+      const flushRight = Math.abs(p.x - (l.x + l.width)) <= 1 && overlapsY(l, p);
+      const flushLeft = Math.abs(p.x + p.width - l.x) <= 1 && overlapsY(l, p);
+      const flushBelow = Math.abs(p.y - (l.y + l.height)) <= 1 && overlapsX(l, p);
+      const flushAbove = Math.abs(p.y + p.height - l.y) <= 1 && overlapsX(l, p);
+      if (
+        (flushRight && !interiorRight) ||
+        (flushLeft && !interiorLeft) ||
+        (flushBelow && !interiorBelow) ||
+        (flushAbove && !interiorAbove)
+      ) {
+        return { local: li, peer: pi };
+      }
+    }
+  }
+  return null;
 }
 
 export function LayoutCanvas({
   localName,
+  localDisplays,
   localBounds,
   peerName,
+  peerDisplays,
+  peerVirtualBounds,
   peerBounds,
   onPeerBoundsChange,
   edgeSettings,
   onEdgeSettingsChange,
 }: Props) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const [dragPreview, setDragPreview] = useState<Rect | null>(null);
-  const dragState = useRef<{
-    startClientX: number;
-    startClientY: number;
-    startBounds: Rect;
-  } | null>(null);
+  const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number } | null>(null);
+  const dragState = useRef<{ startX: number; startY: number } | null>(null);
 
-  const effectivePeerBounds = dragPreview ?? peerBounds;
-  const union = useMemo(
-    () => unionBounds(localBounds, effectivePeerBounds),
-    [localBounds, effectivePeerBounds],
+  const localRects: Rect[] = useMemo(
+    () => (localDisplays.length > 0 ? localDisplays.map((d) => d.bounds) : [localBounds]),
+    [localDisplays, localBounds],
   );
+
+  // Peer monitors, expressed in OUR coordinate space: shift each of the
+  // peer's own-coord display rects by (where its desktop sits here) minus
+  // (its desktop origin in its own coords). Same translation the backend
+  // does in Session::refresh_peer_display_seams.
+  const peerRectsBase: Rect[] | null = useMemo(() => {
+    if (peerDisplays && peerDisplays.length > 0 && peerVirtualBounds && peerBounds) {
+      const dx = peerBounds.x - peerVirtualBounds.x;
+      const dy = peerBounds.y - peerVirtualBounds.y;
+      return peerDisplays.map((d) => translated(d.bounds, dx, dy));
+    }
+    if (peerBounds) return [peerBounds];
+    return null;
+  }, [peerDisplays, peerVirtualBounds, peerBounds]);
+
+  const localPlaced: Placed[] = useMemo(
+    () =>
+      localRects.map((rect, i) => ({
+        rect,
+        label: `${rect.width}×${rect.height}`,
+        isPrimary: localDisplays[i]?.is_primary ?? false,
+      })),
+    [localRects, localDisplays],
+  );
+
   const scale = useMemo(() => {
+    const all = [...localRects, ...(peerRectsBase ?? [])];
+    const u = unionOf(all) ?? localBounds;
     const availableW = CANVAS_WIDTH - CANVAS_PADDING * 2;
     const availableH = CANVAS_HEIGHT - CANVAS_PADDING * 2;
-    const s = Math.min(availableW / union.width, availableH / union.height);
+    const s = Math.min(availableW / u.width, availableH / u.height);
     return Number.isFinite(s) && s > 0 ? Math.min(s, 0.25) : 0.05;
-  }, [union]);
+  }, [localRects, peerRectsBase, localBounds]);
 
-  const originX = union.x;
-  const originY = union.y;
+  // Effective (possibly dragged + snapped) peer rects.
+  const peerRects: Rect[] | null = useMemo(() => {
+    if (!peerRectsBase) return null;
+    if (!dragOffset) return peerRectsBase;
+    const moved = peerRectsBase.map((r) => translated(r, dragOffset.dx, dragOffset.dy));
+    const snap = bestSnap(moved, localRects, 16 / scale);
+    return moved.map((r) => translated(r, snap.dx, snap.dy));
+  }, [peerRectsBase, dragOffset, localRects, scale]);
+
+  const seam = useMemo(
+    () => (peerRects ? seamPair(peerRects, localRects) : null),
+    [peerRects, localRects],
+  );
+
+  const origin = useMemo(() => {
+    const u = unionOf([...localRects, ...(peerRects ?? [])]) ?? localBounds;
+    return { x: u.x, y: u.y };
+  }, [localRects, peerRects, localBounds]);
+
   const toScreen = (r: Rect) => ({
-    left: CANVAS_PADDING + (r.x - originX) * scale,
-    top: CANVAS_PADDING + (r.y - originY) * scale,
-    width: Math.max(r.width * scale, 4),
-    height: Math.max(r.height * scale, 4),
+    left: CANVAS_PADDING + (r.x - origin.x) * scale,
+    top: CANVAS_PADDING + (r.y - origin.y) * scale,
+    width: Math.max(r.width * scale, 6),
+    height: Math.max(r.height * scale, 6),
   });
 
-  function handlePointerDown(e: React.PointerEvent) {
-    if (!peerBounds) return;
+  function onPointerDown(e: React.PointerEvent) {
+    if (!peerRectsBase) return;
     (e.target as Element).setPointerCapture(e.pointerId);
-    dragState.current = {
-      startClientX: e.clientX,
-      startClientY: e.clientY,
-      startBounds: peerBounds,
-    };
-    setDragPreview(peerBounds);
+    dragState.current = { startX: e.clientX, startY: e.clientY };
+    setDragOffset({ dx: 0, dy: 0 });
   }
-
-  function handlePointerMove(e: React.PointerEvent) {
+  function onPointerMove(e: React.PointerEvent) {
     if (!dragState.current) return;
-    const dxScreen = e.clientX - dragState.current.startClientX;
-    const dyScreen = e.clientY - dragState.current.startClientY;
-    const dxReal = dxScreen / scale;
-    const dyReal = dyScreen / scale;
-    const raw: Rect = {
-      ...dragState.current.startBounds,
-      x: dragState.current.startBounds.x + dxReal,
-      y: dragState.current.startBounds.y + dyReal,
-    };
-    // Snap threshold: ~14 screen px worth of real distance, so it feels
-    // consistent regardless of current zoom/scale.
-    setDragPreview(snapToEdge(raw, localBounds, 14 / scale));
+    setDragOffset({
+      dx: (e.clientX - dragState.current.startX) / scale,
+      dy: (e.clientY - dragState.current.startY) / scale,
+    });
   }
-
-  function handlePointerUp() {
-    if (!dragState.current || !dragPreview) {
+  function onPointerUp() {
+    if (!dragState.current || !peerRects) {
       dragState.current = null;
+      setDragOffset(null);
       return;
     }
     dragState.current = null;
-    const final: Rect = {
-      x: Math.round(dragPreview.x),
-      y: Math.round(dragPreview.y),
-      width: dragPreview.width,
-      height: dragPreview.height,
-    };
-    setDragPreview(null);
-    onPeerBoundsChange(final);
+    const u = unionOf(peerRects);
+    setDragOffset(null);
+    if (u)
+      onPeerBoundsChange({
+        x: Math.round(u.x),
+        y: Math.round(u.y),
+        width: Math.round(u.width),
+        height: Math.round(u.height),
+      });
   }
-
-  const localScreen = toScreen(localBounds);
-  const peerScreen = effectivePeerBounds ? toScreen(effectivePeerBounds) : null;
 
   return (
     <section className="panel">
       <h2>Layout</h2>
       <p className="muted">
-        {peerBounds
-          ? "Drag the peer's tile to match your real desk setup — it snaps to touch an edge."
-          : "Waiting for the peer's screen info..."}
+        {peerRectsBase
+          ? "Drag the peer's monitors to match your real desk — the group snaps when a monitor edge meets one of yours. The accent edge is the handoff seam."
+          : "Waiting for the peer's screen info…"}
       </p>
-      <div
-        ref={containerRef}
-        className="layout-canvas"
-        style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT }}
-      >
-        <div
-          className="tile local-tile"
-          style={{
-            left: localScreen.left,
-            top: localScreen.top,
-            width: localScreen.width,
-            height: localScreen.height,
-          }}
-        >
-          {localName}
-          <span className="tile-res">
-            {localBounds.width}×{localBounds.height}
-          </span>
-        </div>
-        {peerScreen && (
-          <div
-            className="tile peer-tile"
-            style={{
-              left: peerScreen.left,
-              top: peerScreen.top,
-              width: peerScreen.width,
-              height: peerScreen.height,
-            }}
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerUp}
-          >
-            {peerName ?? "Peer"}
-            {effectivePeerBounds && (
+      <div className="layout-canvas" style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT }}>
+        {localPlaced.map((d, i) => {
+          const s = toScreen(d.rect);
+          return (
+            <div
+              key={`l${i}`}
+              className={`tile local-tile${seam?.local === i ? " seam-tile" : ""}`}
+              style={{ left: s.left, top: s.top, width: s.width, height: s.height }}
+            >
+              <span>{i === 0 ? localName : ""}</span>
               <span className="tile-res">
-                {effectivePeerBounds.width}×{effectivePeerBounds.height}
+                {d.label}
+                {d.isPrimary ? " ●" : ""}
               </span>
-            )}
-          </div>
-        )}
+            </div>
+          );
+        })}
+        {peerRects?.map((r, i) => {
+          const s = toScreen(r);
+          return (
+            <div
+              key={`p${i}`}
+              className={`tile peer-tile${seam?.peer === i ? " seam-tile" : ""}`}
+              style={{ left: s.left, top: s.top, width: s.width, height: s.height }}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+            >
+              <span>{i === 0 ? (peerName ?? "Peer") : ""}</span>
+              <span className="tile-res">
+                {r.width}×{r.height}
+                {(peerDisplays?.[i]?.is_primary ?? false) ? " ●" : ""}
+              </span>
+            </div>
+          );
+        })}
       </div>
 
       {edgeSettings && (

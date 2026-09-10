@@ -248,6 +248,152 @@ pub fn detect_edge_reclaim(bounds: Rect, edge: Edge, cur: Point, threshold_px: i
     }
 }
 
+/// Slack, in pixels, still allowed between two display edges before they
+/// stop counting as "touching" for seam resolution. Real multi-monitor
+/// arrangements pack flush and the layout canvas snaps to exact contact, so
+/// this is only insurance against a 1px inclusive/exclusive rounding slip —
+/// not a reason to treat a deliberately-separated pair as adjacent.
+const SEAM_CONTACT_SLACK_PX: i32 = 1;
+
+/// One resolved handoff boundary: an outer edge of a LOCAL display that a
+/// PEER display sits flush against.
+///
+/// This — not the whole virtual desktop — is what edge detection and
+/// entry-point normalization work against once either machine has more than
+/// one monitor. A cursor leaving 80% of the way down a 1080-tall side
+/// monitor has to enter the peer 80% of the way down *that monitor's* edge,
+/// not 80% of the way down a union rectangle that's 2192px tall because
+/// some other monitor is bigger.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seam {
+    /// Bounds of the local display whose edge forms this boundary.
+    pub local_display: Rect,
+    /// Which edge of `local_display` the peer is across.
+    pub edge: Edge,
+    /// Bounds of the peer display on the far side, in LOCAL coordinate
+    /// space (already translated out of the peer's own coordinates).
+    pub peer_display: Rect,
+    /// Length, in pixels, of the span the two edges actually share,
+    /// measured perpendicular to `edge`. When several seams exist a caller
+    /// wanting a single "the seam" takes the largest.
+    pub overlap_px: u32,
+}
+
+/// Whether `other` occupies screen space beyond `r`'s `edge` (overlapping
+/// it along the edge) — i.e. that edge is an *interior* boundary of the
+/// local virtual desktop, one a cursor just slides across to the next
+/// monitor, not an outer edge it can cross to another machine.
+fn lies_beyond(r: Rect, edge: Edge, other: Rect) -> bool {
+    match edge {
+        Edge::Right => other.right() > r.right() && vertically_overlaps(r, other),
+        Edge::Left => other.x < r.x && vertically_overlaps(r, other),
+        Edge::Bottom => other.bottom() > r.bottom() && horizontally_overlaps(r, other),
+        Edge::Top => other.y < r.y && horizontally_overlaps(r, other),
+    }
+}
+
+/// Pixels of shared extent between `a` and `b` along the vertical axis
+/// (`0` if they don't overlap).
+fn vertical_overlap_px(a: Rect, b: Rect) -> u32 {
+    (a.bottom().min(b.bottom()) - a.y.max(b.y) + 1)
+        .max(0)
+        .cast_unsigned()
+}
+
+/// Pixels of shared extent between `a` and `b` along the horizontal axis
+/// (`0` if they don't overlap).
+fn horizontal_overlap_px(a: Rect, b: Rect) -> u32 {
+    (a.right().min(b.right()) - a.x.max(b.x) + 1)
+        .max(0)
+        .cast_unsigned()
+}
+
+/// If peer display `p` sits flush against `r`'s `edge` (within
+/// [`SEAM_CONTACT_SLACK_PX`]) sharing a non-empty span, the length of that
+/// span in pixels.
+fn edge_contact(r: Rect, edge: Edge, p: Rect) -> Option<u32> {
+    let (gap, overlap) = match edge {
+        Edge::Right => (p.x - (r.right() + 1), vertical_overlap_px(r, p)),
+        Edge::Left => ((p.right() + 1) - r.x, vertical_overlap_px(r, p)),
+        Edge::Bottom => (p.y - (r.bottom() + 1), horizontal_overlap_px(r, p)),
+        Edge::Top => ((p.bottom() + 1) - r.y, horizontal_overlap_px(r, p)),
+    };
+    (gap.abs() <= SEAM_CONTACT_SLACK_PX && overlap > 0).then_some(overlap)
+}
+
+/// Whether `p` lies within `r`'s extent along the axis *parallel* to
+/// `edge`, ignoring the perpendicular one — so a cursor level with a
+/// different monitor can't match a seam it merely shares a coordinate with.
+fn within_edge_span(r: Rect, edge: Edge, p: Point) -> bool {
+    match edge {
+        Edge::Left | Edge::Right => p.y >= r.y && p.y <= r.bottom(),
+        Edge::Top | Edge::Bottom => p.x >= r.x && p.x <= r.right(),
+    }
+}
+
+/// Resolves every handoff boundary between this machine's `local` display
+/// rectangles and the peer's (`peer_in_local_space` — the peer's displays
+/// already translated into this machine's coordinate space using the
+/// origin offset from `ControlMessage::LayoutUpdate`).
+///
+/// An edge qualifies only if it's on the *outer* hull of the local virtual
+/// desktop (no other local display beyond it) AND a peer display sits flush
+/// against it. That one rule is what makes a 3-monitor machine behave: the
+/// edges between adjacent local monitors produce no seam, the outer edges
+/// with nothing beyond them produce no seam, and only the monitor the other
+/// machine is actually placed against becomes a handoff surface.
+///
+/// Sorted by `overlap_px` descending, so `.first()` is the most
+/// substantial boundary when a caller wants just one.
+#[must_use]
+pub fn resolve_seams(local: &[Rect], peer_in_local_space: &[Rect]) -> Vec<Seam> {
+    let mut seams = Vec::new();
+    for (i, &l) in local.iter().enumerate() {
+        for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
+            let interior = local
+                .iter()
+                .enumerate()
+                .any(|(j, &o)| j != i && lies_beyond(l, edge, o));
+            if interior {
+                continue;
+            }
+            for &peer_display in peer_in_local_space {
+                if let Some(overlap_px) = edge_contact(l, edge, peer_display) {
+                    seams.push(Seam {
+                        local_display: l,
+                        edge,
+                        peer_display,
+                        overlap_px,
+                    });
+                }
+            }
+        }
+    }
+    seams.sort_by_key(|s| core::cmp::Reverse(s.overlap_px));
+    seams
+}
+
+/// The seam whose edge the cursor is crossing right now — within a pixel of
+/// it and still moving outward — or `None`.
+///
+/// The multi-monitor replacement for running [`detect_edge_crossing`]
+/// against the whole virtual desktop: it also requires the cursor to be
+/// within the seam display's own extent along the edge, so pushing off the
+/// top of a left-hand monitor isn't mistaken for crossing a right-hand
+/// seam that merely shares an x coordinate.
+#[must_use]
+pub fn detect_seam_crossing(
+    seams: &[Seam],
+    prev: Point,
+    cur: Point,
+    dead_zone_px: u32,
+) -> Option<&Seam> {
+    seams.iter().find(|s| {
+        within_edge_span(s.local_display, s.edge, cur)
+            && detect_edge_crossing(s.local_display, prev, cur, dead_zone_px) == Some(s.edge)
+    })
+}
+
 /// The shared layout: where each node's screen sits on an abstract canvas
 /// (Tier 8.1's drag-and-snap tiles), used to answer "who's on the other
 /// side of this edge?"
@@ -316,7 +462,8 @@ fn horizontally_overlaps(a: Rect, b: Rect) -> bool {
 mod tests {
     use super::{
         Display, DisplayId, Edge, Layout, NodeId, Point, Rect, compute_entry_point,
-        detect_edge_crossing, detect_edge_reclaim, union_of_display_bounds,
+        detect_edge_crossing, detect_edge_reclaim, detect_seam_crossing, resolve_seams,
+        union_of_display_bounds,
     };
 
     fn rect(x: i32, y: i32, width: u32, height: u32) -> Rect {
@@ -534,5 +681,163 @@ mod tests {
     #[test]
     fn union_of_display_bounds_of_empty_slice_is_zeroed() {
         assert_eq!(union_of_display_bounds(&[]), rect(0, 0, 0, 0));
+    }
+
+    // ─────────────────────────── Seam resolution ──────────────────────────
+    //
+    // Fixture: the real layout that motivated this — a single-monitor Mac
+    // (1920×1080) placed to the LEFT of a Windows machine whose three
+    // monitors are, left to right, a 1920×1080 landscape, a 1080×1920
+    // portrait, and a 3840×2160 TV. The Windows virtual desktop is
+    // 6840×2160; only the leftmost Windows monitor actually borders the Mac.
+
+    /// The three Windows monitors, in the Windows machine's own coordinates.
+    fn windows_monitors() -> [Rect; 3] {
+        [
+            rect(0, 0, 1920, 1080),    // left, landscape
+            rect(1920, 0, 1080, 1920), // middle, portrait
+            rect(3000, 0, 3840, 2160), // right, the TV
+        ]
+    }
+
+    #[test]
+    fn seam_is_the_one_monitor_the_other_machine_borders() {
+        // From the Windows side: local = 3 monitors, peer = the Mac,
+        // translated so it sits flush against the left monitor's left edge.
+        let [left, portrait, tv] = windows_monitors();
+        let mac_in_windows_space = rect(-1920, 0, 1920, 1080);
+
+        let seams = resolve_seams(&[left, portrait, tv], &[mac_in_windows_space]);
+
+        assert_eq!(seams.len(), 1, "exactly one handoff boundary");
+        assert_eq!(seams[0].local_display, left);
+        assert_eq!(seams[0].edge, Edge::Left);
+        assert_eq!(seams[0].peer_display, mac_in_windows_space);
+        assert_eq!(seams[0].overlap_px, 1080);
+    }
+
+    #[test]
+    fn interior_edges_between_local_monitors_are_never_seams() {
+        // Put a peer display flush against *every* outer edge the union has,
+        // then confirm the left↔portrait and portrait↔TV interior seams
+        // still never appear — a cursor there just slides to the next
+        // monitor, it must not hand off.
+        let [left, portrait, tv] = windows_monitors();
+        let peers = [
+            rect(-100, 0, 100, 1080), // left of the left monitor
+            rect(6840, 0, 100, 2160), // right of the TV
+            rect(0, -100, 6840, 100), // above everything
+            rect(0, 2160, 6840, 100), // below everything
+        ];
+
+        let seams = resolve_seams(&[left, portrait, tv], &peers);
+
+        // The only interior edges are the vertical ones where two monitors
+        // abut: left|portrait and portrait|TV. Their top/bottom edges are
+        // still genuine hull edges and may legitimately seam.
+        for s in &seams {
+            let interior = (s.local_display == left && s.edge == Edge::Right)
+                || (s.local_display == portrait && matches!(s.edge, Edge::Left | Edge::Right))
+                || (s.local_display == tv && s.edge == Edge::Left);
+            assert!(!interior, "interior edge leaked a seam: {s:?}");
+        }
+        // And the boundaries that *should* resolve, do.
+        assert!(
+            seams
+                .iter()
+                .any(|s| s.local_display == left && s.edge == Edge::Left)
+        );
+        assert!(
+            seams
+                .iter()
+                .any(|s| s.local_display == tv && s.edge == Edge::Right)
+        );
+    }
+
+    #[test]
+    fn outer_edge_with_nothing_beyond_it_is_not_a_seam() {
+        // Just the Mac to the left — the TV's huge outer right edge, and
+        // the top/bottom of every monitor, border nothing and must produce
+        // no seam.
+        let [left, portrait, tv] = windows_monitors();
+        let seams = resolve_seams(&[left, portrait, tv], &[rect(-1920, 0, 1920, 1080)]);
+        assert!(
+            seams
+                .iter()
+                .all(|s| s.edge == Edge::Left && s.local_display == left)
+        );
+    }
+
+    #[test]
+    fn entry_point_normalizes_against_the_seam_monitor_not_the_union() {
+        // The bug: leaving the bottom of the 1080-tall left monitor used to
+        // normalize against the 2160-tall union and land the cursor
+        // half-way down the peer. Against the seam display it's ~1.0.
+        let [left, _, _] = windows_monitors();
+        let seams = resolve_seams(
+            &[left, windows_monitors()[1], windows_monitors()[2]],
+            &[rect(-1920, 0, 1920, 1080)],
+        );
+        let seam = seams[0];
+
+        let ep = compute_entry_point(seam.local_display, Point { x: 0, y: 1079 }, seam.edge);
+        assert_eq!(ep.edge, Edge::Right);
+        assert!((ep.pos - 1.0).abs() < 0.01, "got {}", ep.pos);
+
+        // 60% down that monitor -> 60%, regardless of the union's height.
+        let ep = compute_entry_point(seam.local_display, Point { x: 0, y: 648 }, seam.edge);
+        assert!((ep.pos - 0.6).abs() < 0.01, "got {}", ep.pos);
+    }
+
+    #[test]
+    fn seam_crossing_ignores_a_cursor_level_with_a_different_monitor() {
+        // Stacked local monitors: a small one on top, a wide one below, with
+        // the peer only against the TOP monitor's right edge. A cursor
+        // pushed off the RIGHT at a y that belongs to the bottom monitor
+        // must not read as crossing the top monitor's seam.
+        let top = rect(0, 0, 800, 600);
+        let bottom = rect(0, 600, 1600, 900);
+        let peer = rect(800, 0, 400, 600); // flush to top's right edge only
+        let seams = resolve_seams(&[top, bottom], &[peer]);
+        assert_eq!(seams.len(), 1);
+        assert_eq!(seams[0].local_display, top);
+
+        // y = 1000 is on the bottom monitor -> no crossing.
+        assert!(
+            detect_seam_crossing(
+                &seams,
+                Point { x: 700, y: 1000 },
+                Point { x: 799, y: 1000 },
+                20
+            )
+            .is_none()
+        );
+        // y = 300 is on the top monitor -> crossing.
+        assert!(
+            detect_seam_crossing(
+                &seams,
+                Point { x: 700, y: 300 },
+                Point { x: 799, y: 300 },
+                20
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn single_display_seam_matches_the_old_whole_desktop_behaviour() {
+        // With one local display == the virtual desktop and one peer rect
+        // adjacent on the right, seam resolution must reproduce exactly what
+        // detect_edge_crossing against the union used to do.
+        let desktop = rect(0, 0, 2560, 1440);
+        let peer = rect(2560, 0, 1920, 1080);
+        let seams = resolve_seams(&[desktop], &[peer]);
+        assert_eq!(seams.len(), 1);
+        assert_eq!(seams[0].edge, Edge::Right);
+        assert_eq!(seams[0].local_display, desktop);
+
+        let center = Point { x: 1280, y: 720 };
+        assert!(detect_seam_crossing(&seams, center, Point { x: 2559, y: 720 }, 20).is_some());
+        assert!(detect_seam_crossing(&seams, center, Point { x: 1280, y: 0 }, 20).is_none());
     }
 }

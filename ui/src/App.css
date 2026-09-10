@@ -262,6 +262,16 @@ button.primary:hover:not(:disabled) {
   cursor: grabbing;
 }
 
+/* The one local monitor + one peer monitor that form the handoff seam. */
+.seam-tile {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  z-index: 2;
+}
+.local-tile.seam-tile {
+  box-shadow: 0 0 0 1px var(--accent), 0 0 16px var(--accent-wash);
+}
+
 .tile-res {
   font-size: 0.7rem;
   font-weight: 400;
