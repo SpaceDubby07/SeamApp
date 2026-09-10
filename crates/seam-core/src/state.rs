@@ -25,11 +25,12 @@ const HANDOFF_COOLDOWN: Duration = Duration::from_millis(200);
 /// doesn't trigger an accidental handoff (Tier 7.2).
 const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 
-/// How far (in pixels) the peer-driven cursor must travel inward from the
-/// edge it entered on before a push back out through that same edge counts
-/// as "give control back" rather than entry jitter.
+/// How far (in pixels) the peer-driven cursor must travel *past its inset
+/// entry point* (see [`StateMachine::entry_inset_px`]), inward, before a
+/// push back out through the entry edge counts as "give control back"
+/// rather than entry jitter or fast-flick overshoot.
 ///
-/// Reclaim now happens on the machine BEING driven (see
+/// Reclaim happens on the machine BEING driven (see
 /// [`StateMachine::on_driven_cursor_moved`] and
 /// `ControlMessage::ReleaseBack`), not by the driver watching its own
 /// suppressed cursor — that earlier local-side approach reclaimed on any
@@ -37,12 +38,18 @@ const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 /// cursor keeps physically moving), fired constantly, producing the
 /// "it never leaves either screen, keeps re-grabbing" behaviour.
 ///
-/// The driven cursor is warped exactly onto the shared edge on entry, so
-/// without an arm step its very first outward jitter sample would look like
-/// a deliberate exit. Requiring `DRIVEN_BACKOUT_ARM_PX` of inward travel
-/// first makes the exit unambiguous while still reading as instant to a
-/// human pushing back on purpose.
+/// Together with the inset entry, this is Seam's version of Barrier's
+/// jump-zone / `clearWait` guard against the "cursor passes through the
+/// computer" bug: the arm threshold is `entry_inset + DRIVEN_BACKOUT_ARM_PX`
+/// from the edge, so residual velocity from the flick that caused the
+/// handoff can't immediately trip the reverse handoff.
 const DRIVEN_BACKOUT_ARM_PX: i32 = 12;
+
+/// Lower bound on the inset entry distance even when the configured corner
+/// dead zone is small or zero — a fast flick still needs *some* landing
+/// room on the new screen. 8px is below human "did the cursor move?"
+/// perception but enough to absorb one over-large relayed delta.
+const MIN_ENTRY_INSET_PX: i32 = 8;
 
 /// The handoff state machine's current mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,13 +175,18 @@ pub struct StateMachine {
     /// to cross back out of to hand control back. `None` in every other
     /// state.
     driven_entry_edge: Option<Edge>,
+    /// While `BeingDriven`: how far inside `driven_entry_edge` the cursor
+    /// was placed on entry (see [`Self::entry_inset_px`]). The back-out
+    /// detector arms at `driven_entry_inset + DRIVEN_BACKOUT_ARM_PX` from
+    /// the edge. `0` in every other state.
+    driven_entry_inset: i32,
     /// While `BeingDriven`: the last integrated position of the
     /// peer-driven cursor, in local pixels, for back-out edge detection.
     last_driven_cursor: Option<Point>,
     /// While `BeingDriven`: set once the driven cursor has moved far enough
-    /// inward from `driven_entry_edge` (`DRIVEN_BACKOUT_ARM_PX`) that a
-    /// subsequent push back out through that edge is a deliberate exit and
-    /// not entry jitter.
+    /// inward past its inset entry point that a subsequent push back out
+    /// through the entry edge is a deliberate exit and not entry jitter or
+    /// fast-flick overshoot.
     driven_backout_armed: bool,
     last_cursor: Option<Point>,
     last_handoff_at: Option<Instant>,
@@ -202,6 +214,7 @@ impl StateMachine {
             layout,
             peer: None,
             driven_entry_edge: None,
+            driven_entry_inset: 0,
             last_driven_cursor: None,
             driven_backout_armed: false,
             last_cursor: None,
@@ -310,7 +323,7 @@ impl StateMachine {
             Input::LockToggled(locked) => self.on_lock_toggled(locked),
             Input::ReceivedHandoff { from, entry } => self.on_received_handoff(from, entry),
             Input::ReceivedReclaim => self.on_received_reclaim(),
-            Input::ReceivedReleaseBack => self.on_received_release_back(),
+            Input::ReceivedReleaseBack => self.on_received_release_back(now),
             Input::ReceivedEmergencyRelease => self.on_emergency_release(),
             Input::ConnectionLost => self.on_connection_lost(),
             Input::Shutdown => self.on_shutdown(),
@@ -357,8 +370,12 @@ impl StateMachine {
         let prev = self.last_driven_cursor.replace(pos);
 
         if !self.driven_backout_armed {
-            // Arm only once the cursor is unambiguously inside our screen.
-            if detect_edge_reclaim(self.local_bounds, edge, pos, DRIVEN_BACKOUT_ARM_PX) {
+            // Arm only once the cursor is unambiguously inside our screen —
+            // measured from the edge, so it accounts for the inset entry
+            // point (a fast flick that overshot toward the edge stays
+            // unarmed, and so can't bounce straight back).
+            let arm_from_edge = self.driven_entry_inset + DRIVEN_BACKOUT_ARM_PX;
+            if detect_edge_reclaim(self.local_bounds, edge, pos, arm_from_edge) {
                 self.driven_backout_armed = true;
             }
             return Vec::new();
@@ -386,8 +403,35 @@ impl StateMachine {
     /// every transition out of `BeingDriven`.
     fn clear_driven_tracking(&mut self) {
         self.driven_entry_edge = None;
+        self.driven_entry_inset = 0;
         self.last_driven_cursor = None;
         self.driven_backout_armed = false;
+    }
+
+    /// How far inside the entry edge to place the peer-driven cursor on a
+    /// handoff — Barrier's `avoidJumpZone` idea. Landing a jump-zone width
+    /// *in*, rather than exactly on the edge, means a fast flick that
+    /// carried the cursor across the boundary puts it visibly on the new
+    /// screen with room to stop, instead of pinned against the far side of
+    /// the edge where the slightest reverse motion bounces control
+    /// straight back ("the cursor passes through the computer").
+    ///
+    /// Tracks the configured corner dead zone (so the Layout panel's one
+    /// "edge margin" control governs both), floored at
+    /// [`MIN_ENTRY_INSET_PX`] and capped at a third of the smaller screen
+    /// dimension so a large dead zone on a small screen can't warp past
+    /// the middle.
+    fn entry_inset_px(&self) -> i32 {
+        let cap = self
+            .local_bounds
+            .width
+            .min(self.local_bounds.height)
+            .cast_signed()
+            / 3;
+        self.corner_dead_zone_px
+            .cast_signed()
+            .max(MIN_ENTRY_INSET_PX)
+            .min(cap.max(0))
     }
 
     fn try_handoff(&mut self, prev: Option<Point>, pos: Point, now: Instant) -> Vec<Action> {
@@ -432,11 +476,16 @@ impl StateMachine {
     /// user left off, and release any modifiers (Tier 7.1: mandatory on
     /// every exit from `RemoteActive`). No `SendReclaim` — the peer
     /// initiated this and already knows.
-    fn on_received_release_back(&mut self) -> Vec<Action> {
+    fn on_received_release_back(&mut self, now: Instant) -> Vec<Action> {
         if self.state != State::RemoteActive {
             return Vec::new();
         }
         self.state = State::LocalActive;
+        // Re-arm the post-handoff cooldown so a flick that carried the
+        // cursor all the way through the peer and back can't immediately
+        // hand off again — the boundary-oscillation guard, matching
+        // Barrier's `stopSwitch` on a screen switch.
+        self.last_handoff_at = Some(now);
         let warp_to = self
             .remembered_cursor
             .get(&self.local_node)
@@ -498,29 +547,27 @@ impl StateMachine {
         self.state = State::BeingDriven;
         self.peer = Some(from);
         let bounds = self.local_bounds;
+        // Land the cursor `inset` px INSIDE the entry edge, not on it (see
+        // `entry_inset_px`). `pos` still fixes the coordinate *along* the
+        // edge; the inset is the offset *into* the screen.
+        let inset = self.entry_inset_px();
+        let along_h = bounds.y + (entry.pos * bounds.height as f32) as i32;
+        let along_v = bounds.x + (entry.pos * bounds.width as f32) as i32;
+        let right = bounds.x + bounds.width.cast_signed() - 1;
+        let bottom = bounds.y + bounds.height.cast_signed() - 1;
         let (x, y) = match entry.edge {
-            Edge::Left => (
-                bounds.x,
-                bounds.y + (entry.pos * bounds.height as f32) as i32,
-            ),
-            Edge::Right => (
-                bounds.x + bounds.width.cast_signed() - 1,
-                bounds.y + (entry.pos * bounds.height as f32) as i32,
-            ),
-            Edge::Top => (
-                bounds.x + (entry.pos * bounds.width as f32) as i32,
-                bounds.y,
-            ),
-            Edge::Bottom => (
-                bounds.x + (entry.pos * bounds.width as f32) as i32,
-                bounds.y + bounds.height.cast_signed() - 1,
-            ),
+            Edge::Left => (bounds.x + inset, along_h),
+            Edge::Right => (right - inset, along_h),
+            Edge::Top => (along_v, bounds.y + inset),
+            Edge::Bottom => (along_v, bottom - inset),
         };
-        // Arm the back-out detector fresh: the cursor is being placed
-        // exactly on `entry.edge`, and it has to travel `DRIVEN_BACKOUT_ARM_PX`
-        // inward before pushing back out through that edge counts as a
-        // deliberate hand-back (`on_driven_cursor_moved`).
+        // Arm the back-out detector fresh: it won't trip until the cursor
+        // has travelled `driven_entry_inset + DRIVEN_BACKOUT_ARM_PX` inward
+        // from the edge, so residual velocity from the flick that caused
+        // this handoff can't bounce control straight back
+        // (`on_driven_cursor_moved`).
         self.driven_entry_edge = Some(entry.edge);
+        self.driven_entry_inset = inset;
         self.last_driven_cursor = Some(Point { x, y });
         self.driven_backout_armed = false;
         vec![Action::WarpCursor { x, y }]
@@ -762,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn received_handoff_warps_cursor_to_the_entry_point() {
+    fn received_handoff_warps_cursor_inset_from_the_entry_edge() {
         let (mut sm, _, peer) = two_node_machine();
         let entry = crate::topology::EdgePoint {
             edge: crate::topology::Edge::Left,
@@ -772,13 +819,153 @@ mod tests {
         let actions = sm.handle(Input::ReceivedHandoff { from: peer, entry }, Instant::now());
 
         assert_eq!(sm.state(), State::BeingDriven);
+        // Lands the default 20px dead-zone width inside the left edge, not
+        // at x=0 — Barrier's `avoidJumpZone` behaviour.
         assert_eq!(
             actions[0],
             Action::WarpCursor {
-                x: 0,
+                x: 20,
                 y: (0.25 * 1080.0) as i32
             }
         );
+    }
+
+    #[test]
+    fn handoff_entry_inset_is_capped_on_a_small_screen() {
+        let local = NodeId::new();
+        let peer = NodeId::new();
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 60,
+        };
+        let mut layout = Layout::new();
+        layout.set_placement(local, tiny);
+        layout.set_placement(
+            peer,
+            Rect {
+                x: -60,
+                y: 0,
+                width: 60,
+                height: 60,
+            },
+        );
+        let mut sm = StateMachine::new(local, tiny, layout);
+        // Default dead zone is 20, but a third of 60 is 20, so this still
+        // fits — push the dead zone up to force the cap.
+        sm.set_edge_settings(50, 200);
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+
+        let actions = sm.handle(
+            Input::ReceivedHandoff {
+                from: peer,
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            },
+            Instant::now(),
+        );
+        // Capped at width/3 = 20, never past the middle.
+        assert_eq!(actions[0], Action::WarpCursor { x: 20, y: 30 });
+    }
+
+    /// The "cursor passes through the computer" regression: right after a
+    /// handoff, residual velocity from the same fast flick keeps arriving
+    /// as inward-then-outward deltas. Because entry is inset and the arm
+    /// threshold sits past the inset, none of it trips the reverse
+    /// handoff — control stays put.
+    #[test]
+    fn fast_flick_overshoot_after_handoff_does_not_bounce_control_back() {
+        let local = NodeId::new();
+        let peer = NodeId::new();
+        let mut layout = Layout::new();
+        layout.set_placement(local, local_bounds());
+        layout.set_placement(
+            peer,
+            Rect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let mut sm = StateMachine::new(local, local_bounds(), layout);
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+
+        let actions = sm.handle(
+            Input::ReceivedHandoff {
+                from: peer,
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            },
+            Instant::now(),
+        );
+        assert_eq!(actions[0], Action::WarpCursor { x: 20, y: 540 });
+
+        // A fast leftward flick's tail: the cursor briefly moves a little
+        // further in (still settling) then is carried back out past the
+        // edge. Never armed (never reached x = 20 + 12), so no hand-back.
+        for x in [26, 22, 10, 0, -8, -30] {
+            let actions = sm.handle(
+                Input::DrivenCursorMoved(Point { x, y: 540 }),
+                Instant::now(),
+            );
+            assert!(
+                actions.is_empty(),
+                "x={x} produced {actions:?} — a flick tail must not reclaim"
+            );
+            assert_eq!(sm.state(), State::BeingDriven, "bounced back at x={x}");
+        }
+
+        // A deliberate move well inside then back out the edge still works.
+        sm.handle(
+            Input::DrivenCursorMoved(Point { x: 500, y: 540 }),
+            Instant::now(),
+        );
+        let actions = sm.handle(
+            Input::DrivenCursorMoved(Point { x: -2, y: 540 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+        assert!(actions.contains(&Action::SendReleaseBack));
+    }
+
+    /// The driver side of the same concern: a `ReleaseBack` re-arms the
+    /// post-handoff cooldown, so a flick that carried the cursor through
+    /// the peer and back can't immediately hand off again even if the
+    /// original handoff was long ago.
+    #[test]
+    fn release_back_re_arms_the_handoff_cooldown() {
+        let (mut sm, _, peer) = two_node_machine(); // peer on the RIGHT
+        sm.handle(Input::PeerHandshakeOk(peer), Instant::now());
+        let t0 = Instant::now();
+
+        // Hand off to the right, then get it back a full second later.
+        sm.handle(Input::CursorMoved(Point { x: 960, y: 540 }), t0);
+        sm.handle(Input::CursorMoved(Point { x: 1919, y: 540 }), t0);
+        assert_eq!(sm.state(), State::RemoteActive);
+        let t_back = t0 + Duration::from_secs(1);
+        sm.handle(Input::ReceivedReleaseBack, t_back);
+        assert_eq!(sm.state(), State::LocalActive);
+
+        // 50ms after the reclaim — inside the (re-armed) 200ms cooldown —
+        // pushing the edge again must NOT hand off.
+        sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            t_back + Duration::from_millis(50),
+        );
+        assert_eq!(sm.state(), State::LocalActive, "re-handoff inside cooldown");
+
+        // Past the cooldown, it can.
+        sm.handle(
+            Input::CursorMoved(Point { x: 1919, y: 540 }),
+            t_back + Duration::from_millis(250),
+        );
+        assert_eq!(sm.state(), State::RemoteActive);
     }
 
     #[test]
@@ -907,10 +1094,11 @@ mod tests {
         };
         let actions = sm.handle(Input::ReceivedHandoff { from: peer, entry }, Instant::now());
         assert_eq!(sm.state(), State::BeingDriven);
-        assert!(matches!(actions[0], Action::WarpCursor { x: 0, .. }));
+        // Inset 20px inside the left edge (default dead zone).
+        assert!(matches!(actions[0], Action::WarpCursor { x: 20, .. }));
 
-        // A tiny outward wobble before the cursor has come inward at all
-        // must NOT be read as an exit (the cursor was warped onto the edge).
+        // A tiny outward wobble before the cursor has come inward past the
+        // inset must NOT be read as an exit.
         let actions = sm.handle(
             Input::DrivenCursorMoved(Point { x: -3, y: 540 }),
             Instant::now(),

@@ -2245,10 +2245,11 @@ mod tests {
         assert_eq!(b_session.state(), State::BeingDriven);
         let warps = b_sink.warps.lock().expect("mutex poisoned");
         assert_eq!(warps.len(), 1);
-        // Entry point should be on B's LEFT edge (mirrors A's Right exit),
-        // vertically centered since A crossed at y=540 of a 1080-tall
-        // screen.
-        assert_eq!(warps[0].0, 0);
+        // Entry lands just inside B's LEFT edge (mirrors A's Right exit) —
+        // the 20px default dead-zone inset, not x=0 (Barrier's
+        // `avoidJumpZone`). Vertically centred since A crossed at y=540 of
+        // a 1080-tall screen.
+        assert_eq!(warps[0].0, 20);
         assert!((warps[0].1 - 540).abs() <= 1);
     }
 
