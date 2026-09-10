@@ -36,10 +36,10 @@ const IMAGE_MIME: &str = "image/png";
 
 /// macOS implementation of [`seam_core::traits::ClipboardProvider`].
 pub struct Clipboard {
-    /// The polling thread `watch` spawns. Never joined: `ClipboardProvider`
-    /// has no `stop()` (unlike `InputCapture`), so this simply runs for the
-    /// life of the process — kept here only so the handle isn't dropped
-    /// (and detached) the moment `watch` returns.
+    /// The polling thread `watch` spawns. Not joined — `ClipboardProvider`
+    /// has no `stop()` — but it ends on its own within one [`POLL_INTERVAL`]
+    /// once its `sink` closes (the session dropped), so a reconnect
+    /// doesn't stack a second poller on the pasteboard.
     thread: Option<JoinHandle<()>>,
 }
 
@@ -72,6 +72,12 @@ impl ClipboardProvider for Clipboard {
                 let mut last_seen_change_count: Option<NSInteger> = None;
 
                 loop {
+                    // The session dropped its receiver (disconnect /
+                    // reconnect / shutdown) — stop polling rather than run
+                    // until the next unrelated clipboard change.
+                    if sink.is_closed() {
+                        return;
+                    }
                     let change_count = pasteboard.changeCount();
                     if last_seen_change_count != Some(change_count) {
                         last_seen_change_count = Some(change_count);

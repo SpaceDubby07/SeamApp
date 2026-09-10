@@ -33,8 +33,8 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    HWND_MESSAGE, MSG, RegisterClassExW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLIPBOARDUPDATE, WNDCLASSEXW,
+    HWND_MESSAGE, MSG, PostThreadMessageW, RegisterClassExW, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSEXW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -68,11 +68,38 @@ impl Clipboard {
             thread_id: None,
         }
     }
+
+    /// Stops the watch thread: posts `WM_QUIT` to break its `GetMessageW`
+    /// loop (which then removes the format listener and destroys the
+    /// window), then joins. Idempotent — mirrors `Capture::stop`.
+    fn stop(&mut self) {
+        if let Some(thread_id) = self.thread_id.take() {
+            // SAFETY: `thread_id` came from `GetCurrentThreadId` on the
+            // still-running watch thread; posting `WM_QUIT` to it is the
+            // documented way to end its message loop.
+            let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Default for Clipboard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Clipboard {
+    /// Without this the watch thread and its message-only window leak for
+    /// the life of the process. That stayed invisible until reconnect
+    /// (M12) made `watch` run a second time: `AddClipboardFormatListener`
+    /// on a second live window double-reports every clipboard change, and
+    /// before the `OnceLock` in `create_message_window` a second
+    /// `RegisterClassExW` failed outright ("RegisterClassExW failed").
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -178,34 +205,52 @@ impl ClipboardProvider for Clipboard {
     }
 }
 
+/// Registers the message-window class exactly once per process. A window
+/// class is a process-global template: re-registering the same name fails
+/// with `ERROR_CLASS_ALREADY_EXISTS`, which is what broke a reconnect —
+/// `watch` runs a second time in the same process. Never unregistered;
+/// leaving one class registered for the process's life costs nothing.
+fn ensure_class_registered() -> Result<(), String> {
+    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            // SAFETY: `GetModuleHandleW(None)` returns this process's own
+            // module handle, valid to register a class against.
+            let hinstance = unsafe { GetModuleHandleW(None) }
+                .map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
+            let wc = WNDCLASSEXW {
+                cbSize: u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or_default(),
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: WINDOW_CLASS_NAME,
+                ..Default::default()
+            };
+            // SAFETY: `wc` is a fully initialized `WNDCLASSEXW`;
+            // registering a window class this way is always sound.
+            if unsafe { RegisterClassExW(&raw const wc) } == 0 {
+                return Err("RegisterClassExW failed".to_string());
+            }
+            Ok(())
+        })
+        .clone()
+}
+
 /// Creates a hidden, message-only window (`HWND_MESSAGE` parent) purely to
 /// receive `WM_CLIPBOARDUPDATE` — it's never shown and has no visible
 /// content.
 fn create_message_window() -> Result<HWND, String> {
+    ensure_class_registered()?;
+
     // SAFETY: `GetModuleHandleW(None)` returns a handle to this process's
-    // own module, valid for registering a window class against.
+    // own module.
     let hinstance =
         unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
 
-    let wc = WNDCLASSEXW {
-        cbSize: u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or_default(),
-        lpfnWndProc: Some(wndproc),
-        hInstance: hinstance.into(),
-        lpszClassName: WINDOW_CLASS_NAME,
-        ..Default::default()
-    };
-    // SAFETY: `wc` is a fully initialized `WNDCLASSEXW`; registering a
-    // window class this way is always sound, and a duplicate-class error
-    // (e.g. a second `Clipboard` in the same process) is reported through
-    // the return value rather than being unsound.
-    if unsafe { RegisterClassExW(&raw const wc) } == 0 {
-        return Err("RegisterClassExW failed".to_string());
-    }
-
-    // SAFETY: creating a message-only window with the class just
-    // registered above; `HWND_MESSAGE` as the parent and no window style
-    // is the documented combination for a window that never becomes
-    // visible and needs no message loop beyond delivering messages to us.
+    // SAFETY: creating a message-only window with the class registered by
+    // `ensure_class_registered`; `HWND_MESSAGE` as the parent and no
+    // window style is the documented combination for a window that never
+    // becomes visible and needs no message loop beyond delivering
+    // messages to us.
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
