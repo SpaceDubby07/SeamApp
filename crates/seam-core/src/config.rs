@@ -67,7 +67,7 @@ pub struct Config {
     /// The key combo that force-returns control to the local machine from
     /// anywhere (Tier 7.7, the Input panel's click-to-record binding).
     /// `#[serde(default)]` → a config written before this field existed
-    /// gets [`Hotkey::default`] (Shift+Ctrl+Alt+Escape).
+    /// gets [`Hotkey::default`].
     #[serde(default)]
     pub escape_hotkey: Hotkey,
     /// Edge-handoff tuning (Tier 8.1's per-edge settings, applied globally
@@ -103,14 +103,20 @@ pub struct Hotkey {
 }
 
 impl Default for Hotkey {
-    /// Shift+Ctrl+Alt+Escape — the historical hardcoded combo (Tier 7.7).
+    /// Ctrl+Alt+Backslash. Deliberately NOT the old Shift+Ctrl+Alt+Escape:
+    /// holding Ctrl+Alt+Shift together is the prefix for Windows 10 +
+    /// Microsoft 365's global "Office key" launcher hotkeys, and
+    /// Ctrl+Shift+Esc is Task Manager — relaying that modifier set to a
+    /// Windows peer at handoff time triggered those. `\` has no OS
+    /// binding on macOS or Windows and is a comfortable one-hand combo.
+    /// Rebind it in the Input panel.
     fn default() -> Self {
         Self {
             ctrl: true,
-            shift: true,
+            shift: false,
             alt: true,
             meta: false,
-            key: KeyCode::Escape,
+            key: KeyCode::Backslash,
         }
     }
 }

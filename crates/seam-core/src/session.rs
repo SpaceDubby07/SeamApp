@@ -2516,7 +2516,8 @@ mod tests {
         // reaction, not send delivery.
         let _b_control = b_control;
 
-        for code in [KeyCode::LeftShift, KeyCode::LeftCtrl, KeyCode::LeftAlt] {
+        // The default combo (Ctrl+Alt+Backslash).
+        for code in [KeyCode::LeftCtrl, KeyCode::LeftAlt] {
             session
                 .handle_capture_event(InputEvent::KeyDown {
                     code,
@@ -2540,7 +2541,7 @@ mod tests {
 
         session
             .handle_capture_event(InputEvent::KeyDown {
-                code: KeyCode::Escape,
+                code: KeyCode::Backslash,
                 repeat: false,
             })
             .await
