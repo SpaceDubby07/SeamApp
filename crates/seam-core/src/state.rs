@@ -430,12 +430,17 @@ impl StateMachine {
         let Some(edge) = self.driven_entry_edge else {
             return Vec::new();
         };
-        // Reclaim is measured against the seam monitor the peer entered on,
-        // not the whole virtual desktop — otherwise "push back out through
-        // the edge" would mean the union's outer edge, which on a
-        // multi-monitor machine the cursor can't even reach from that
-        // monitor.
-        let bounds = self.driven_seam_display.unwrap_or(self.local_bounds);
+        // Back-out geometry is a hybrid: the entry-edge axis comes from the
+        // seam monitor (so "pushed back out" means the line the cursor
+        // actually crossed to get here — which need not be the union's
+        // outer edge), but the PERPENDICULAR axis spans the whole virtual
+        // desktop, because a driven cursor roams every monitor. Using the
+        // narrow seam monitor for both axes was a bug: once the cursor's
+        // off-seam-monitor coordinate left that monitor's span, the corner
+        // dead-zone check in `detect_edge_crossing` tripped on a negative
+        // distance and reclaim could never fire — control got stuck on this
+        // side.
+        let bounds = self.driven_backout_bounds();
         let prev = self.last_driven_cursor.replace(pos);
 
         if !self.driven_backout_armed {
@@ -464,6 +469,33 @@ impl StateMachine {
         self.peer = None;
         self.clear_driven_tracking();
         vec![Action::SendReleaseBack, Action::ReleaseAllModifiers]
+    }
+
+    /// The rectangle back-out detection runs against while `BeingDriven`
+    /// (see [`Self::on_driven_cursor_moved`]): the seam monitor's extent
+    /// along the entry-edge axis, the whole virtual desktop's along the
+    /// other. Falls back to the whole desktop when there's no seam monitor
+    /// (single-monitor machine, or a handoff with no resolved seam).
+    fn driven_backout_bounds(&self) -> Rect {
+        let Some(seam) = self.driven_seam_display else {
+            return self.local_bounds;
+        };
+        let desk = self.local_bounds;
+        match self.driven_entry_edge {
+            Some(Edge::Left | Edge::Right) => Rect {
+                x: seam.x,
+                width: seam.width,
+                y: desk.y,
+                height: desk.height,
+            },
+            Some(Edge::Top | Edge::Bottom) => Rect {
+                x: desk.x,
+                width: desk.width,
+                y: seam.y,
+                height: seam.height,
+            },
+            None => desk,
+        }
     }
 
     /// Resets the `BeingDriven` cursor-tracking bookkeeping. Called on
@@ -1452,5 +1484,41 @@ mod tests {
         assert_eq!(sm.state(), State::LocalActive);
         assert!(out.contains(&Action::ReleaseAllModifiers), "got {out:?}");
         assert!(out.contains(&Action::SendReleaseBack));
+    }
+
+    #[test]
+    fn reclaim_fires_when_the_driven_cursor_backs_out_from_off_the_seam_monitor() {
+        // Regression: while BeingDriven the peer roams onto a taller monitor
+        // (y past the 1080-tall seam monitor), then pushes back out the
+        // entry edge. Back-out detection must still fire — using the narrow
+        // seam monitor for the perpendicular axis made the corner check
+        // trip on a negative distance and control got stuck on this side.
+        let (mut sm, _, peer) = three_monitor_machine();
+        sm.handle(
+            Input::ReceivedHandoff {
+                from: peer,
+                entry: crate::topology::EdgePoint {
+                    edge: crate::topology::Edge::Left,
+                    pos: 0.5,
+                },
+            },
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::BeingDriven);
+
+        // Roam onto the portrait monitor (y = 1600, well below the seam
+        // monitor's 1080) — this arms the back-out detector.
+        sm.handle(
+            Input::DrivenCursorMoved(Point { x: 2500, y: 1600 }),
+            Instant::now(),
+        );
+        // Push back out through the left edge at that same y.
+        let out = sm.handle(
+            Input::DrivenCursorMoved(Point { x: 0, y: 1600 }),
+            Instant::now(),
+        );
+        assert_eq!(sm.state(), State::LocalActive, "reclaim never fired");
+        assert!(out.contains(&Action::SendReleaseBack), "got {out:?}");
+        assert!(out.contains(&Action::ReleaseAllModifiers));
     }
 }
