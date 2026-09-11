@@ -97,7 +97,7 @@ impl Drop for Clipboard {
     /// (M12) made `watch` run a second time: `AddClipboardFormatListener`
     /// on a second live window double-reports every clipboard change, and
     /// before the `OnceLock` in `create_message_window` a second
-    /// `RegisterClassExW` failed outright ("RegisterClassExW failed").
+    /// `RegisterClassExW` failed outright (`"RegisterClassExW failed"`).
     fn drop(&mut self) {
         self.stop();
     }
