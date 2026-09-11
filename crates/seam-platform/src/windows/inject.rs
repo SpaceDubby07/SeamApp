@@ -8,12 +8,16 @@ use seam_core::traits::InputSink;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SetCursorPos, XBUTTON1, XBUTTON2,
+};
 
 use super::keycodes::keycode_to_vk;
 
@@ -38,7 +42,7 @@ impl Default for Sink {
 impl InputSink for Sink {
     fn inject(&mut self, event: &InputEvent) -> Result<(), PlatformError> {
         match *event {
-            InputEvent::MouseMoveAbs { x, y } => self.warp_cursor(x, y),
+            InputEvent::MouseMoveAbs { x, y } => send_one(mouse_move_abs(x, y)),
             InputEvent::MouseDelta { dx, dy } => send_one(mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)),
             InputEvent::MouseDown { button } => send_one(mouse_button_input(button, true)),
             InputEvent::MouseUp { button } => send_one(mouse_button_input(button, false)),
@@ -94,6 +98,39 @@ fn send_one(input: INPUT) -> Result<(), PlatformError> {
         return Err(PlatformError::InjectionRejected);
     }
     Ok(())
+}
+
+/// Absolute mouse move to virtual-desktop pixel `(x, y)`, normalized to
+/// the `0..=65535` range `SendInput` expects for an absolute move.
+///
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` positions the cursor
+/// directly and — unlike a relative `MOUSEEVENTF_MOVE` — is NOT run
+/// through this machine's "enhance pointer precision" acceleration curve.
+/// Relayed motion has already been accelerated once on the driver; a
+/// relative injection here would accelerate it a second time, which is
+/// what made driven motion feel wrong. Matches Barrier's `deskMouseMove`.
+#[allow(clippy::cast_possible_truncation)]
+fn mouse_move_abs(x: i32, y: i32) -> INPUT {
+    // SAFETY: `GetSystemMetrics` takes a plain metric index, no preconditions.
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    // The absolute coordinate space is [0, 65535] mapped across the whole
+    // virtual desktop; guard the divisor against a degenerate metric read.
+    let span_x = i64::from((vw - 1).max(1));
+    let span_y = i64::from((vh - 1).max(1));
+    let nx = (i64::from(x - vx) * 65_535 / span_x).clamp(0, 65_535) as i32;
+    let ny = (i64::from(y - vy) * 65_535 / span_y).clamp(0, 65_535) as i32;
+    // Rebuild the flag set via `.0` (as the keyboard path in this file
+    // does) rather than relying on a `BitOr` impl for the newtype.
+    let flags =
+        MOUSE_EVENT_FLAGS(MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
+    mouse_input(nx, ny, 0, flags)
 }
 
 fn mouse_input(dx: i32, dy: i32, mouse_data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {

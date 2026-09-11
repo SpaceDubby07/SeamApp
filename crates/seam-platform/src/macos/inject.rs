@@ -7,9 +7,10 @@ use seam_core::traits::InputSink;
 use super::cg_ffi::{
     CFRelease, CGEventCreateKeyboardEvent, CGEventCreateMouseEvent, CGEventCreateScrollWheelEvent,
     CGEventPost, CGEventRef, CGPoint, CGWarpMouseCursorPosition, K_CG_EVENT_LEFT_MOUSE_DOWN,
-    K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_UP,
-    K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_HID_EVENT_TAP,
-    K_CG_MOUSE_BUTTON_CENTER, K_CG_MOUSE_BUTTON_LEFT, K_CG_MOUSE_BUTTON_RIGHT,
+    K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_EVENT_MOUSE_MOVED,
+    K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_EVENT_OTHER_MOUSE_UP,
+    K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_EVENT_RIGHT_MOUSE_UP,
+    K_CG_HID_EVENT_TAP, K_CG_MOUSE_BUTTON_CENTER, K_CG_MOUSE_BUTTON_LEFT, K_CG_MOUSE_BUTTON_RIGHT,
 };
 use super::keycodes::keycode_to_cgkeycode;
 
@@ -21,8 +22,18 @@ use super::keycodes::keycode_to_cgkeycode;
 /// posted "at the current location" on every other platform's input
 /// model) — so button events here are posted at whatever position the
 /// last warp/move left the synthetic cursor at.
+///
+/// It also tracks which mouse buttons are currently held, so that a move
+/// while a button is down is posted as the matching `…MouseDragged` event
+/// rather than a plain `MouseMoved` — without that, dragging a window or
+/// selecting text on the machine being driven silently does nothing
+/// (Barrier does the same in `OSXScreen::fakeMouseMove`).
 pub struct Sink {
     last_position: CGPoint,
+    /// Buttons currently held by our own injection, most-recently-pressed
+    /// last. `Vec` rather than a set so `.last()` picks the button a drag
+    /// event should carry when several are down.
+    held_buttons: Vec<MouseButton>,
 }
 
 impl Sink {
@@ -32,6 +43,7 @@ impl Sink {
     pub fn new() -> Self {
         Self {
             last_position: CGPoint { x: 0.0, y: 0.0 },
+            held_buttons: Vec::new(),
         }
     }
 }
@@ -45,11 +57,11 @@ impl Default for Sink {
 impl InputSink for Sink {
     fn inject(&mut self, event: &InputEvent) -> Result<(), PlatformError> {
         match *event {
-            InputEvent::MouseMoveAbs { x, y } => self.warp_cursor(x, y),
+            InputEvent::MouseMoveAbs { x, y } => self.post_mouse_moved(f64::from(x), f64::from(y)),
             InputEvent::MouseDelta { dx, dy } => {
                 let x = self.last_position.x + f64::from(dx);
                 let y = self.last_position.y + f64::from(dy);
-                self.warp_cursor_f64(x, y)
+                self.post_mouse_moved(x, y)
             }
             InputEvent::MouseDown { button } => self.post_mouse_button(button, true),
             InputEvent::MouseUp { button } => self.post_mouse_button(button, false),
@@ -95,7 +107,43 @@ impl Sink {
         Ok(())
     }
 
-    fn post_mouse_button(&self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
+    /// Posts a synthetic mouse-moved event at the absolute point
+    /// `(x, y)` — or the matching `…MouseDragged` event if a button is
+    /// held — and records the new position for later button events.
+    ///
+    /// A real `CGEventPost(kCGEventMouseMoved)` (Barrier's
+    /// `OSXScreen::postMouseEvent`), not just `CGWarpMouseCursorPosition`,
+    /// is what makes hover, tooltips, `:hover`, and drags track on the
+    /// machine being driven. `CGEventPost` moves the on-screen cursor on
+    /// its own, so no warp is needed here (and skipping it also drops the
+    /// per-sample warp cost that showed up as stutter).
+    fn post_mouse_moved(&mut self, x: f64, y: f64) -> Result<(), PlatformError> {
+        let point = CGPoint { x, y };
+        let (event_type, cg_button) = match self.held_buttons.last() {
+            Some(MouseButton::Left) => (K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_MOUSE_BUTTON_LEFT),
+            Some(MouseButton::Right) => (K_CG_EVENT_RIGHT_MOUSE_DRAGGED, K_CG_MOUSE_BUTTON_RIGHT),
+            Some(MouseButton::Middle | MouseButton::X1 | MouseButton::X2) => {
+                (K_CG_EVENT_OTHER_MOUSE_DRAGGED, K_CG_MOUSE_BUTTON_CENTER)
+            }
+            None => (K_CG_EVENT_MOUSE_MOVED, K_CG_MOUSE_BUTTON_LEFT),
+        };
+        // SAFETY: passing a null CGEventSourceRef is documented as valid —
+        // the event is created with default source properties.
+        let event: CGEventRef =
+            unsafe { CGEventCreateMouseEvent(std::ptr::null(), event_type, point, cg_button) };
+        post_and_release(event)?;
+        self.last_position = point;
+        Ok(())
+    }
+
+    fn post_mouse_button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
+        if down {
+            if !self.held_buttons.contains(&button) {
+                self.held_buttons.push(button);
+            }
+        } else {
+            self.held_buttons.retain(|&b| b != button);
+        }
         let (event_type, cg_button) = match (button, down) {
             (MouseButton::Left, true) => (K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_MOUSE_BUTTON_LEFT),
             (MouseButton::Left, false) => (K_CG_EVENT_LEFT_MOUSE_UP, K_CG_MOUSE_BUTTON_LEFT),

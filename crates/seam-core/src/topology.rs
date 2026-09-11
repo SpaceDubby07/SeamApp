@@ -182,6 +182,41 @@ pub fn compute_entry_point(local_bounds: Rect, cursor: Point, edge: Edge) -> Edg
     }
 }
 
+/// Places a normalized position (`pos`, `0.0..=1.0`) along `edge` of
+/// `bounds` as a concrete pixel point, landed `inset_px` *inside* that
+/// edge rather than exactly on it — Barrier's `avoidJumpZone` idea (see
+/// [`crate::state`]). `pos` fixes the coordinate *along* the edge; the
+/// inset is the offset *into* the rectangle.
+///
+/// Shared by the driven side's entry warp ([`crate::state`]) and the
+/// driver's authoritative-cursor seed ([`crate::session`]) so the two
+/// ends agree on where a handoff lands with a default configuration.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn place_on_edge(bounds: Rect, edge: Edge, pos: f32, inset_px: i32) -> Point {
+    let along_h = bounds.y + (pos.clamp(0.0, 1.0) * bounds.height as f32) as i32;
+    let along_v = bounds.x + (pos.clamp(0.0, 1.0) * bounds.width as f32) as i32;
+    let (x, y) = match edge {
+        Edge::Left => (bounds.x + inset_px, along_h),
+        Edge::Right => (bounds.right() - inset_px, along_h),
+        Edge::Top => (along_v, bounds.y + inset_px),
+        Edge::Bottom => (along_v, bounds.bottom() - inset_px),
+    };
+    Point { x, y }
+}
+
+/// Clamps `p` to lie within `bounds`, inclusive of the far edge's last
+/// pixel — the same clamp the OS applies to a real cursor at a screen
+/// boundary. Used to keep the driver's accumulated authoritative cursor
+/// ([`crate::session`]) from running off the peer's desktop.
+#[must_use]
+pub fn clamp_point_to_rect(p: Point, bounds: Rect) -> Point {
+    Point {
+        x: p.x.clamp(bounds.x, bounds.right()),
+        y: p.y.clamp(bounds.y, bounds.bottom()),
+    }
+}
+
 /// Returns the edge `cur` is pressed against and still moving into, if any
 /// — the outward handoff trigger (Tier 7.2).
 ///

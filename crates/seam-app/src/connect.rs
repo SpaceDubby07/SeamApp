@@ -183,6 +183,25 @@ async fn bootstrap_session(
         .await
         .map_err(|e| format!("failed to send screen config: {e}"))?;
 
+    // One line naming both ends and how this connection was established.
+    // Seam is peer-to-peer with no fixed server/client — input control
+    // starts LOCAL on both machines and moves with each edge handoff (the
+    // session logs "now DRIVING" / "now BEING DRIVEN" on every change) —
+    // but the connection itself is asymmetric: one side dialled, one
+    // accepted, and only the dialling side auto-reconnects.
+    let how = match &role {
+        Role::Connector { host } => format!("dialled out to {host}"),
+        Role::Listener { .. } => "accepted an inbound connection".to_string(),
+    };
+    tracing::info!(
+        local = %config_snapshot.display_name,
+        local_os = ?CURRENT_OS,
+        peer = %peer_display_name,
+        peer_node = ?peer_node,
+        "session up: this machine ({}) {how}; input control starts LOCAL and moves with edge handoff",
+        config_snapshot.display_name,
+    );
+
     let SessionHandle {
         command_tx,
         mut event_rx,

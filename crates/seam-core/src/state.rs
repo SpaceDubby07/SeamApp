@@ -25,6 +25,20 @@ const HANDOFF_COOLDOWN: Duration = Duration::from_millis(200);
 /// doesn't trigger an accidental handoff (Tier 7.2).
 const DEFAULT_CORNER_DEAD_ZONE_PX: u32 = 20;
 
+/// How far inside the entry edge a handoff lands the cursor by default —
+/// Barrier's `avoidJumpZone`. The driven side warps here
+/// ([`StateMachine::on_received_handoff`]); the driver seeds its
+/// authoritative cursor the same distance in ([`crate::session`]), so with
+/// a default configuration both ends agree on the landing point and
+/// there's no visible correction hop on the first relayed move. Kept equal
+/// to [`DEFAULT_CORNER_DEAD_ZONE_PX`] so the Layout panel's one "edge
+/// margin" control still governs the driven-side inset via
+/// [`StateMachine::entry_inset_px_for`].
+///
+/// Must stay equal to [`DEFAULT_CORNER_DEAD_ZONE_PX`] (a `u32`); a
+/// `debug_assert` in [`StateMachine::new`] guards the two from drifting.
+pub const HANDOFF_ENTRY_INSET_PX: i32 = 20;
+
 /// How far (in pixels) the peer-driven cursor must travel *past its inset
 /// entry point* (see [`StateMachine::entry_inset_px_for`]), inward, before a
 /// push back out through the entry edge counts as "give control back"
@@ -225,6 +239,11 @@ impl StateMachine {
     /// shared canvas used to resolve which peer sits across a given edge.
     #[must_use]
     pub fn new(local_node: NodeId, local_bounds: Rect, layout: Layout) -> Self {
+        debug_assert_eq!(
+            HANDOFF_ENTRY_INSET_PX.cast_unsigned(),
+            DEFAULT_CORNER_DEAD_ZONE_PX,
+            "the driver's authoritative-cursor seed inset must match the driven-side default"
+        );
         let mut sm = Self {
             state: State::Disconnected,
             local_node,
@@ -637,10 +656,6 @@ impl StateMachine {
         }
     }
 
-    // Screen coordinates never approach the range where an f32 mantissa or
-    // an i32 truncation would matter — see the equivalent allow on
-    // `compute_entry_point` in topology.rs.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn on_received_handoff(&mut self, from: NodeId, entry: EdgePoint) -> Vec<Action> {
         self.state = State::BeingDriven;
         self.peer = Some(from);
@@ -660,16 +675,7 @@ impl StateMachine {
         // `entry_inset_px_for`). `pos` still fixes the coordinate *along* the
         // edge; the inset is the offset *into* the screen.
         let inset = self.entry_inset_px_for(bounds);
-        let along_h = bounds.y + (entry.pos * bounds.height as f32) as i32;
-        let along_v = bounds.x + (entry.pos * bounds.width as f32) as i32;
-        let right = bounds.x + bounds.width.cast_signed() - 1;
-        let bottom = bounds.y + bounds.height.cast_signed() - 1;
-        let (x, y) = match entry.edge {
-            Edge::Left => (bounds.x + inset, along_h),
-            Edge::Right => (right - inset, along_h),
-            Edge::Top => (along_v, bounds.y + inset),
-            Edge::Bottom => (along_v, bottom - inset),
-        };
+        let Point { x, y } = crate::topology::place_on_edge(bounds, entry.edge, entry.pos, inset);
         // Arm the back-out detector fresh: it won't trip until the cursor
         // has travelled `driven_entry_inset + DRIVEN_BACKOUT_ARM_PX` inward
         // from the edge, so residual velocity from the flick that caused
