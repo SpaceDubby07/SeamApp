@@ -917,6 +917,15 @@ impl Session {
                     cur.y += dy;
                     *cur = clamp_point_to_rect(*cur, bounds);
                     self.driving_cursor_dirty = true;
+                    // Per-move; only visible under `RUST_LOG=seam_core=trace`
+                    // or the in-app log export. Mirrors the driven side's
+                    // `driven cursor moved` trace — this is the half of the
+                    // picture that was missing when diagnosing "the cursor
+                    // barely moves": whether a small `driving_cursor` is
+                    // because the captured deltas themselves are tiny (a
+                    // driver-side capture problem) or because the deltas
+                    // are large but something downstream is clamping them.
+                    tracing::trace!(dx, dy, ?cur, "driving cursor moved");
                 } else {
                     // No peer bounds yet (handoff raced ScreenConfig): fall
                     // back to a raw delta relay for this window so motion
