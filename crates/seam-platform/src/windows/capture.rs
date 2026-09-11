@@ -24,27 +24,25 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
-    LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetCursorPos,
-    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
+    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -59,6 +57,23 @@ use super::keycodes::vk_to_keycode;
 /// just as correct as, threading `self` through a raw OS callback pointer
 /// (which the `HOOKPROC` signature has no room for anyway).
 static SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// Center of the PRIMARY display, in virtual-desktop coordinates — where
+/// the suppressed cursor is warped back to after EVERY real move while
+/// driving a peer, not just when it happens to hit a monitor edge. Set
+/// once in `set_suppression(true)`. Mirrors macOS's `ANCHOR_X`/`ANCHOR_Y`
+/// and Barrier's own Windows primary-screen implementation
+/// (`MSWindowsScreen::onMouseMove`'s `warpCursorNoFlush(m_xCenter,
+/// m_yCenter)` on every move while driving a secondary). See
+/// `handle_mouse_move`'s docs for why "warp to a fixed anchor every move"
+/// replaced the earlier "only nudge off an edge once pinned" approach.
+static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
+static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
+/// Half the primary display's width/height, set alongside the anchor —
+/// used by [`is_bogus_delta`] to drop a sample the OS may have clamped
+/// before we saw it (Barrier's `bogusZoneSize` check).
+static HALF_WIDTH: AtomicI32 = AtomicI32::new(0);
+static HALF_HEIGHT: AtomicI32 = AtomicI32::new(0);
 
 /// `GetTickCount()` (ms since boot) when a hook callback last fired.
 /// Compared by the watchdog against [`GetLastInputInfo`]. Written from the
@@ -100,8 +115,9 @@ thread_local! {
     // used to compute `InputEvent::MouseDelta` — `MSLLHOOKSTRUCT` carries
     // no delta field of its own (unlike macOS's `CGEventGetIntegerValueField`
     // with `kCGMouseEventDeltaX/Y`), so this is derived by diffing
-    // consecutive readings instead. See `recenter_if_pinned`'s docs for
-    // why this alone isn't enough once suppressed.
+    // consecutive readings instead. See `handle_mouse_move`'s docs for
+    // why, once suppressed, this alone isn't enough without also warping
+    // the cursor back to a fixed anchor after every move.
     static LAST_REAL_POS: RefCell<Option<POINT>> = const { RefCell::new(None) };
 }
 
@@ -272,6 +288,28 @@ impl InputCapture for Capture {
 
     fn set_suppression(&mut self, suppress: bool) -> Result<(), PlatformError> {
         SUPPRESS.store(suppress, Ordering::SeqCst);
+        if suppress {
+            // SAFETY: `GetSystemMetrics` takes a plain metric index and has
+            // no preconditions. `SM_CXSCREEN`/`SM_CYSCREEN` are the PRIMARY
+            // display's size — its origin is always (0, 0) in Windows'
+            // virtual-desktop coordinate space, so half its size is
+            // directly the anchor point.
+            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            let (cx, cy) = (w / 2, h / 2);
+            ANCHOR_X.store(cx, Ordering::SeqCst);
+            ANCHOR_Y.store(cy, Ordering::SeqCst);
+            HALF_WIDTH.store(cx, Ordering::SeqCst);
+            HALF_HEIGHT.store(cy, Ordering::SeqCst);
+            // SAFETY: `SetCursorPos` takes plain integer coordinates and is
+            // safe to call from any thread (it's a global desktop
+            // operation, not thread-affine) — this runs on the session
+            // thread, not the capture hook thread. The low-level hook
+            // (running on its own thread) sees the resulting `WM_MOUSEMOVE`
+            // as usual and resyncs its own `LAST_REAL_POS` via the
+            // `LLMHF_INJECTED` branch in `handle_mouse_move` — nothing here
+            // touches that thread-local directly.
+            let _ = unsafe { SetCursorPos(cx, cy) };
+        }
         Ok(())
     }
 
@@ -317,29 +355,38 @@ fn forward(event: InputEvent) {
     });
 }
 
-/// Tier 7.2: pulled back off whichever virtual-desktop edge a suppressed
-/// cursor is pinned against, once `recenter_if_pinned` warps it — large
-/// enough that the OS doesn't immediately re-clamp on the very next tiny
-/// real movement, small enough to stay well within any real multi-monitor
-/// layout.
-const RECENTER_MARGIN_PX: i32 = 200;
+/// How close a raw `dx`/`dy` is allowed to get to the distance between
+/// the anchor and the primary screen's edge before it's treated as
+/// possibly clamped and dropped — see [`is_bogus_delta`]. Barrier's own
+/// `bogusZoneSize` (its Windows primary-screen implementation, same
+/// technique).
+const BOGUS_ZONE_PX: i32 = 10;
 
 /// Handles one `WM_MOUSEMOVE`: derives `MouseDelta` from the raw absolute
 /// reading (`MSLLHOOKSTRUCT` carries no delta field of its own, unlike
 /// macOS's `CGEventGetIntegerValueField` with `kCGMouseEventDeltaX/Y`),
-/// and — while suppressed — proactively un-clamps the cursor from
-/// whichever virtual-desktop edge it's pinned against.
+/// and — while suppressed — warps the cursor back to a fixed anchor after
+/// EVERY move, so it never travels far enough to approach any edge in the
+/// first place.
 ///
-/// # Why the recenter warp is needed at all
-/// Once `RemoteActive`, our own cursor sits suppressed at the edge that
-/// triggered the handoff. Windows clamps `MSLLHOOKSTRUCT.pt` to the
-/// virtual desktop's bounds, so once the real cursor is pinned at x=0 (or
-/// any other edge), further real hardware motion in that direction keeps
-/// arriving as `WM_MOUSEMOVE` but with the EXACT SAME `pt` every time —
-/// there is no lower value for the OS to report. Nudging the cursor back
-/// by `RECENTER_MARGIN_PX` gives the OS room to register fresh motion
-/// again, so delta keeps flowing indefinitely in the same direction
-/// rather than dying the instant the edge is reached.
+/// # Why warp to a fixed anchor on every move, not just when pinned
+/// An earlier version of this only nudged the cursor once it was
+/// discovered already pinned against a monitor edge. That is fundamentally
+/// unreliable on a real multi-monitor desktop: measured directly (see the
+/// `windows_suppression_delta_demo` example), an identical physical mouse
+/// sweep captured ~4.6px of motion per sample unsuppressed but only
+/// ~1.1px/sample suppressed, with the single-sample max dropping from 31px
+/// to 7px — sustained real motion was being fragmented by hitting *some*
+/// monitor edge over and over (the previous fix widened which edges
+/// counted as "pinned", which only made recentring fire *more* often).
+///
+/// Warping back to one fixed point far from every edge after every single
+/// move — Barrier's own approach on Windows
+/// (`MSWindowsScreen::onMouseMove`, `warpCursorNoFlush(m_xCenter,
+/// m_yCenter)` whenever driving a peer) and exactly what this crate's
+/// macOS `capture.rs` already does with `ANCHOR_X`/`ANCHOR_Y` — sidesteps
+/// the problem instead of reacting to it: the cursor is essentially never
+/// near an edge to begin with, regardless of monitor count or shape.
 ///
 /// # Why this doesn't fight anything downstream
 /// The warp is filtered from ever becoming a `MouseMoveAbs` reading at all
@@ -350,27 +397,40 @@ const RECENTER_MARGIN_PX: i32 = 200;
 /// can't be mistaken for a reclaim gesture.
 fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
     // `LLMHF_INJECTED` marks an event as having come from `SendInput`/
-    // `SetCursorPos` rather than real hardware — exactly what
-    // `recenter_if_pinned` generates when it warps us. Silently resync the
-    // delta baseline to it and stop: it must never be treated as real
-    // motion, or it would both double-count as a spurious `MouseDelta` and
-    // look like a false reclaim gesture.
+    // `SetCursorPos` rather than real hardware — exactly what the anchor
+    // warp below generates. Silently resync the delta baseline to it and
+    // stop: it must never be treated as real motion, or it would both
+    // double-count as a spurious `MouseDelta` and look like a false
+    // reclaim gesture.
     if (info.flags & LLMHF_INJECTED) != 0 {
         LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(info.pt));
         return None;
     }
 
     let previous = LAST_REAL_POS.with(|cell| cell.borrow_mut().replace(info.pt));
+    let suppressed = SUPPRESS.load(Ordering::SeqCst);
     if let Some(previous) = previous {
         let dx = info.pt.x - previous.x;
         let dy = info.pt.y - previous.y;
-        if dx != 0 || dy != 0 {
+        // While suppressed, `previous` is always the anchor (the warp
+        // below runs after every real move), so this delta measures
+        // straight from the anchor — exactly the quantity `is_bogus_delta`
+        // is calibrated against.
+        if (dx != 0 || dy != 0) && !(suppressed && is_bogus_delta(dx, dy)) {
             forward(InputEvent::MouseDelta { dx, dy });
         }
     }
 
-    if SUPPRESS.load(Ordering::SeqCst) {
-        recenter_if_pinned(info.pt);
+    if suppressed {
+        let (ax, ay) = (
+            ANCHOR_X.load(Ordering::SeqCst),
+            ANCHOR_Y.load(Ordering::SeqCst),
+        );
+        // SAFETY: `SetCursorPos` takes plain integer coordinates; the
+        // resulting synthetic `WM_MOUSEMOVE` is what the `LLMHF_INJECTED`
+        // branch above filters, resyncing `LAST_REAL_POS` to the anchor
+        // for the next sample.
+        let _ = unsafe { SetCursorPos(ax, ay) };
     }
 
     Some(InputEvent::MouseMoveAbs {
@@ -379,67 +439,17 @@ fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
     })
 }
 
-/// Warps the cursor `RECENTER_MARGIN_PX` off whichever edge of ITS OWN
-/// monitor `pt` is currently pinned against. See `handle_mouse_move`'s
-/// docs for why this exists and why it's safe against feedback loops/
-/// false reclaims.
-///
-/// This checks the specific monitor `pt` is on (`MonitorFromPoint`), NOT
-/// just the outer bounding box of the whole virtual desktop
-/// (`SM_XVIRTUALSCREEN` et al — the original implementation). A
-/// multi-monitor layout is usually non-rectangular (a portrait monitor
-/// beside a taller landscape one, monitors of different heights, …), and
-/// Windows clamps the real cursor at ANY monitor edge it hits, including
-/// internal ones the bounding box never touches — push into one of those
-/// "notches" and the cursor sticks there exactly like it does at the true
-/// outer edge. Checking only the bounding box meant a cursor pinned at an
-/// internal edge was never recognized as pinned and never recentred:
-/// `pt` then stops changing across consecutive `WM_MOUSEMOVE` samples, so
-/// `handle_mouse_move` computes `dx = dy = 0` and captures NOTHING —
-/// sustained real motion in that direction silently vanished rather than
-/// being relayed as a delta (the "moving the mouse a lot but the driven
-/// cursor barely moves" bug).
-fn recenter_if_pinned(pt: POINT) {
-    // SAFETY: `MonitorFromPoint` takes a plain point value and a flags
-    // enum; it always returns a valid handle (falling back to the
-    // primary monitor) when asked for the nearest one, so it can't fail
-    // on a point that's technically outside every monitor (a notch).
-    let hmonitor = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: u32::try_from(size_of::<MONITORINFO>()).expect("MONITORINFO size fits in u32"),
-        ..Default::default()
-    };
-    // SAFETY: `info.cbSize` is set as `GetMonitorInfoW` requires, and
-    // `hmonitor` was just obtained above and is valid for this call.
-    if !unsafe { GetMonitorInfoW(hmonitor, &raw mut info) }.as_bool() {
-        return;
-    }
-    let rc = info.rcMonitor;
-
-    let mut target = pt;
-    let mut pinned = false;
-    if pt.x <= rc.left {
-        target.x = rc.left + RECENTER_MARGIN_PX;
-        pinned = true;
-    } else if pt.x >= rc.right - 1 {
-        target.x = rc.right - 1 - RECENTER_MARGIN_PX;
-        pinned = true;
-    }
-    if pt.y <= rc.top {
-        target.y = rc.top + RECENTER_MARGIN_PX;
-        pinned = true;
-    } else if pt.y >= rc.bottom - 1 {
-        target.y = rc.bottom - 1 - RECENTER_MARGIN_PX;
-        pinned = true;
-    }
-
-    if pinned {
-        // SAFETY: `SetCursorPos` takes plain integer coordinates; the
-        // resulting synthetic `WM_MOUSEMOVE` is what `handle_mouse_move`
-        // filters via `LLMHF_INJECTED` above.
-        let _ = unsafe { SetCursorPos(target.x, target.y) };
-        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(target));
-    }
+/// While suppressed, `dx`/`dy` are measured from the fixed anchor (see
+/// `handle_mouse_move`). If either component is within [`BOGUS_ZONE_PX`]
+/// of the distance from the anchor to the primary screen's edge, the
+/// physical motion may have been larger than reported — the OS clamps the
+/// cursor at the real screen edge before our hook ever sees it, so a
+/// single very fast flick can under-report. Barrier's own
+/// `bogusZoneSize` check on the same primary-screen-center technique.
+fn is_bogus_delta(dx: i32, dy: i32) -> bool {
+    let half_width = HALF_WIDTH.load(Ordering::SeqCst);
+    let half_height = HALF_HEIGHT.load(Ordering::SeqCst);
+    dx.abs() + BOGUS_ZONE_PX > half_width || dy.abs() + BOGUS_ZONE_PX > half_height
 }
 
 /// One watchdog tick (runs on the pump thread, off `WM_TIMER`). If the
