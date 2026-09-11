@@ -54,6 +54,23 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 /// which is minutes. Three missed [`PING_INTERVAL`] heartbeats.
 const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Upper bound on how many extra capture events `run`'s coalescing drain
+/// consumes in one pass before forcing a flush and yielding back to
+/// `select!`.
+///
+/// A real mouse sustains hundreds of samples per second; under continuous
+/// motion a plain `while let Ok(event) = capture_rx.try_recv()` almost
+/// never sees `Empty`, so it never exits — `flush_driving_cursor` never
+/// runs and every OTHER `select!` branch (pings, peer messages) starves
+/// for as long as the mouse keeps moving. That reproduced as: the driven
+/// machine's cursor frozen for over a second while the driver's own
+/// heartbeat pongs went silent, then the entire backlog landing as one
+/// giant coalesced jump the instant the mouse paused — which promptly
+/// crossed back through the entry edge and reclaimed control. Capping the
+/// batch guarantees a flush + a trip back through every other branch at
+/// least this often, no matter how fast the input is.
+const MAX_CAPTURE_COALESCE_BATCH: u32 = 32;
+
 /// An accepted `ClipboardContent::ImageOffer` awaiting its matching
 /// `BulkMessage::ClipboardBlob`. Only one can be outstanding at a time — a
 /// newer offer simply replaces it, matching the "ignore anything not the
@@ -673,14 +690,20 @@ impl Session {
                         return Ok(());
                     };
                     self.process_capture_event(event).await?;
-                    // Coalesce: fold every already-queued capture event into
-                    // the state machine / authoritative driving cursor before
-                    // relaying anything, so a burst of mouse motion becomes a
-                    // single `MouseMove` rather than one send per HID sample
-                    // (the old per-sample relay was a chunk of the perceived
-                    // lag while driving).
-                    while let Ok(event) = self.capture_rx.try_recv() {
-                        self.process_capture_event(event).await?;
+                    // Coalesce: fold already-queued capture events into the
+                    // state machine / authoritative driving cursor before
+                    // relaying anything, so a burst of mouse motion becomes
+                    // one `MouseMove` rather than one send per HID sample
+                    // (the old per-sample relay was a chunk of the
+                    // perceived lag while driving). Capped at
+                    // `MAX_CAPTURE_COALESCE_BATCH` — see its docs — so
+                    // continuous real motion can't monopolize this loop and
+                    // starve every other `select!` branch indefinitely.
+                    for _ in 0..MAX_CAPTURE_COALESCE_BATCH {
+                        match self.capture_rx.try_recv() {
+                            Ok(event) => self.process_capture_event(event).await?,
+                            Err(_) => break,
+                        }
                     }
                     self.flush_driving_cursor().await?;
                 }
