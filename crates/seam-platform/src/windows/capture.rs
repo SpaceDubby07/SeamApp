@@ -23,26 +23,28 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
-    WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
+    LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetCursorPos,
+    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -377,36 +379,57 @@ fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
     })
 }
 
-/// Warps the cursor `RECENTER_MARGIN_PX` off any virtual-desktop edge
-/// `pt` is currently pinned against. See `handle_mouse_move`'s docs for
-/// why this exists and why it's safe against feedback loops/false
-/// reclaims.
+/// Warps the cursor `RECENTER_MARGIN_PX` off whichever edge of ITS OWN
+/// monitor `pt` is currently pinned against. See `handle_mouse_move`'s
+/// docs for why this exists and why it's safe against feedback loops/
+/// false reclaims.
+///
+/// This checks the specific monitor `pt` is on (`MonitorFromPoint`), NOT
+/// just the outer bounding box of the whole virtual desktop
+/// (`SM_XVIRTUALSCREEN` et al — the original implementation). A
+/// multi-monitor layout is usually non-rectangular (a portrait monitor
+/// beside a taller landscape one, monitors of different heights, …), and
+/// Windows clamps the real cursor at ANY monitor edge it hits, including
+/// internal ones the bounding box never touches — push into one of those
+/// "notches" and the cursor sticks there exactly like it does at the true
+/// outer edge. Checking only the bounding box meant a cursor pinned at an
+/// internal edge was never recognized as pinned and never recentred:
+/// `pt` then stops changing across consecutive `WM_MOUSEMOVE` samples, so
+/// `handle_mouse_move` computes `dx = dy = 0` and captures NOTHING —
+/// sustained real motion in that direction silently vanished rather than
+/// being relayed as a delta (the "moving the mouse a lot but the driven
+/// cursor barely moves" bug).
 fn recenter_if_pinned(pt: POINT) {
-    // SAFETY: `GetSystemMetrics` takes a plain metric index and has no
-    // preconditions.
-    let (left, top, width, height) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
+    // SAFETY: `MonitorFromPoint` takes a plain point value and a flags
+    // enum; it always returns a valid handle (falling back to the
+    // primary monitor) when asked for the nearest one, so it can't fail
+    // on a point that's technically outside every monitor (a notch).
+    let hmonitor = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(size_of::<MONITORINFO>()).expect("MONITORINFO size fits in u32"),
+        ..Default::default()
     };
+    // SAFETY: `info.cbSize` is set as `GetMonitorInfoW` requires, and
+    // `hmonitor` was just obtained above and is valid for this call.
+    if !unsafe { GetMonitorInfoW(hmonitor, &raw mut info) }.as_bool() {
+        return;
+    }
+    let rc = info.rcMonitor;
 
     let mut target = pt;
     let mut pinned = false;
-    if pt.x <= left {
-        target.x = left + RECENTER_MARGIN_PX;
+    if pt.x <= rc.left {
+        target.x = rc.left + RECENTER_MARGIN_PX;
         pinned = true;
-    } else if pt.x >= left + width - 1 {
-        target.x = left + width - 1 - RECENTER_MARGIN_PX;
+    } else if pt.x >= rc.right - 1 {
+        target.x = rc.right - 1 - RECENTER_MARGIN_PX;
         pinned = true;
     }
-    if pt.y <= top {
-        target.y = top + RECENTER_MARGIN_PX;
+    if pt.y <= rc.top {
+        target.y = rc.top + RECENTER_MARGIN_PX;
         pinned = true;
-    } else if pt.y >= top + height - 1 {
-        target.y = top + height - 1 - RECENTER_MARGIN_PX;
+    } else if pt.y >= rc.bottom - 1 {
+        target.y = rc.bottom - 1 - RECENTER_MARGIN_PX;
         pinned = true;
     }
 
