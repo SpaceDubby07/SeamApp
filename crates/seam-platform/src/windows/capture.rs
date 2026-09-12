@@ -200,7 +200,7 @@ impl InputCapture for Capture {
 
         let handle = std::thread::Builder::new()
             .name("seam-input-capture".into())
-            .spawn(move || capture_thread_main(sink, ready_tx))
+            .spawn(move || capture_thread_main(sink, &ready_tx))
             .map_err(|e| PlatformError::HookRegistrationFailed(e.to_string()))?;
 
         match ready_rx.recv() {
@@ -299,7 +299,7 @@ impl Drop for Capture {
 /// reasoning are unchanged from when this lived inline in the closure.
 fn capture_thread_main(
     sink: UnboundedSender<InputEvent>,
-    ready_tx: std_mpsc::Sender<Result<u32, String>>,
+    ready_tx: &std_mpsc::Sender<Result<u32, String>>,
 ) {
     SINK.with(|cell| *cell.borrow_mut() = Some(sink));
 
