@@ -1944,6 +1944,14 @@ impl Session {
                 } else {
                     InputEvent::KeyUp { code }
                 };
+                // Diagnostic: pairs with the sender-side log on
+                // `Action::SendModifierState` — shows exactly which
+                // modifier keys this machine actually injects in response,
+                // post-remap, to catch an unwanted combo (e.g. Ctrl+Alt+
+                // Shift triggering Windows/Microsoft 365's global launcher)
+                // landing here even when the peer only ever intended plain
+                // mouse motion.
+                tracing::debug!(?event, was_down, now_down, "injecting modifier change");
                 self.sink.inject(&event)?;
             }
         }
@@ -1962,6 +1970,13 @@ impl Session {
     async fn execute_action(&mut self, action: Action) -> Result<(), SessionError> {
         match action {
             Action::SendModifierState(mods) => {
+                // Diagnostic: this fires on every Handoff/Reclaim (Tier
+                // 7.1's non-negotiable rule) — logging the actual snapshot
+                // lets us see directly whether a modifier is stuck "held"
+                // that shouldn't be, e.g. reproducing the Ctrl+Alt+Shift /
+                // Microsoft 365 "Office key" launcher interaction already
+                // documented on `Hotkey::default`.
+                tracing::debug!(?mods, "sending modifier state to peer");
                 self.control
                     .send(&ControlMessage::ModifierState { mods })
                     .await?;
