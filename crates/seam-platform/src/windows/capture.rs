@@ -186,6 +186,12 @@ impl InputCapture for Capture {
                     (Ok(m), Ok(k)) => {
                         MOUSE_HOOK.with(|c| *c.borrow_mut() = Some(m));
                         KEYBOARD_HOOK.with(|c| *c.borrow_mut() = Some(k));
+                        // Diagnostic: confirms both hooks actually installed
+                        // (as opposed to a keyboard-specific block by AV/EDR
+                        // software that a bare Ok(HHOOK) from
+                        // SetWindowsHookExW wouldn't otherwise reveal at
+                        // keypress time).
+                        tracing::info!("low-level mouse + keyboard hooks installed");
                     }
                     (m, k) => {
                         // Clean up whichever one *did* register before
@@ -730,6 +736,11 @@ unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
         // to fit u32 even though it's widened to usize on 64-bit targets.
         let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
         let code = resolve_keycode(info);
+        // Diagnostic: proves the hook is actually firing for this key at
+        // all, independent of whether it gets forwarded/relayed — isolates
+        // "hook never sees it" (nothing logged here) from "hook sees it but
+        // something downstream drops it" (this logs, nothing later does).
+        tracing::debug!(vk = info.vkCode, msg, ?code, "keyboard_proc fired");
 
         match msg {
             WM_KEYDOWN | WM_SYSKEYDOWN => {
