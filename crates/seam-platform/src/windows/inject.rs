@@ -6,6 +6,9 @@ use seam_core::error::PlatformError;
 use seam_core::protocol::{InputEvent, KeyCode, MouseButton};
 use seam_core::traits::InputSink;
 
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
@@ -80,6 +83,29 @@ impl InputSink for Sink {
         ] {
             send_key(code, true)?;
         }
+        Ok(())
+    }
+
+    /// Barrier's own fix for this exact failure mode
+    /// (`ArchMiscWindows::addBusyState`/`kSYSTEM`, `MSWindowsScreen::enable`/
+    /// `disable`): a machine that's only receiving synthetic (injected)
+    /// input has no real local HID activity of its own to keep the system
+    /// idle timer fresh, and once it sleeps, injected input can't wake it
+    /// back up remotely. `ES_CONTINUOUS` makes the state persist until the
+    /// next call (rather than being a one-shot idle-timer reset);
+    /// `ES_SYSTEM_REQUIRED` blocks idle sleep, `ES_DISPLAY_REQUIRED` blocks
+    /// the display from turning off too — Barrier's `kSYSTEM | kDISPLAY`.
+    /// Calling with just `ES_CONTINUOUS` (no other flags) is the documented
+    /// way to release the override and return to normal power management.
+    fn set_being_driven(&mut self, being_driven: bool) -> Result<(), PlatformError> {
+        let flags = if being_driven {
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        } else {
+            ES_CONTINUOUS
+        };
+        // SAFETY: `SetThreadExecutionState` takes a plain flags value with
+        // no preconditions.
+        unsafe { SetThreadExecutionState(flags) };
         Ok(())
     }
 }

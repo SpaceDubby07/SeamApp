@@ -90,6 +90,11 @@ impl InputSink for Sink {
         }
         Ok(())
     }
+
+    fn set_being_driven(&mut self, being_driven: bool) -> Result<(), PlatformError> {
+        super::power::set_being_driven(being_driven);
+        Ok(())
+    }
 }
 
 impl Sink {

@@ -13,6 +13,7 @@ mod clipboard;
 mod inject;
 mod keycodes;
 mod permissions;
+mod power;
 mod screens;
 
 pub use capture::Capture;

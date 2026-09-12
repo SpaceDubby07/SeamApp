@@ -155,6 +155,11 @@ pub enum Action {
     /// Release all locally-held modifier keys
     /// (`InputSink::release_all_modifiers`).
     ReleaseAllModifiers,
+    /// Entering (`true`) or leaving (`false`) `BeingDriven`
+    /// (`InputSink::set_being_driven`) — holds/releases an OS-level
+    /// stay-awake assertion, since a machine receiving nothing but
+    /// synthetic input can't be woken back up remotely once it sleeps.
+    SetBeingDriven(bool),
     /// Warp the local cursor to this position (`InputSink::warp_cursor`).
     WarpCursor {
         /// Target X coordinate.
@@ -487,7 +492,11 @@ impl StateMachine {
         self.state = State::LocalActive;
         self.peer = None;
         self.clear_driven_tracking();
-        vec![Action::SendReleaseBack, Action::ReleaseAllModifiers]
+        vec![
+            Action::SendReleaseBack,
+            Action::ReleaseAllModifiers,
+            Action::SetBeingDriven(false),
+        ]
     }
 
     /// The rectangle back-out detection runs against while `BeingDriven`
@@ -636,7 +645,11 @@ impl StateMachine {
                 self.state = State::LocalActive;
                 self.peer = None;
                 self.clear_driven_tracking();
-                vec![Action::SendEmergencyRelease, Action::ReleaseAllModifiers]
+                vec![
+                    Action::SendEmergencyRelease,
+                    Action::ReleaseAllModifiers,
+                    Action::SetBeingDriven(false),
+                ]
             }
             State::LocalActive | State::Disconnected | State::Locked => Vec::new(),
         }
@@ -685,7 +698,7 @@ impl StateMachine {
         self.driven_entry_inset = inset;
         self.last_driven_cursor = Some(Point { x, y });
         self.driven_backout_armed = false;
-        vec![Action::WarpCursor { x, y }]
+        vec![Action::WarpCursor { x, y }, Action::SetBeingDriven(true)]
     }
 
     fn on_received_reclaim(&mut self) -> Vec<Action> {
@@ -695,16 +708,21 @@ impl StateMachine {
         self.state = State::LocalActive;
         self.peer = None;
         self.clear_driven_tracking();
-        vec![Action::ReleaseAllModifiers]
+        vec![Action::ReleaseAllModifiers, Action::SetBeingDriven(false)]
     }
 
     fn on_emergency_release(&mut self) -> Vec<Action> {
         match self.state {
             State::RemoteActive | State::BeingDriven => {
+                let was_being_driven = self.state == State::BeingDriven;
                 self.state = State::LocalActive;
                 self.peer = None;
                 self.clear_driven_tracking();
-                vec![Action::SetSuppression(false), Action::ReleaseAllModifiers]
+                let mut actions = vec![Action::SetSuppression(false), Action::ReleaseAllModifiers];
+                if was_being_driven {
+                    actions.push(Action::SetBeingDriven(false));
+                }
+                actions
             }
             State::LocalActive | State::Disconnected | State::Locked => Vec::new(),
         }
@@ -715,6 +733,7 @@ impl StateMachine {
             return Vec::new();
         }
         let was_active_or_driven = matches!(self.state, State::RemoteActive | State::BeingDriven);
+        let was_being_driven = self.state == State::BeingDriven;
         self.state = State::Disconnected;
         self.peer = None;
         self.clear_driven_tracking();
@@ -723,6 +742,9 @@ impl StateMachine {
         if was_active_or_driven {
             actions.push(Action::SetSuppression(false));
             actions.push(Action::ReleaseAllModifiers);
+        }
+        if was_being_driven {
+            actions.push(Action::SetBeingDriven(false));
         }
         actions.push(Action::StartReconnect);
         actions
@@ -737,15 +759,19 @@ impl StateMachine {
             return Vec::new();
         }
         let was_active_or_driven = matches!(self.state, State::RemoteActive | State::BeingDriven);
+        let was_being_driven = self.state == State::BeingDriven;
         self.state = State::Disconnected;
         self.peer = None;
         self.clear_driven_tracking();
 
-        if was_active_or_driven {
-            vec![Action::SetSuppression(false), Action::ReleaseAllModifiers]
-        } else {
-            Vec::new()
+        if !was_active_or_driven {
+            return Vec::new();
         }
+        let mut actions = vec![Action::SetSuppression(false), Action::ReleaseAllModifiers];
+        if was_being_driven {
+            actions.push(Action::SetBeingDriven(false));
+        }
+        actions
     }
 }
 
@@ -852,6 +878,11 @@ mod tests {
                 actions.contains(&Action::SetSuppression(false)),
                 "state {state:?} failed to disable suppression on disconnect"
             );
+            assert_eq!(
+                actions.contains(&Action::SetBeingDriven(false)),
+                state == State::BeingDriven,
+                "SetBeingDriven(false) must fire iff we were actually BeingDriven, state {state:?}"
+            );
             assert!(actions.contains(&Action::StartReconnect));
         }
     }
@@ -872,6 +903,11 @@ mod tests {
             assert!(
                 actions.contains(&Action::SetSuppression(false)),
                 "state {state:?} failed to disable suppression on shutdown"
+            );
+            assert_eq!(
+                actions.contains(&Action::SetBeingDriven(false)),
+                state == State::BeingDriven,
+                "SetBeingDriven(false) must fire iff we were actually BeingDriven, state {state:?}"
             );
             assert!(
                 !actions.contains(&Action::StartReconnect),
@@ -910,6 +946,7 @@ mod tests {
 
         assert_eq!(sm.state(), State::LocalActive);
         assert!(actions.contains(&Action::ReleaseAllModifiers));
+        assert!(actions.contains(&Action::SetBeingDriven(false)));
     }
 
     #[test]
@@ -943,6 +980,7 @@ mod tests {
                 y: (0.25 * 1080.0) as i32
             }
         );
+        assert!(actions.contains(&Action::SetBeingDriven(true)));
     }
 
     #[test]
@@ -1092,6 +1130,7 @@ mod tests {
 
         assert_eq!(sm.state(), State::LocalActive);
         assert!(actions.contains(&Action::ReleaseAllModifiers));
+        assert!(actions.contains(&Action::SetBeingDriven(false)));
     }
 
     #[test]
@@ -1115,6 +1154,11 @@ mod tests {
 
             assert_eq!(sm.state(), State::LocalActive, "state was {state:?}");
             assert!(actions.contains(&Action::ReleaseAllModifiers));
+            assert_eq!(
+                actions.contains(&Action::SetBeingDriven(false)),
+                state == State::BeingDriven,
+                "SetBeingDriven(false) must fire iff we were actually BeingDriven, state {state:?}"
+            );
         }
     }
 
@@ -1236,6 +1280,7 @@ mod tests {
         assert_eq!(sm.state(), State::LocalActive);
         assert!(actions.contains(&Action::SendReleaseBack));
         assert!(actions.contains(&Action::ReleaseAllModifiers));
+        assert!(actions.contains(&Action::SetBeingDriven(false)));
     }
 
     #[test]

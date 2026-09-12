@@ -2028,6 +2028,9 @@ impl Session {
                 self.sink.release_all_modifiers()?;
                 self.injected_modifiers = Modifiers::default();
             }
+            Action::SetBeingDriven(being_driven) => {
+                self.sink.set_being_driven(being_driven)?;
+            }
             Action::WarpCursor { x, y } => {
                 self.sink.warp_cursor(x, y)?;
                 // A warp issued while `BeingDriven` is the peer placing
@@ -2239,6 +2242,7 @@ mod tests {
         injected: Arc<Mutex<Vec<InputEvent>>>,
         warps: Arc<Mutex<Vec<(i32, i32)>>>,
         releases: Arc<Mutex<u32>>,
+        being_driven_calls: Arc<Mutex<Vec<bool>>>,
     }
 
     impl InputSink for RecordingSink {
@@ -2252,6 +2256,13 @@ mod tests {
         }
         fn release_all_modifiers(&mut self) -> Result<(), PlatformError> {
             *self.releases.lock().expect("mutex poisoned") += 1;
+            Ok(())
+        }
+        fn set_being_driven(&mut self, being_driven: bool) -> Result<(), PlatformError> {
+            self.being_driven_calls
+                .lock()
+                .expect("mutex poisoned")
+                .push(being_driven);
             Ok(())
         }
     }

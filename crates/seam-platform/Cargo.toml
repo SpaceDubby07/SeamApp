@@ -27,6 +27,7 @@ windows = { version = "0.60", features = [
     "Win32_System_Memory",             # GlobalAlloc/GlobalLock for clipboard payloads
     "Win32_System_Ole",                # CF_UNICODETEXT and friends
     "Win32_System_LibraryLoader",      # GetModuleHandleW, for registering the message-only window class
+    "Win32_System_Power",              # SetThreadExecutionState, to stop this machine sleeping while being driven
 ] }
 
 # macOS — see Tier 5.4 of the build guide. M1/M5's capture/inject/screens/

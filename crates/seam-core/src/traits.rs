@@ -72,6 +72,28 @@ pub trait InputSink: Send + 'static {
     /// Returns an error if the OS rejects one of the synthetic key-up
     /// events.
     fn release_all_modifiers(&mut self) -> Result<(), PlatformError>;
+
+    /// Tells the platform layer whether this machine is currently
+    /// `BeingDriven` — called once on entry (`true`) and once on every exit
+    /// (`false`), mirroring `release_all_modifiers`'s own call sites.
+    ///
+    /// A machine that's `BeingDriven` receives nothing but synthetic
+    /// (injected) input — it has no real local HID activity of its own to
+    /// keep its idle timer fresh. If it goes to sleep or the screen locks,
+    /// injected input can't wake it back up remotely: the session is dead
+    /// until someone physically touches it. Implementations should hold
+    /// whatever OS-level "stay awake" assertion is available while `true`
+    /// (Windows: `SetThreadExecutionState`; macOS:
+    /// `IOPMAssertionCreateWithName`) and release it on `false`. Barrier's
+    /// own fix for this exact failure mode
+    /// (`ArchMiscWindows::addBusyState`/`kSYSTEM`, Windows-only) is the
+    /// reference for why this exists — ported to both platforms here since
+    /// either machine can end up on the driven side.
+    ///
+    /// # Errors
+    /// Returns an error if the OS rejects the assertion. Best-effort:
+    /// callers should log rather than abort a session over this failing.
+    fn set_being_driven(&mut self, being_driven: bool) -> Result<(), PlatformError>;
 }
 
 /// Watches and sets the system clipboard.
@@ -198,6 +220,10 @@ mod tests {
         }
 
         fn release_all_modifiers(&mut self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn set_being_driven(&mut self, _being_driven: bool) -> Result<(), PlatformError> {
             Ok(())
         }
     }
