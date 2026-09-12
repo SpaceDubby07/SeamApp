@@ -200,163 +200,7 @@ impl InputCapture for Capture {
 
         let handle = std::thread::Builder::new()
             .name("seam-input-capture".into())
-            .spawn(move || {
-                SINK.with(|cell| *cell.borrow_mut() = Some(sink));
-
-                // SAFETY: `mouse_proc`/`keyboard_proc` are `extern "system"`
-                // functions matching the exact signature `SetWindowsHookExW`
-                // requires. We pass `None` for `hmod` because both hooks are
-                // installed for this process on this thread with no DLL
-                // module to load, which is the documented combination for
-                // WH_MOUSE_LL/WH_KEYBOARD_LL.
-                let mouse_hook =
-                    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) };
-                // SAFETY: same reasoning as the mouse hook above.
-                let keyboard_hook =
-                    unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
-
-                match (mouse_hook, keyboard_hook) {
-                    (Ok(m), Ok(k)) => {
-                        MOUSE_HOOK.with(|c| *c.borrow_mut() = Some(m));
-                        KEYBOARD_HOOK.with(|c| *c.borrow_mut() = Some(k));
-                        // Diagnostic: confirms both hooks actually installed
-                        // (as opposed to a keyboard-specific block by AV/EDR
-                        // software that a bare Ok(HHOOK) from
-                        // SetWindowsHookExW wouldn't otherwise reveal at
-                        // keypress time).
-                        tracing::info!("low-level mouse + keyboard hooks installed");
-
-                        // Raw Input keyboard registration is a soft
-                        // dependency: mouse capture (and keyboard
-                        // suppression, via the hook above) must not fail
-                        // just because this couldn't be set up. On failure
-                        // we log and carry on — regular-key detection
-                        // degrades to whatever `keyboard_proc` alone can
-                        // see (modifiers, per the investigation in
-                        // `register_raw_keyboard`'s docs), rather than
-                        // losing mouse capture too.
-                        match create_message_window() {
-                            Ok(hwnd) => {
-                                if let Err(reason) = register_raw_keyboard(hwnd) {
-                                    tracing::warn!(
-                                        reason,
-                                        "raw input keyboard registration failed; falling back to \
-                                         WH_KEYBOARD_LL alone"
-                                    );
-                                    // SAFETY: `hwnd` was just created above
-                                    // and nothing else references it yet.
-                                    unsafe {
-                                        let _ = DestroyWindow(hwnd);
-                                    }
-                                } else {
-                                    RAW_INPUT_HWND.with(|c| *c.borrow_mut() = Some(hwnd));
-                                }
-                            }
-                            Err(reason) => {
-                                tracing::warn!(
-                                    reason,
-                                    "creating the raw input message window failed; falling back \
-                                     to WH_KEYBOARD_LL alone"
-                                );
-                            }
-                        }
-                    }
-                    (m, k) => {
-                        // Clean up whichever one *did* register before
-                        // reporting failure.
-                        if let Ok(m) = m {
-                            // SAFETY: `m` was just returned by a successful
-                            // SetWindowsHookExW call above and hasn't been
-                            // unhooked yet.
-                            let _ = unsafe { UnhookWindowsHookEx(m) };
-                        }
-                        if let Ok(k) = k {
-                            // SAFETY: same as above, for the keyboard hook.
-                            let _ = unsafe { UnhookWindowsHookEx(k) };
-                        }
-                        let _ = ready_tx.send(Err(
-                            "SetWindowsHookExW failed for one or both hooks — is this running \
-                             interactively (not as a service)?"
-                                .to_string(),
-                        ));
-                        SINK.with(|cell| *cell.borrow_mut() = None);
-                        return;
-                    }
-                }
-
-                // Seed the watchdog baseline so a tick before any real
-                // input doesn't read as a miss, and start its timer.
-                // SAFETY: `GetTickCount` has no preconditions.
-                LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
-                // SAFETY: a null `hwnd` + null `TIMERPROC` posts plain
-                // `WM_TIMER` messages to this thread's queue, retrieved by
-                // the `GetMessageW` loop below; the id is arbitrary.
-                unsafe { SetTimer(None, WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None) };
-
-                // SAFETY: `GetCurrentThreadId` has no preconditions.
-                let thread_id = unsafe { GetCurrentThreadId() };
-                let _ = ready_tx.send(Ok(thread_id));
-
-                // Message pump. Low-level hooks are only delivered while
-                // this thread is pumping messages — this loop IS the
-                // capture, not just bookkeeping. `GetMessageW` blocks until
-                // a message (including our own WM_QUIT from `stop()`, the
-                // watchdog's `WM_TIMER`, and `mouse_proc`'s deferred
-                // `MOUSE_MOVE_MSG`/`PRE_WARP_MSG`) arrives.
-                let mut msg = MSG::default();
-                // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
-                // fills in; `None, 0, 0` means "any message for this
-                // thread".
-                while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
-                    if msg.message == WM_TIMER && msg.wParam.0 == WATCHDOG_TIMER_ID {
-                        watchdog_tick();
-                        continue;
-                    }
-                    if msg.message == MOUSE_MOVE_MSG {
-                        let (x, y) = unpack_point(msg.wParam, msg.lParam);
-                        handle_mouse_move(x, y);
-                        continue;
-                    }
-                    if msg.message == PRE_WARP_MSG {
-                        // Save the warp target as the new delta baseline —
-                        // Barrier's `saveMousePosition` inside its own
-                        // `BARRIER_MSG_PRE_WARP` handler
-                        // (`MSWindowsScreen.cpp:997`) — then fence off
-                        // everything up to the matching `POST_WARP_MSG`.
-                        let (x, y) = unpack_point(msg.wParam, msg.lParam);
-                        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(POINT { x, y }));
-                        discard_until_post_warp();
-                        continue;
-                    }
-                    if msg.message == POST_WARP_MSG {
-                        tracing::warn!("unmatched POST_WARP_MSG on the capture pump thread");
-                        continue;
-                    }
-                    // SAFETY: `msg` was just populated by GetMessageW above.
-                    unsafe {
-                        let _ = TranslateMessage(&raw const msg);
-                        DispatchMessageW(&raw const msg);
-                    }
-                }
-
-                // SAFETY: `None` id-matches the timer set with a null hwnd
-                // above; the hooks in the thread-locals are whatever the
-                // watchdog last installed (or the originals) and are live.
-                unsafe {
-                    let _ = KillTimer(None, WATCHDOG_TIMER_ID);
-                    if let Some(m) = MOUSE_HOOK.with(|c| c.borrow_mut().take()) {
-                        let _ = UnhookWindowsHookEx(m);
-                    }
-                    if let Some(k) = KEYBOARD_HOOK.with(|c| c.borrow_mut().take()) {
-                        let _ = UnhookWindowsHookEx(k);
-                    }
-                    if let Some(hwnd) = RAW_INPUT_HWND.with(|c| c.borrow_mut().take()) {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                }
-                SINK.with(|cell| *cell.borrow_mut() = None);
-                HELD_KEYS.with(|cell| cell.borrow_mut().clear());
-            })
+            .spawn(move || capture_thread_main(sink, ready_tx))
             .map_err(|e| PlatformError::HookRegistrationFailed(e.to_string()))?;
 
         match ready_rx.recv() {
@@ -445,6 +289,171 @@ impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+/// Body of the dedicated capture thread spawned by `Capture::start`: installs
+/// the low-level hooks and (best-effort) Raw Input registration, seeds and
+/// arms the watchdog, then runs the `GetMessageW` pump until `stop()` posts
+/// `WM_QUIT`. Pulled out of `start` itself only to keep that function's line
+/// count under clippy's `too_many_lines` — the logic and its `SAFETY`
+/// reasoning are unchanged from when this lived inline in the closure.
+fn capture_thread_main(
+    sink: UnboundedSender<InputEvent>,
+    ready_tx: std_mpsc::Sender<Result<u32, String>>,
+) {
+    SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+
+    // SAFETY: `mouse_proc`/`keyboard_proc` are `extern "system"`
+    // functions matching the exact signature `SetWindowsHookExW`
+    // requires. We pass `None` for `hmod` because both hooks are
+    // installed for this process on this thread with no DLL
+    // module to load, which is the documented combination for
+    // WH_MOUSE_LL/WH_KEYBOARD_LL.
+    let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) };
+    // SAFETY: same reasoning as the mouse hook above.
+    let keyboard_hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
+
+    match (mouse_hook, keyboard_hook) {
+        (Ok(m), Ok(k)) => {
+            MOUSE_HOOK.with(|c| *c.borrow_mut() = Some(m));
+            KEYBOARD_HOOK.with(|c| *c.borrow_mut() = Some(k));
+            // Diagnostic: confirms both hooks actually installed
+            // (as opposed to a keyboard-specific block by AV/EDR
+            // software that a bare Ok(HHOOK) from
+            // SetWindowsHookExW wouldn't otherwise reveal at
+            // keypress time).
+            tracing::info!("low-level mouse + keyboard hooks installed");
+
+            // Raw Input keyboard registration is a soft
+            // dependency: mouse capture (and keyboard
+            // suppression, via the hook above) must not fail
+            // just because this couldn't be set up. On failure
+            // we log and carry on — regular-key detection
+            // degrades to whatever `keyboard_proc` alone can
+            // see (modifiers, per the investigation in
+            // `register_raw_keyboard`'s docs), rather than
+            // losing mouse capture too.
+            match create_message_window() {
+                Ok(hwnd) => {
+                    if let Err(reason) = register_raw_keyboard(hwnd) {
+                        tracing::warn!(
+                            reason,
+                            "raw input keyboard registration failed; falling back to \
+                             WH_KEYBOARD_LL alone"
+                        );
+                        // SAFETY: `hwnd` was just created above
+                        // and nothing else references it yet.
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    } else {
+                        RAW_INPUT_HWND.with(|c| *c.borrow_mut() = Some(hwnd));
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        "creating the raw input message window failed; falling back \
+                         to WH_KEYBOARD_LL alone"
+                    );
+                }
+            }
+        }
+        (m, k) => {
+            // Clean up whichever one *did* register before
+            // reporting failure.
+            if let Ok(m) = m {
+                // SAFETY: `m` was just returned by a successful
+                // SetWindowsHookExW call above and hasn't been
+                // unhooked yet.
+                let _ = unsafe { UnhookWindowsHookEx(m) };
+            }
+            if let Ok(k) = k {
+                // SAFETY: same as above, for the keyboard hook.
+                let _ = unsafe { UnhookWindowsHookEx(k) };
+            }
+            let _ = ready_tx.send(Err(
+                "SetWindowsHookExW failed for one or both hooks — is this running \
+                 interactively (not as a service)?"
+                    .to_string(),
+            ));
+            SINK.with(|cell| *cell.borrow_mut() = None);
+            return;
+        }
+    }
+
+    // Seed the watchdog baseline so a tick before any real
+    // input doesn't read as a miss, and start its timer.
+    // SAFETY: `GetTickCount` has no preconditions.
+    LAST_HOOK_TICK.store(unsafe { GetTickCount() }, Ordering::Relaxed);
+    // SAFETY: a null `hwnd` + null `TIMERPROC` posts plain
+    // `WM_TIMER` messages to this thread's queue, retrieved by
+    // the `GetMessageW` loop below; the id is arbitrary.
+    unsafe { SetTimer(None, WATCHDOG_TIMER_ID, WATCHDOG_INTERVAL_MS, None) };
+
+    // SAFETY: `GetCurrentThreadId` has no preconditions.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let _ = ready_tx.send(Ok(thread_id));
+
+    // Message pump. Low-level hooks are only delivered while
+    // this thread is pumping messages — this loop IS the
+    // capture, not just bookkeeping. `GetMessageW` blocks until
+    // a message (including our own WM_QUIT from `stop()`, the
+    // watchdog's `WM_TIMER`, and `mouse_proc`'s deferred
+    // `MOUSE_MOVE_MSG`/`PRE_WARP_MSG`) arrives.
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
+    // fills in; `None, 0, 0` means "any message for this
+    // thread".
+    while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
+        if msg.message == WM_TIMER && msg.wParam.0 == WATCHDOG_TIMER_ID {
+            watchdog_tick();
+            continue;
+        }
+        if msg.message == MOUSE_MOVE_MSG {
+            let (x, y) = unpack_point(msg.wParam, msg.lParam);
+            handle_mouse_move(x, y);
+            continue;
+        }
+        if msg.message == PRE_WARP_MSG {
+            // Save the warp target as the new delta baseline —
+            // Barrier's `saveMousePosition` inside its own
+            // `BARRIER_MSG_PRE_WARP` handler
+            // (`MSWindowsScreen.cpp:997`) — then fence off
+            // everything up to the matching `POST_WARP_MSG`.
+            let (x, y) = unpack_point(msg.wParam, msg.lParam);
+            LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(POINT { x, y }));
+            discard_until_post_warp();
+            continue;
+        }
+        if msg.message == POST_WARP_MSG {
+            tracing::warn!("unmatched POST_WARP_MSG on the capture pump thread");
+            continue;
+        }
+        // SAFETY: `msg` was just populated by GetMessageW above.
+        unsafe {
+            let _ = TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
+        }
+    }
+
+    // SAFETY: `None` id-matches the timer set with a null hwnd
+    // above; the hooks in the thread-locals are whatever the
+    // watchdog last installed (or the originals) and are live.
+    unsafe {
+        let _ = KillTimer(None, WATCHDOG_TIMER_ID);
+        if let Some(m) = MOUSE_HOOK.with(|c| c.borrow_mut().take()) {
+            let _ = UnhookWindowsHookEx(m);
+        }
+        if let Some(k) = KEYBOARD_HOOK.with(|c| c.borrow_mut().take()) {
+            let _ = UnhookWindowsHookEx(k);
+        }
+        if let Some(hwnd) = RAW_INPUT_HWND.with(|c| c.borrow_mut().take()) {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+    SINK.with(|cell| *cell.borrow_mut() = None);
+    HELD_KEYS.with(|cell| cell.borrow_mut().clear());
 }
 
 /// Registers the message-window class exactly once per process — mirrors
@@ -593,10 +602,16 @@ fn handle_raw_input(lparam: LPARAM) {
         return;
     }
 
-    let mut buf = vec![0u8; size as usize];
-    // SAFETY: `buf` is sized exactly to what the query above reported;
-    // `size` is re-passed as an in/out capacity, matching the documented
-    // second-call contract.
+    // Backed by `u64` rather than `u8` so the buffer is 8-byte aligned —
+    // `RAWINPUT` contains a `HANDLE` and is not valid to dereference behind
+    // a pointer with `u8`'s (1-byte) alignment guarantee, even though a
+    // `Vec<u8>` heap allocation happens to come back over-aligned in
+    // practice on this allocator.
+    let byte_len = size as usize;
+    let mut buf = vec![0u64; byte_len.div_ceil(size_of::<u64>())];
+    // SAFETY: `buf` is sized exactly to what the query above reported (in
+    // 8-byte words, rounded up); `size` is re-passed as an in/out capacity,
+    // matching the documented second-call contract.
     let read = unsafe {
         GetRawInputData(
             hrawinput,
@@ -608,12 +623,13 @@ fn handle_raw_input(lparam: LPARAM) {
     };
     // `GetRawInputData` returns `u32::MAX` (cast from `(UINT)-1`) on
     // failure, or the number of bytes written on success.
-    if read == u32::MAX || read as usize != buf.len() {
+    if read == u32::MAX || read as usize != byte_len {
         return;
     }
 
     // SAFETY: `buf` holds a fully-populated `RAWINPUT` per the successful
-    // read above — its declared size came from the OS itself.
+    // read above — its declared size came from the OS itself, and the
+    // `u64`-backed allocation satisfies `RAWINPUT`'s alignment.
     let raw = unsafe { &*buf.as_ptr().cast::<RAWINPUT>() };
     if raw.header.dwType != RIM_TYPEKEYBOARD.0 {
         return;
@@ -650,8 +666,11 @@ fn handle_raw_input(lparam: LPARAM) {
 // exposes are `u32` (matching the Win32 header, which defines them as
 // plain `#define`s with no fixed width). Narrowed once here rather than
 // converting at each use.
+#[allow(clippy::cast_possible_truncation)]
 const RI_KEY_BREAK_U16: u16 = RI_KEY_BREAK as u16;
+#[allow(clippy::cast_possible_truncation)]
 const RI_KEY_E0_U16: u16 = RI_KEY_E0 as u16;
+#[allow(clippy::cast_possible_truncation)]
 const RI_KEY_E1_U16: u16 = RI_KEY_E1 as u16;
 
 /// Extracts which side button (XBUTTON1/XBUTTON2) from `MSLLHOOKSTRUCT`'s
@@ -814,7 +833,7 @@ fn handle_mouse_move(mx: i32, my: i32) {
 /// physical motion may have been larger than reported — the OS clamps the
 /// cursor at the real screen edge before our hook ever sees it, so a
 /// single very fast flick can under-report. Barrier keeps this same
-/// `bogusZoneSize` check as a backup even with its PRE_WARP/POST_WARP fence
+/// `bogusZoneSize` check as a backup even with its `PRE_WARP`/`POST_WARP` fence
 /// in place, and so do we.
 fn is_bogus_delta(dx: i32, dy: i32) -> bool {
     let half_width = HALF_WIDTH.load(Ordering::SeqCst);
