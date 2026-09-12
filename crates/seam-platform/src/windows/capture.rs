@@ -37,12 +37,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
-    WM_XBUTTONUP,
+    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -621,52 +621,69 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         // The hook's wParam carries a WM_* message id, always small enough
         // to fit u32 even though it's widened to usize on 64-bit targets.
         let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
-        let event = match msg {
-            WM_MOUSEMOVE => {
-                // Deferred to the pump thread as `MOUSE_MOVE_MSG` — the
-                // real work (delta computation, the anchor-warp fence) needs
-                // the pump thread's own message queue and can't happen in
-                // this callback, which must return in well under 1ms.
-                let (wx, wy) = pack_point(info.pt.x, info.pt.y);
-                // SAFETY: low-level hooks always run on the thread that
-                // installed them, so `GetCurrentThreadId` here is the pump
-                // thread; posting a plain integer payload to its own queue.
-                let _ = unsafe { PostThreadMessageW(GetCurrentThreadId(), MOUSE_MOVE_MSG, wx, wy) };
-                None
+        // `LLMHF_INJECTED` marks an event as coming from `SendInput` rather
+        // than real hardware — e.g. our own button/wheel injection while
+        // `BeingDriven`. Skip the whole dispatch below for these: without
+        // this, injecting a click on this machine gets immediately
+        // re-captured by this same hook and fed back into
+        // `process_capture_event` as if it were fresh local input (the same
+        // bug class just found and fixed in `keyboard_proc`). Real
+        // `WM_MOUSEMOVE` warp-echo filtering is handled separately by the
+        // PRE_WARP/POST_WARP fence, not this flag, but the flag still
+        // matters here for injected buttons/wheel, which the fence doesn't
+        // cover.
+        let injected = (info.flags & LLMHF_INJECTED) != 0;
+        let event = if injected {
+            None
+        } else {
+            match msg {
+                WM_MOUSEMOVE => {
+                    // Deferred to the pump thread as `MOUSE_MOVE_MSG` — the
+                    // real work (delta computation, the anchor-warp fence) needs
+                    // the pump thread's own message queue and can't happen in
+                    // this callback, which must return in well under 1ms.
+                    let (wx, wy) = pack_point(info.pt.x, info.pt.y);
+                    // SAFETY: low-level hooks always run on the thread that
+                    // installed them, so `GetCurrentThreadId` here is the pump
+                    // thread; posting a plain integer payload to its own queue.
+                    let _ =
+                        unsafe { PostThreadMessageW(GetCurrentThreadId(), MOUSE_MOVE_MSG, wx, wy) };
+                    None
+                }
+                WM_LBUTTONDOWN => Some(InputEvent::MouseDown {
+                    button: MouseButton::Left,
+                }),
+                WM_LBUTTONUP => Some(InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                }),
+                WM_RBUTTONDOWN => Some(InputEvent::MouseDown {
+                    button: MouseButton::Right,
+                }),
+                WM_RBUTTONUP => Some(InputEvent::MouseUp {
+                    button: MouseButton::Right,
+                }),
+                WM_MBUTTONDOWN => Some(InputEvent::MouseDown {
+                    button: MouseButton::Middle,
+                }),
+                WM_MBUTTONUP => Some(InputEvent::MouseUp {
+                    button: MouseButton::Middle,
+                }),
+                WM_XBUTTONDOWN => Some(InputEvent::MouseDown {
+                    button: xbutton(info.mouseData),
+                }),
+                WM_XBUTTONUP => Some(InputEvent::MouseUp {
+                    button: xbutton(info.mouseData),
+                }),
+                WM_MOUSEWHEEL => Some(InputEvent::Scroll {
+                    dx: 0,
+                    dy: wheel_delta(info.mouseData),
+                }),
+                WM_MOUSEHWHEEL => Some(InputEvent::Scroll {
+                    dx: wheel_delta(info.mouseData),
+                    dy: 0,
+                }),
+                _ => None,
             }
-            WM_LBUTTONDOWN => Some(InputEvent::MouseDown {
-                button: MouseButton::Left,
-            }),
-            WM_LBUTTONUP => Some(InputEvent::MouseUp {
-                button: MouseButton::Left,
-            }),
-            WM_RBUTTONDOWN => Some(InputEvent::MouseDown {
-                button: MouseButton::Right,
-            }),
-            WM_RBUTTONUP => Some(InputEvent::MouseUp {
-                button: MouseButton::Right,
-            }),
-            WM_MBUTTONDOWN => Some(InputEvent::MouseDown {
-                button: MouseButton::Middle,
-            }),
-            WM_MBUTTONUP => Some(InputEvent::MouseUp {
-                button: MouseButton::Middle,
-            }),
-            WM_XBUTTONDOWN => Some(InputEvent::MouseDown {
-                button: xbutton(info.mouseData),
-            }),
-            WM_XBUTTONUP => Some(InputEvent::MouseUp {
-                button: xbutton(info.mouseData),
-            }),
-            WM_MOUSEWHEEL => Some(InputEvent::Scroll {
-                dx: 0,
-                dy: wheel_delta(info.mouseData),
-            }),
-            WM_MOUSEHWHEEL => Some(InputEvent::Scroll {
-                dx: wheel_delta(info.mouseData),
-                dy: 0,
-            }),
-            _ => None,
         };
         if let Some(event) = event {
             forward(event);
@@ -742,18 +759,33 @@ unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
         // something downstream drops it" (this logs, nothing later does).
         tracing::debug!(vk = info.vkCode, msg, ?code, "keyboard_proc fired");
 
-        match msg {
-            WM_KEYDOWN | WM_SYSKEYDOWN => {
-                let repeat = HELD_KEYS.with(|cell| !cell.borrow_mut().insert(code));
-                forward(InputEvent::KeyDown { code, repeat });
+        // `LLKHF_INJECTED` marks an event as coming from `SendInput` rather
+        // than real hardware — exactly what `Sink::release_all_modifiers`
+        // and any other synthetic key injection on THIS machine generates.
+        // Without this check, injecting e.g. the 8-key release-all-
+        // modifiers sweep on handoff exit gets immediately re-captured by
+        // this same hook and fed back into `process_capture_event` as if
+        // it were fresh local input — corrupting `held_modifiers` tracking
+        // and, while `RemoteActive`, re-relaying our own injected keys back
+        // to the peer. Mirrors the equivalent check the mouse hook used to
+        // have (removed there once the PRE_WARP/POST_WARP fence replaced
+        // it) and Barrier's own keyboard hook doesn't need only because it
+        // uses a different mechanism (`g_fakeServerInput`) for the same
+        // purpose (`MSWindowsHook.cpp`'s `keyboardHookHandler`).
+        if (info.flags.0 & LLKHF_INJECTED.0) == 0 {
+            match msg {
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    let repeat = HELD_KEYS.with(|cell| !cell.borrow_mut().insert(code));
+                    forward(InputEvent::KeyDown { code, repeat });
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    HELD_KEYS.with(|cell| {
+                        cell.borrow_mut().remove(&code);
+                    });
+                    forward(InputEvent::KeyUp { code });
+                }
+                _ => {}
             }
-            WM_KEYUP | WM_SYSKEYUP => {
-                HELD_KEYS.with(|cell| {
-                    cell.borrow_mut().remove(&code);
-                });
-                forward(InputEvent::KeyUp { code });
-            }
-            _ => {}
         }
     }
 
