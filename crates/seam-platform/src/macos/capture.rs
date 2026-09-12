@@ -68,6 +68,22 @@ static SUPPRESS: AtomicBool = AtomicBool::new(false);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 
+/// Set by `set_suppression(true)` (which runs on the session thread) to
+/// tell the next `handle_mouse_moved` call (on the capture thread) to
+/// resync `LAST_CURSOR` to the anchor before computing a delta. Needed
+/// because `set_suppression` warps the real cursor to the anchor
+/// proactively, immediately, from wherever it physically was — without
+/// this, the very next delta gets computed against that stale pre-warp
+/// position (wherever the user's cursor happened to be when suppression
+/// turned on) instead of the anchor, producing one huge, spurious jump on
+/// entering `RemoteActive`. On a large enough display that jump can slip
+/// past the bogus-zone filter (it's only bounded by anchor-to-edge
+/// distance) and get relayed as real motion, slamming the peer's driving
+/// cursor to a screen edge and immediately triggering a false reclaim.
+/// `LAST_CURSOR` itself is a thread-local the session thread can't touch
+/// directly, so this flag is the cross-thread handoff.
+static RESYNC_BASELINE: AtomicBool = AtomicBool::new(false);
+
 /// How close a raw motion delta is allowed to get to the distance between
 /// the anchor and the primary display's edge before it's dropped as
 /// possibly clamped by the OS before the tap saw it — Barrier's
@@ -362,6 +378,7 @@ impl InputCapture for Capture {
                 ANCHOR_X.store(cx, Ordering::SeqCst);
                 ANCHOR_Y.store(cy, Ordering::SeqCst);
                 warp_cursor_to(cx, cy);
+                RESYNC_BASELINE.store(true, Ordering::SeqCst);
                 set_cursor_hidden(true);
             } else {
                 set_cursor_hidden(false);
@@ -469,6 +486,19 @@ fn handle_mouse_moved(event: CGEventRef) -> Option<InputEvent> {
     // SAFETY: `event` is valid for the duration of the tap callback that
     // called us.
     let CGPoint { x: mx, y: my } = unsafe { CGEventGetLocation(event) };
+
+    if RESYNC_BASELINE.swap(false, Ordering::SeqCst) {
+        // `set_suppression(true)` just warped the real cursor here from
+        // wherever it physically was — resync the baseline to the anchor
+        // (not the stale pre-warp position) before diffing, so this move's
+        // delta reflects only the real motion since the warp. See
+        // `RESYNC_BASELINE`'s docs for why this matters.
+        let (ax, ay) = (
+            f64::from(ANCHOR_X.load(Ordering::SeqCst)),
+            f64::from(ANCHOR_Y.load(Ordering::SeqCst)),
+        );
+        LAST_CURSOR.with(|cell| *cell.borrow_mut() = Some((ax, ay)));
+    }
 
     let previous = LAST_CURSOR.with(|cell| cell.borrow_mut().replace((mx, my)));
     let Some((prev_x, prev_y)) = previous else {
