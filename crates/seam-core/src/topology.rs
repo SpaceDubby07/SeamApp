@@ -286,9 +286,21 @@ pub fn detect_edge_reclaim(bounds: Rect, edge: Edge, cur: Point, threshold_px: i
 /// Slack, in pixels, still allowed between two display edges before they
 /// stop counting as "touching" for seam resolution. Real multi-monitor
 /// arrangements pack flush and the layout canvas snaps to exact contact, so
-/// this is only insurance against a 1px inclusive/exclusive rounding slip —
-/// not a reason to treat a deliberately-separated pair as adjacent.
-const SEAM_CONTACT_SLACK_PX: i32 = 1;
+/// this is mainly insurance against rounding slip — but a real two-machine
+/// session with an asymmetric 3-monitor layout (mismatched heights, so the
+/// group carries a vertical offset the simple same-height test fixtures
+/// below don't exercise) showed `resolve_seams` coming up completely empty
+/// (falling back to the whole virtual desktop for reclaim bounds) even
+/// though the Layout panel's own drag-to-snap had been used. The UI's snap
+/// (`LayoutCanvas.tsx`'s `bestSnap`) computes the group translation against
+/// whichever single display pair is numerically closest, then only rounds
+/// the *derived union* it sends over the wire — for a multi-monitor peer
+/// group, the display that actually forms the seam isn't necessarily the
+/// one defining that union's corner, so the union's rounding doesn't
+/// guarantee the specific bordering pair stays within old the 1px window.
+/// 8px absorbs that (and any future rounding path) while still being far
+/// too tight to mistake a deliberately-separated pair for adjacent ones.
+const SEAM_CONTACT_SLACK_PX: i32 = 8;
 
 /// One resolved handoff boundary: an outer edge of a LOCAL display that a
 /// PEER display sits flush against.
@@ -496,9 +508,9 @@ fn horizontally_overlaps(a: Rect, b: Rect) -> bool {
 )]
 mod tests {
     use super::{
-        Display, DisplayId, Edge, Layout, NodeId, Point, Rect, compute_entry_point,
-        detect_edge_crossing, detect_edge_reclaim, detect_seam_crossing, resolve_seams,
-        union_of_display_bounds,
+        Display, DisplayId, Edge, Layout, NodeId, Point, Rect, SEAM_CONTACT_SLACK_PX,
+        compute_entry_point, detect_edge_crossing, detect_edge_reclaim, detect_seam_crossing,
+        resolve_seams, union_of_display_bounds,
     };
 
     fn rect(x: i32, y: i32, width: u32, height: u32) -> Rect {
@@ -749,6 +761,46 @@ mod tests {
         assert_eq!(seams[0].edge, Edge::Left);
         assert_eq!(seams[0].peer_display, mac_in_windows_space);
         assert_eq!(seams[0].overlap_px, 1080);
+    }
+
+    #[test]
+    fn seam_still_resolves_with_a_few_px_gap_from_layout_canvas_rounding() {
+        // The real bug this covers: a real two-machine session with this
+        // exact 3-monitor topology (but the group carrying a vertical
+        // offset, unlike this fixture's y=0-aligned one) came up with NO
+        // seam at all — `resolve_seams` returned empty and reclaim fell
+        // back to the whole 6840-wide virtual desktop. Traced to
+        // `LayoutCanvas.tsx`'s drag-to-snap rounding the derived UNION of a
+        // multi-monitor peer group instead of the uniform translation that
+        // produced it, which can leave the display that actually forms the
+        // seam a few px off even though the group visually "snapped".
+        // `SEAM_CONTACT_SLACK_PX` (and the matching UI fix) both guard
+        // against this; this pins the boundary this constant is meant to
+        // cover.
+        let [left, portrait, tv] = windows_monitors();
+        let barely_off = rect(-1920 - SEAM_CONTACT_SLACK_PX, 0, 1920, 1080);
+
+        let seams = resolve_seams(&[left, portrait, tv], &[barely_off]);
+
+        assert_eq!(
+            seams.len(),
+            1,
+            "a few px of rounding slop must not lose the seam"
+        );
+        assert_eq!(seams[0].local_display, left);
+        assert_eq!(seams[0].edge, Edge::Left);
+    }
+
+    #[test]
+    fn a_gap_well_beyond_the_slack_is_still_not_a_seam() {
+        // The flip side: the slack must stay far short of mistaking a
+        // deliberately-separated display for an adjacent one.
+        let [left, portrait, tv] = windows_monitors();
+        let clearly_separate = rect(-1920 - SEAM_CONTACT_SLACK_PX - 50, 0, 1920, 1080);
+
+        let seams = resolve_seams(&[left, portrait, tv], &[clearly_separate]);
+
+        assert!(seams.is_empty(), "a real gap must not resolve as a seam");
     }
 
     #[test]

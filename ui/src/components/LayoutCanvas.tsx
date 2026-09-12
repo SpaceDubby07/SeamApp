@@ -212,21 +212,28 @@ export function LayoutCanvas({
     });
   }
   function onPointerUp() {
-    if (!dragState.current || !peerRects) {
+    if (!dragState.current || !peerRects || !peerRectsBase) {
       dragState.current = null;
       setDragOffset(null);
       return;
     }
     dragState.current = null;
-    const u = unionOf(peerRects);
     setDragOffset(null);
-    if (u)
-      onPeerBoundsChange({
-        x: Math.round(u.x),
-        y: Math.round(u.y),
-        width: Math.round(u.width),
-        height: Math.round(u.height),
-      });
+    // Round the whole-group TRANSLATION to an integer, then re-derive every
+    // peer rect (and the union sent below) from that — not the other way
+    // around. `peerRects` already carries a rigid, uniform shift off
+    // `peerRectsBase` (drag delta + `bestSnap`'s correction), so any index
+    // recovers the same (fractional) dx/dy. Rounding the DERIVED union
+    // instead used to be able to snap the wrong display in a multi-monitor
+    // peer group: whichever member happens to define the union's corner
+    // gets the rounding, not necessarily the one `bestSnap` actually
+    // aligned flush, which could leave the real seam a fraction of a pixel
+    // off (see `SEAM_CONTACT_SLACK_PX`'s doc comment on the Rust side).
+    const dx = Math.round(peerRects[0].x - peerRectsBase[0].x);
+    const dy = Math.round(peerRects[0].y - peerRectsBase[0].y);
+    const snapped = peerRectsBase.map((r) => translated(r, dx, dy));
+    const u = unionOf(snapped);
+    if (u) onPeerBoundsChange(u);
   }
 
   return (
