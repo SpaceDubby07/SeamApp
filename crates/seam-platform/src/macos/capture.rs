@@ -700,18 +700,23 @@ unsafe extern "C" fn tap_callback(
                 let repeat =
                     unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT) }
                         != 0;
-                Some(InputEvent::KeyDown {
-                    code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
-                    repeat,
-                })
+                let code = cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0));
+                // Diagnostic: the Windows twin of this callback turned out
+                // to only ever see modifier keys, never regular letters —
+                // this proves (or disproves) the same thing is/isn't
+                // happening on macOS, where CGEventTap sits above the HID
+                // translation layer and so shouldn't be vulnerable to the
+                // same "another app's hook eats it first" class of bug.
+                tracing::debug!(raw_code, ?code, "tap_callback saw KeyDown");
+                Some(InputEvent::KeyDown { code, repeat })
             }
             K_CG_EVENT_KEY_UP => {
                 // SAFETY: `event` is valid for the duration of this callback.
                 let raw_code =
                     unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-                Some(InputEvent::KeyUp {
-                    code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
-                })
+                let code = cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0));
+                tracing::debug!(raw_code, ?code, "tap_callback saw KeyUp");
+                Some(InputEvent::KeyUp { code })
             }
             K_CG_EVENT_FLAGS_CHANGED => resolve_flags_changed(event),
             _ => None,

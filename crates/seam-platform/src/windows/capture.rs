@@ -20,30 +20,52 @@
 //! and reinstalls the hooks if the system saw input we didn't (Tier 12's
 //! sleep/wake recovery). `is_healthy()` still only reports whether the
 //! pump thread is alive.
+//!
+//! # Keyboard detection is Raw Input, not `WH_KEYBOARD_LL`
+//! Mouse capture/suppression is entirely hook-based, same as ever. Keyboard
+//! is split: `WH_KEYBOARD_LL` (`keyboard_proc`) is kept only for the one
+//! thing a hook can do that Raw Input can't — blocking local delivery while
+//! `SUPPRESS` is set — but actual `KeyDown`/`KeyUp` detection comes from
+//! Raw Input (`register_raw_keyboard`/`handle_raw_input`) via a hidden
+//! message-only window this module also owns. See `register_raw_keyboard`'s
+//! doc comment for why: a real two-machine test showed the low-level hook
+//! reliably seeing modifier keys but never a single regular letter, on
+//! both driving directions, which points at another globally-installed
+//! hook earlier in the chain (common in gaming/RGB keyboard software)
+//! swallowing regular keys before ours ever sees them — a class of problem
+//! Raw Input's separate, hook-chain-independent delivery path sidesteps.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
 use tokio::sync::mpsc::UnboundedSender;
-use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+use windows::Win32::UI::Input::{
+    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
+    RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK, HWND_MESSAGE,
+    KBDLLHOOKSTRUCT, KillTimer, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+    RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos,
+    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
+};
+use windows::core::{PCWSTR, w};
 
 use seam_core::error::PlatformError;
 use seam_core::protocol::{InputEvent, KeyCode, MouseButton};
@@ -105,6 +127,12 @@ const MOUSE_MOVE_MSG: u32 = WM_APP + 1;
 const PRE_WARP_MSG: u32 = WM_APP + 2;
 const POST_WARP_MSG: u32 = WM_APP + 3;
 
+/// Window class for the hidden message-only window `WM_INPUT` is delivered
+/// to (see `create_message_window`) — distinct from `clipboard.rs`'s own
+/// class, since each `RegisterClassExW` name is a process-global template
+/// tied to one `WNDPROC`.
+const WINDOW_CLASS_NAME: PCWSTR = w!("SeamInputCapture");
+
 thread_local! {
     // The hook callbacks run on the thread that called `SetWindowsHookExW`
     // (Windows delivers low-level hook events synchronously on that
@@ -118,10 +146,15 @@ thread_local! {
     static MOUSE_HOOK: RefCell<Option<HHOOK>> = const { RefCell::new(None) };
     static KEYBOARD_HOOK: RefCell<Option<HHOOK>> = const { RefCell::new(None) };
 
-    // `KBDLLHOOKSTRUCT` carries no "is this a repeat" bit (that only
-    // existed in the classic WM_KEYDOWN lParam, not the low-level hook
-    // struct), so we track currently-held keys ourselves to derive it.
+    // Raw Input's `RAWKEYBOARD` carries no "is this a repeat" bit either,
+    // so we track currently-held keys ourselves to derive it — same reason
+    // as before, just fed from `handle_raw_input` now instead of
+    // `keyboard_proc`.
     static HELD_KEYS: RefCell<HashSet<KeyCode>> = RefCell::new(HashSet::new());
+
+    // The message-only window created for `WM_INPUT` delivery (see
+    // `create_message_window`), so `stop`'s teardown can destroy it.
+    static RAW_INPUT_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
 
     // The last absolute position we saw, used to compute
     // `InputEvent::MouseDelta` by diffing consecutive readings —
@@ -192,6 +225,41 @@ impl InputCapture for Capture {
                         // SetWindowsHookExW wouldn't otherwise reveal at
                         // keypress time).
                         tracing::info!("low-level mouse + keyboard hooks installed");
+
+                        // Raw Input keyboard registration is a soft
+                        // dependency: mouse capture (and keyboard
+                        // suppression, via the hook above) must not fail
+                        // just because this couldn't be set up. On failure
+                        // we log and carry on — regular-key detection
+                        // degrades to whatever `keyboard_proc` alone can
+                        // see (modifiers, per the investigation in
+                        // `register_raw_keyboard`'s docs), rather than
+                        // losing mouse capture too.
+                        match create_message_window() {
+                            Ok(hwnd) => {
+                                if let Err(reason) = register_raw_keyboard(hwnd) {
+                                    tracing::warn!(
+                                        reason,
+                                        "raw input keyboard registration failed; falling back to \
+                                         WH_KEYBOARD_LL alone"
+                                    );
+                                    // SAFETY: `hwnd` was just created above
+                                    // and nothing else references it yet.
+                                    unsafe {
+                                        let _ = DestroyWindow(hwnd);
+                                    }
+                                } else {
+                                    RAW_INPUT_HWND.with(|c| *c.borrow_mut() = Some(hwnd));
+                                }
+                            }
+                            Err(reason) => {
+                                tracing::warn!(
+                                    reason,
+                                    "creating the raw input message window failed; falling back \
+                                     to WH_KEYBOARD_LL alone"
+                                );
+                            }
+                        }
                     }
                     (m, k) => {
                         // Clean up whichever one *did* register before
@@ -281,6 +349,9 @@ impl InputCapture for Capture {
                     }
                     if let Some(k) = KEYBOARD_HOOK.with(|c| c.borrow_mut().take()) {
                         let _ = UnhookWindowsHookEx(k);
+                    }
+                    if let Some(hwnd) = RAW_INPUT_HWND.with(|c| c.borrow_mut().take()) {
+                        let _ = DestroyWindow(hwnd);
                     }
                 }
                 SINK.with(|cell| *cell.borrow_mut() = None);
@@ -375,6 +446,213 @@ impl Drop for Capture {
         let _ = self.stop();
     }
 }
+
+/// Registers the message-window class exactly once per process — mirrors
+/// `clipboard.rs`'s `ensure_class_registered` (same rationale: a window
+/// class is a process-global template, and re-registering the same name on
+/// a reconnect fails with `ERROR_CLASS_ALREADY_EXISTS`).
+fn ensure_class_registered() -> Result<(), String> {
+    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            // SAFETY: `GetModuleHandleW(None)` returns this process's own
+            // module handle, valid to register a class against.
+            let hinstance = unsafe { GetModuleHandleW(None) }
+                .map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
+            let wc = WNDCLASSEXW {
+                cbSize: u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or_default(),
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: WINDOW_CLASS_NAME,
+                ..Default::default()
+            };
+            // SAFETY: `wc` is a fully initialized `WNDCLASSEXW`; registering
+            // a window class this way is always sound.
+            if unsafe { RegisterClassExW(&raw const wc) } == 0 {
+                return Err("RegisterClassExW failed".to_string());
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+/// Creates a hidden, message-only window (`HWND_MESSAGE` parent) purely to
+/// receive `WM_INPUT` — never shown, no visible content. Must be created on
+/// the capture pump thread: `RegisterRawInputDevices` delivers `WM_INPUT`
+/// to whichever thread's message queue owns `hwndTarget`, and that thread
+/// is the only one whose `GetMessageW` loop will ever see it.
+fn create_message_window() -> Result<HWND, String> {
+    ensure_class_registered()?;
+
+    // SAFETY: `GetModuleHandleW(None)` returns a handle to this process's
+    // own module.
+    let hinstance =
+        unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
+
+    // SAFETY: creating a message-only window with the class registered by
+    // `ensure_class_registered`; `HWND_MESSAGE` as the parent and no window
+    // style is the documented combination for a window that never becomes
+    // visible and needs no message loop beyond delivering messages to us.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            WINDOW_CLASS_NAME,
+            WINDOW_CLASS_NAME,
+            WINDOW_STYLE::default(),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(HWND_MESSAGE),
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+    }
+    .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
+
+    Ok(hwnd)
+}
+
+/// Registers this process for raw keyboard input, delivered to `hwnd` as
+/// `WM_INPUT`. `RIDEV_INPUTSINK` is what makes delivery work even while our
+/// window has no focus and isn't foreground — the normal case, since we're
+/// capturing global input while some other window is active.
+///
+/// # Why: `WH_KEYBOARD_LL` alone isn't reliable for this
+/// A real two-machine test showed `WH_KEYBOARD_LL` reliably seeing
+/// modifier keys (including this machine's own `SendInput`-injected ones —
+/// see `keyboard_proc`'s history) but NEVER a single regular letter/number
+/// key, on both directions of driving, across multiple sessions. Low-level
+/// hooks are cooperative: any other globally-installed hook earlier in the
+/// chain can swallow an event and stop it from ever reaching ours, and
+/// gaming/RGB keyboard software commonly installs exactly this kind of
+/// hook to watch for macro keys — plausibly explaining an asymmetry where
+/// modifiers (rarely bound to macros) pass through untouched while regular
+/// keys don't. Raw Input reads from the HID input queue via a separate
+/// registration mechanism that Windows guarantees delivery for regardless
+/// of what any other process's hook chain does with the same event
+/// afterward, so it's used here as the actual detection source for
+/// `KeyDown`/`KeyUp`. `WH_KEYBOARD_LL` (`keyboard_proc`) is kept, but only
+/// for what a hook can do that Raw Input can't: suppressing local delivery
+/// while `SUPPRESS` is set.
+fn register_raw_keyboard(hwnd: HWND) -> Result<(), String> {
+    const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
+    let device = RAWINPUTDEVICE {
+        usUsagePage: HID_USAGE_PAGE_GENERIC,
+        usUsage: HID_USAGE_GENERIC_KEYBOARD,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    // SAFETY: `device` is a single, fully-initialized `RAWINPUTDEVICE`
+    // targeting `hwnd`, which the caller guarantees is valid and owned by
+    // this thread.
+    unsafe {
+        RegisterRawInputDevices(
+            &[device],
+            u32::try_from(size_of::<RAWINPUTDEVICE>()).unwrap_or_default(),
+        )
+    }
+    .map_err(|e| format!("RegisterRawInputDevices failed: {e}"))
+}
+
+/// # Safety
+/// Called by the OS per the standard `WNDPROC` contract for the window
+/// class registered in `create_message_window`.
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_INPUT {
+        handle_raw_input(lparam);
+        // Fall through to `DefWindowProcW` regardless: Microsoft's own
+        // docs for `WM_INPUT` say to call it even after handling the
+        // message yourself, for cleanup.
+    }
+    // SAFETY: forwarding to the default window procedure with the exact
+    // parameters we were given is always sound.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Reads one `WM_INPUT` payload and, if it's a real (non-synthetic)
+/// keyboard event, resolves and forwards it as `InputEvent::KeyDown`/
+/// `KeyUp` — this is the actual detection path; see `register_raw_keyboard`
+/// for why `keyboard_proc`/`WH_KEYBOARD_LL` no longer does this.
+fn handle_raw_input(lparam: LPARAM) {
+    // SAFETY: `lparam` is the `WM_INPUT` payload handed to us by `wndproc`;
+    // reinterpreting its bit pattern as `HRAWINPUT` matches what
+    // `GetRawInputData` expects for that message.
+    let hrawinput = HRAWINPUT(lparam.0 as *mut std::ffi::c_void);
+    let header_size = u32::try_from(size_of::<RAWINPUTHEADER>()).unwrap_or(0);
+
+    // First call: query the required buffer size (the documented two-step
+    // `GetRawInputData` pattern — a `RAWINPUT` is variable-sized).
+    let mut size: u32 = 0;
+    // SAFETY: `pdata: None` means "just tell us the size"; `size` is a
+    // valid, exclusively-owned `u32` for the OS to write into.
+    let query = unsafe { GetRawInputData(hrawinput, RID_INPUT, None, &raw mut size, header_size) };
+    if query != 0 || size == 0 {
+        return;
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    // SAFETY: `buf` is sized exactly to what the query above reported;
+    // `size` is re-passed as an in/out capacity, matching the documented
+    // second-call contract.
+    let read = unsafe {
+        GetRawInputData(
+            hrawinput,
+            RID_INPUT,
+            Some(buf.as_mut_ptr().cast()),
+            &raw mut size,
+            header_size,
+        )
+    };
+    // `GetRawInputData` returns `u32::MAX` (cast from `(UINT)-1`) on
+    // failure, or the number of bytes written on success.
+    if read == u32::MAX || read as usize != buf.len() {
+        return;
+    }
+
+    // SAFETY: `buf` holds a fully-populated `RAWINPUT` per the successful
+    // read above — its declared size came from the OS itself.
+    let raw = unsafe { &*buf.as_ptr().cast::<RAWINPUT>() };
+    if raw.header.dwType != RIM_TYPEKEYBOARD.0 {
+        return;
+    }
+    // A null device handle marks input Windows synthesized (e.g. our own
+    // `SendInput` calls) rather than a real physical device — the Raw
+    // Input equivalent of `LLKHF_INJECTED`/`LLMHF_INJECTED`. Without this,
+    // `Sink::release_all_modifiers`'s sweep would echo right back in here
+    // too, the same self-feedback bug already fixed for `keyboard_proc`
+    // and the mouse hooks.
+    if raw.header.hDevice.0.is_null() {
+        return;
+    }
+
+    // SAFETY: `dwType` was just confirmed `RIM_TYPEKEYBOARD` above, so
+    // `.keyboard` is the active union member.
+    let kb = unsafe { raw.data.keyboard };
+    let up = kb.Flags & RI_KEY_BREAK_U16 != 0;
+    let extended = kb.Flags & (RI_KEY_E0_U16 | RI_KEY_E1_U16) != 0;
+    let code = resolve_keycode_raw(kb.VKey, kb.MakeCode, extended);
+
+    if up {
+        HELD_KEYS.with(|cell| {
+            cell.borrow_mut().remove(&code);
+        });
+        forward(InputEvent::KeyUp { code });
+    } else {
+        let repeat = HELD_KEYS.with(|cell| !cell.borrow_mut().insert(code));
+        forward(InputEvent::KeyDown { code, repeat });
+    }
+}
+
+// `RAWKEYBOARD::Flags` is `u16`; the `RI_KEY_*` constants windows-rs
+// exposes are `u32` (matching the Win32 header, which defines them as
+// plain `#define`s with no fixed width). Narrowed once here rather than
+// converting at each use.
+const RI_KEY_BREAK_U16: u16 = RI_KEY_BREAK as u16;
+const RI_KEY_E0_U16: u16 = RI_KEY_E0 as u16;
+const RI_KEY_E1_U16: u16 = RI_KEY_E1 as u16;
 
 /// Extracts which side button (XBUTTON1/XBUTTON2) from `MSLLHOOKSTRUCT`'s
 /// packed `mouseData` field: the button index lives in the high word.
@@ -702,14 +980,13 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     unsafe { CallNextHookEx(None, ncode, wparam, lparam) }
 }
 
-/// Resolves a `KBDLLHOOKSTRUCT` into our normalized `KeyCode`, handling the
-/// left/right disambiguation `vk_to_keycode` alone can't do — see the
-/// module docs on `keycodes.rs`.
-fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
-    let extended = (info.flags.0 & LLKHF_EXTENDED.0) != 0;
-    // VK codes are always 8-bit despite `vkCode`'s u32 field type.
-    let vk = u16::try_from(info.vkCode).unwrap_or(0);
-
+/// Resolves a `(VKey, scan code, extended)` triple into our normalized
+/// `KeyCode`, handling the left/right disambiguation `vk_to_keycode` alone
+/// can't do — see the module docs on `keycodes.rs`. Takes primitives
+/// rather than a specific OS struct so both `handle_raw_input`'s
+/// `RAWKEYBOARD` and (for reference) `WH_KEYBOARD_LL`'s `KBDLLHOOKSTRUCT`
+/// shape can feed it identically; only `handle_raw_input` calls it now.
+fn resolve_keycode_raw(vk: u16, scan_code: u16, extended: bool) -> KeyCode {
     if vk == VK_CONTROL.0 {
         return if extended {
             KeyCode::RightCtrl
@@ -728,7 +1005,7 @@ fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
         // The extended flag is never set for either physical Shift key, so
         // this is the one modifier that has to be disambiguated by scan
         // code instead: 0x36 is right Shift, everything else is left.
-        return if info.scanCode == 0x36 {
+        return if scan_code == 0x36 {
             KeyCode::RightShift
         } else {
             KeyCode::LeftShift
@@ -741,6 +1018,16 @@ fn resolve_keycode(info: &KBDLLHOOKSTRUCT) -> KeyCode {
     vk_to_keycode(vk)
 }
 
+/// `WH_KEYBOARD_LL` no longer does key detection — see
+/// `register_raw_keyboard`'s docs for why (a real two-machine test showed
+/// this hook reliably seeing modifier keys but never a single regular
+/// letter, on both driving directions, across multiple sessions; Raw Input
+/// is now the actual source `handle_raw_input` forwards from). What a hook
+/// can do that Raw Input can't is BLOCK local delivery, so this stays
+/// installed purely for the `SUPPRESS` gate below, plus a liveness stamp
+/// for the watchdog and a diagnostic proving whether this specific key
+/// reached the hook chain at all.
+///
 /// # Safety
 /// Called by the OS per the `WH_KEYBOARD_LL` contract; see `mouse_proc`'s
 /// SAFETY comment — the same reasoning applies to `KBDLLHOOKSTRUCT` here.
@@ -751,42 +1038,10 @@ unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         // The hook's wParam carries a WM_* message id, always small enough
         // to fit u32 even though it's widened to usize on 64-bit targets.
+        // Diagnostic only now: confirms whether the LL hook chain saw this
+        // key at all, independent of Raw Input's own (separate) delivery.
         let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
-        let code = resolve_keycode(info);
-        // Diagnostic: proves the hook is actually firing for this key at
-        // all, independent of whether it gets forwarded/relayed — isolates
-        // "hook never sees it" (nothing logged here) from "hook sees it but
-        // something downstream drops it" (this logs, nothing later does).
-        tracing::debug!(vk = info.vkCode, msg, ?code, "keyboard_proc fired");
-
-        // `LLKHF_INJECTED` marks an event as coming from `SendInput` rather
-        // than real hardware — exactly what `Sink::release_all_modifiers`
-        // and any other synthetic key injection on THIS machine generates.
-        // Without this check, injecting e.g. the 8-key release-all-
-        // modifiers sweep on handoff exit gets immediately re-captured by
-        // this same hook and fed back into `process_capture_event` as if
-        // it were fresh local input — corrupting `held_modifiers` tracking
-        // and, while `RemoteActive`, re-relaying our own injected keys back
-        // to the peer. Mirrors the equivalent check the mouse hook used to
-        // have (removed there once the PRE_WARP/POST_WARP fence replaced
-        // it) and Barrier's own keyboard hook doesn't need only because it
-        // uses a different mechanism (`g_fakeServerInput`) for the same
-        // purpose (`MSWindowsHook.cpp`'s `keyboardHookHandler`).
-        if (info.flags.0 & LLKHF_INJECTED.0) == 0 {
-            match msg {
-                WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    let repeat = HELD_KEYS.with(|cell| !cell.borrow_mut().insert(code));
-                    forward(InputEvent::KeyDown { code, repeat });
-                }
-                WM_KEYUP | WM_SYSKEYUP => {
-                    HELD_KEYS.with(|cell| {
-                        cell.borrow_mut().remove(&code);
-                    });
-                    forward(InputEvent::KeyUp { code });
-                }
-                _ => {}
-            }
-        }
+        tracing::debug!(vk = info.vkCode, msg, "keyboard_proc fired");
     }
 
     if ncode == HC_ACTION.cast_signed() && SUPPRESS.load(Ordering::SeqCst) {
