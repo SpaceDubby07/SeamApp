@@ -664,9 +664,30 @@ unsafe extern "C" fn tap_callback(
         forward(parsed);
     }
 
-    if SUPPRESS.load(Ordering::SeqCst) {
+    // Mouse-moved/dragged events are NEVER swallowed, suppressed or not —
+    // Barrier's exact behaviour (`OSXScreen::handleCGInputEvent`,
+    // `OSXScreen.mm:1935-1943`) and documented reason: the OS silently
+    // ignores subsequent `CGWarpMouseCursorPosition` calls from this same
+    // tap if a mouse-moved event was just swallowed (returned null) instead
+    // of passed through. Swallowing this event type would break the very
+    // anchor warp `handle_mouse_moved` just issued, letting the real cursor
+    // wander to actual screen edges instead of staying pinned near the
+    // anchor. The cursor being hidden (`CGDisplayHideCursor`) is what
+    // actually keeps it invisible; consuming the event was never load-
+    // bearing for that and only breaks the warp. Barrier's own comment:
+    // "This should be harmless, but might register as slight movement to
+    // other apps on the system. It hasn't been a problem before, though."
+    let is_mouse_motion = matches!(
+        event_type,
+        K_CG_EVENT_MOUSE_MOVED
+            | K_CG_EVENT_LEFT_MOUSE_DRAGGED
+            | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+            | K_CG_EVENT_OTHER_MOUSE_DRAGGED
+    );
+
+    if !is_mouse_motion && SUPPRESS.load(Ordering::SeqCst) {
         // Returning null swallows the event — it never reaches any other
-        // app. This is what makes the local cursor "disappear" during a
+        // app. This is what makes clicks/keys/scroll "disappear" during a
         // remote handoff.
         std::ptr::null_mut()
     } else {
