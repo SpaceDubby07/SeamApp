@@ -152,14 +152,21 @@ unsafe extern "C" {
 
     // ── Pinning the hardware pointer during suppression ──
     // Consuming a mouse-moved event in the tap hides it from apps but does
-    // NOT stop the window server moving the on-screen cursor. Disassociating
-    // (`connected = false`) stops the cursor moving AND removes the ~0.25s
-    // local-event suppression window that `CGWarpMouseCursorPosition`
-    // otherwise triggers while associated — so we can warp the cursor back
-    // to an anchor on every move without starving the HID delta stream.
-    // `CGDisplayHideCursor`/`ShowCursor` are ref-counted and must be
-    // balanced.
-    pub fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    // NOT stop the window server moving the on-screen cursor — that's what
+    // the anchor warp is for. `CGWarpMouseCursorPosition` normally triggers
+    // a ~0.25s local-event suppression window (meant to stop a warp from
+    // generating a spurious event feedback loop) that would otherwise starve
+    // the HID delta stream while we're warping on every move; zeroing it via
+    // `CGSetLocalEventsSuppressionInterval` is the documented fix (this is
+    // Barrier's own technique — `OSXScreen::setZeroSuppressionInterval` /
+    // `avoidHesitatingCursor`). Deliberately NOT using
+    // `CGAssociateMouseAndMouseCursorPosition(false)` here: it stops the
+    // cursor moving but lets the OS's internal pointer position drift off in
+    // one direction during a sustained one-way drag, which starves
+    // `kCGMouseEventDeltaX/Y` and freezes the peer's cursor — see the
+    // `reclaim-is-driven-side` project note. `CGDisplayHideCursor`/`ShowCursor`
+    // are ref-counted and must be balanced.
+    pub fn CGSetLocalEventsSuppressionInterval(seconds: f64);
     pub fn CGDisplayHideCursor(display: CGDirectDisplayID) -> i32;
     pub fn CGDisplayShowCursor(display: CGDirectDisplayID) -> i32;
 

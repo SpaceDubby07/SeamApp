@@ -37,12 +37,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WM_XBUTTONDOWN, WM_XBUTTONUP,
+    KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+    SM_CXSCREEN, SM_CYSCREEN, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 use seam_core::error::PlatformError;
@@ -93,6 +93,18 @@ const WATCHDOG_WRAP_GUARD_MS: u32 = u32::MAX / 2;
 /// Arbitrary non-zero timer id for `SetTimer`/`KillTimer`.
 const WATCHDOG_TIMER_ID: usize = 1;
 
+/// Custom thread messages that move real mouse-move handling off the hook
+/// callback (which must return in well under 1ms) and onto the pump
+/// thread's own message queue, and fence the anchor warp against both its
+/// own synthetic echo and any real event racing it — mirrors Barrier's
+/// `BARRIER_MSG_MOUSE_MOVE`/`_PRE_WARP`/`_POST_WARP`
+/// (`MSWindowsHook.cpp`/`MSWindowsScreen.cpp`). Declared in ascending
+/// order: [`discard_until_post_warp`] filters `GetMessageW` to exactly this
+/// range.
+const MOUSE_MOVE_MSG: u32 = WM_APP + 1;
+const PRE_WARP_MSG: u32 = WM_APP + 2;
+const POST_WARP_MSG: u32 = WM_APP + 3;
+
 thread_local! {
     // The hook callbacks run on the thread that called `SetWindowsHookExW`
     // (Windows delivers low-level hook events synchronously on that
@@ -111,13 +123,17 @@ thread_local! {
     // struct), so we track currently-held keys ourselves to derive it.
     static HELD_KEYS: RefCell<HashSet<KeyCode>> = RefCell::new(HashSet::new());
 
-    // Tier 7.2: the last real (non-injected) absolute position we saw,
-    // used to compute `InputEvent::MouseDelta` — `MSLLHOOKSTRUCT` carries
-    // no delta field of its own (unlike macOS's `CGEventGetIntegerValueField`
-    // with `kCGMouseEventDeltaX/Y`), so this is derived by diffing
-    // consecutive readings instead. See `handle_mouse_move`'s docs for
-    // why, once suppressed, this alone isn't enough without also warping
-    // the cursor back to a fixed anchor after every move.
+    // The last absolute position we saw, used to compute
+    // `InputEvent::MouseDelta` by diffing consecutive readings —
+    // `MSLLHOOKSTRUCT` carries no delta field of its own (unlike macOS's
+    // `CGEventGetIntegerValueField` with `kCGMouseEventDeltaX/Y`). Updated
+    // both by `handle_mouse_move` (real motion) and by the `PRE_WARP_MSG`
+    // handler in the pump loop (the upcoming warp target), mirroring
+    // Barrier's `saveMousePosition` being called from both
+    // `MSWindowsScreen::onMouseMove` and its `BARRIER_MSG_PRE_WARP` handler.
+    // Only ever touched on the pump thread, since `handle_mouse_move` now
+    // runs there too (deferred from the hook callback via `MOUSE_MOVE_MSG`)
+    // rather than inside `mouse_proc` itself.
     static LAST_REAL_POS: RefCell<Option<POINT>> = const { RefCell::new(None) };
 }
 
@@ -210,8 +226,9 @@ impl InputCapture for Capture {
                 // Message pump. Low-level hooks are only delivered while
                 // this thread is pumping messages — this loop IS the
                 // capture, not just bookkeeping. `GetMessageW` blocks until
-                // a message (including our own WM_QUIT from `stop()` and
-                // the watchdog's `WM_TIMER`) arrives.
+                // a message (including our own WM_QUIT from `stop()`, the
+                // watchdog's `WM_TIMER`, and `mouse_proc`'s deferred
+                // `MOUSE_MOVE_MSG`/`PRE_WARP_MSG`) arrives.
                 let mut msg = MSG::default();
                 // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
                 // fills in; `None, 0, 0` means "any message for this
@@ -219,6 +236,26 @@ impl InputCapture for Capture {
                 while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
                     if msg.message == WM_TIMER && msg.wParam.0 == WATCHDOG_TIMER_ID {
                         watchdog_tick();
+                        continue;
+                    }
+                    if msg.message == MOUSE_MOVE_MSG {
+                        let (x, y) = unpack_point(msg.wParam, msg.lParam);
+                        handle_mouse_move(x, y);
+                        continue;
+                    }
+                    if msg.message == PRE_WARP_MSG {
+                        // Save the warp target as the new delta baseline —
+                        // Barrier's `saveMousePosition` inside its own
+                        // `BARRIER_MSG_PRE_WARP` handler
+                        // (`MSWindowsScreen.cpp:997`) — then fence off
+                        // everything up to the matching `POST_WARP_MSG`.
+                        let (x, y) = unpack_point(msg.wParam, msg.lParam);
+                        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(POINT { x, y }));
+                        discard_until_post_warp();
+                        continue;
+                    }
+                    if msg.message == POST_WARP_MSG {
+                        tracing::warn!("unmatched POST_WARP_MSG on the capture pump thread");
                         continue;
                     }
                     // SAFETY: `msg` was just populated by GetMessageW above.
@@ -300,15 +337,21 @@ impl InputCapture for Capture {
             ANCHOR_Y.store(cy, Ordering::SeqCst);
             HALF_WIDTH.store(cx, Ordering::SeqCst);
             HALF_HEIGHT.store(cy, Ordering::SeqCst);
-            // SAFETY: `SetCursorPos` takes plain integer coordinates and is
-            // safe to call from any thread (it's a global desktop
-            // operation, not thread-affine) — this runs on the session
-            // thread, not the capture hook thread. The low-level hook
-            // (running on its own thread) sees the resulting `WM_MOUSEMOVE`
-            // as usual and resyncs its own `LAST_REAL_POS` via the
-            // `LLMHF_INJECTED` branch in `handle_mouse_move` — nothing here
-            // touches that thread-local directly.
-            let _ = unsafe { SetCursorPos(cx, cy) };
+            // Deliberately no immediate `SetCursorPos` here to snap the
+            // cursor to the anchor right away: unlike macOS's
+            // `CGWarpMouseCursorPosition` (documented to never generate a
+            // tap event, from any thread), Windows' `SetCursorPos` DOES
+            // generate a real `WM_MOUSEMOVE` the low-level hook will see —
+            // and this runs on the session thread, not the capture pump
+            // thread, so it can't go through the `PRE_WARP_MSG`/
+            // `POST_WARP_MSG` fence that protects every other warp (that
+            // fence only works when posted from the pump thread itself).
+            // Barrier's own `OSXScreen::leave`/Windows equivalent don't
+            // warp proactively either — the anchor recentring happens
+            // lazily on the first real move after suppression turns on,
+            // inside `handle_mouse_move`'s normal (fenced) suppressed
+            // branch. The local cursor visibly sits wherever it was until
+            // then, matching Barrier's own Windows behaviour.
         }
         Ok(())
     }
@@ -362,81 +405,123 @@ fn forward(event: InputEvent) {
 /// technique).
 const BOGUS_ZONE_PX: i32 = 10;
 
-/// Handles one `WM_MOUSEMOVE`: derives `MouseDelta` from the raw absolute
-/// reading (`MSLLHOOKSTRUCT` carries no delta field of its own, unlike
-/// macOS's `CGEventGetIntegerValueField` with `kCGMouseEventDeltaX/Y`),
-/// and — while suppressed — warps the cursor back to a fixed anchor after
-/// EVERY move, so it never travels far enough to approach any edge in the
-/// first place.
-///
-/// # Why warp to a fixed anchor on every move, not just when pinned
-/// An earlier version of this only nudged the cursor once it was
-/// discovered already pinned against a monitor edge. That is fundamentally
-/// unreliable on a real multi-monitor desktop: measured directly (see the
-/// `windows_suppression_delta_demo` example), an identical physical mouse
-/// sweep captured ~4.6px of motion per sample unsuppressed but only
-/// ~1.1px/sample suppressed, with the single-sample max dropping from 31px
-/// to 7px — sustained real motion was being fragmented by hitting *some*
-/// monitor edge over and over (the previous fix widened which edges
-/// counted as "pinned", which only made recentring fire *more* often).
-///
-/// Warping back to one fixed point far from every edge after every single
-/// move — Barrier's own approach on Windows
-/// (`MSWindowsScreen::onMouseMove`, `warpCursorNoFlush(m_xCenter,
-/// m_yCenter)` whenever driving a peer) and exactly what this crate's
-/// macOS `capture.rs` already does with `ANCHOR_X`/`ANCHOR_Y` — sidesteps
-/// the problem instead of reacting to it: the cursor is essentially never
-/// near an edge to begin with, regardless of monitor count or shape.
-///
-/// # Why this doesn't fight anything downstream
-/// The warp is filtered from ever becoming a `MouseMoveAbs` reading at all
-/// (see the `injected` check below); only the true `MouseDelta`s it keeps
-/// alive are forwarded, and those are what `seam-core::session` relays to
-/// the peer as continued motion while driving. Reclaim itself now lives on
-/// the driven side (`ControlMessage::ReleaseBack`), so a recenter warp
-/// can't be mistaken for a reclaim gesture.
-fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
-    // `LLMHF_INJECTED` marks an event as having come from `SendInput`/
-    // `SetCursorPos` rather than real hardware — exactly what the anchor
-    // warp below generates. Silently resync the delta baseline to it and
-    // stop: it must never be treated as real motion, or it would both
-    // double-count as a spurious `MouseDelta` and look like a false
-    // reclaim gesture.
-    if (info.flags & LLMHF_INJECTED) != 0 {
-        LAST_REAL_POS.with(|cell| *cell.borrow_mut() = Some(info.pt));
-        return None;
-    }
+/// Packs an `(x, y)` pair into a thread-message's `WPARAM`/`LPARAM` —
+/// sign-extended through the pointer-sized fields so [`unpack_point`]
+/// round-trips negative coordinates (a monitor left of the primary has
+/// negative virtual-desktop coordinates) exactly.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn pack_point(x: i32, y: i32) -> (WPARAM, LPARAM) {
+    (WPARAM(x as isize as usize), LPARAM(y as isize))
+}
 
-    let previous = LAST_REAL_POS.with(|cell| cell.borrow_mut().replace(info.pt));
-    let suppressed = SUPPRESS.load(Ordering::SeqCst);
-    if let Some(previous) = previous {
-        let dx = info.pt.x - previous.x;
-        let dy = info.pt.y - previous.y;
-        // While suppressed, `previous` is always the anchor (the warp
-        // below runs after every real move), so this delta measures
-        // straight from the anchor — exactly the quantity `is_bogus_delta`
-        // is calibrated against.
-        if (dx != 0 || dy != 0) && !(suppressed && is_bogus_delta(dx, dy)) {
-            forward(InputEvent::MouseDelta { dx, dy });
+/// Inverse of [`pack_point`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn unpack_point(wparam: WPARAM, lparam: LPARAM) -> (i32, i32) {
+    (wparam.0 as isize as i32, lparam.0 as i32)
+}
+
+/// Warps the cursor to `(x, y)` while fencing off both the resulting
+/// synthetic move and any real hardware move that races it — Barrier's
+/// `warpCursorNoFlush` (`MSWindowsScreen.cpp`), ported exactly. MUST be
+/// called from the capture pump thread (the same thread the low-level
+/// hooks and this thread's own message queue belong to); `set_suppression`
+/// deliberately does NOT call this itself (see its doc comment) since it
+/// runs on the session thread instead.
+fn warp_cursor_no_flush(x: i32, y: i32) {
+    // SAFETY: `GetCurrentThreadId` has no preconditions; this always
+    // returns the id of whichever thread is executing right now, which by
+    // this function's contract is the pump thread itself.
+    let tid = unsafe { GetCurrentThreadId() };
+    let (wx, wy) = pack_point(x, y);
+    // SAFETY: posting to our own thread's message queue with a plain
+    // integer payload; the pump loop's `PRE_WARP_MSG` arm reads it back via
+    // `unpack_point`.
+    let _ = unsafe { PostThreadMessageW(tid, PRE_WARP_MSG, wx, wy) };
+    // SAFETY: `SetCursorPos` takes plain integer coordinates.
+    let _ = unsafe { SetCursorPos(x, y) };
+    // Yield the timeslice: there's a race where a hardware move occurs but
+    // the hook isn't serviced yet because this thread has the CPU; without
+    // yielding here, `POST_WARP_MSG` could get posted before that hardware
+    // event's own `MOUSE_MOVE_MSG`, defeating the fence below. Barrier's
+    // `ARCH->sleep(0.0)`, same rationale (`MSWindowsScreen.cpp:1526-1541`).
+    std::thread::yield_now();
+    // SAFETY: as above.
+    let _ = unsafe { PostThreadMessageW(tid, POST_WARP_MSG, WPARAM(0), LPARAM(0)) };
+}
+
+/// Discards every message in `[MOUSE_MOVE_MSG, POST_WARP_MSG]` until
+/// `POST_WARP_MSG` itself arrives — Barrier's exact `BARRIER_MSG_PRE_WARP`
+/// handler (`MSWindowsScreen.cpp:994-1010`). This is what makes the warp
+/// safe: it deterministically eats both `SetCursorPos`'s own synthetic echo
+/// and any real hardware move that raced it, rather than trying to
+/// distinguish them after the fact.
+fn discard_until_post_warp() {
+    let mut msg = MSG::default();
+    loop {
+        // SAFETY: `msg` is a valid, exclusively-owned MSG the OS fills in;
+        // `GetMessageW`'s range filter is the documented way to restrict
+        // which messages it retrieves.
+        let ok = unsafe { GetMessageW(&raw mut msg, None, MOUSE_MOVE_MSG, POST_WARP_MSG) };
+        if !ok.as_bool() {
+            // WM_QUIT bypasses GetMessageW's id-range filter (Microsoft
+            // documents it as always retrieved) and would otherwise be
+            // silently consumed here mid-fence, hanging `stop()`'s
+            // `PostThreadMessageW(WM_QUIT)` forever. Repost it so the outer
+            // pump loop still observes it and exits.
+            // SAFETY: posting to our own thread, no preconditions beyond
+            // that.
+            let _ =
+                unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_QUIT, WPARAM(0), LPARAM(0)) };
+            break;
+        }
+        if msg.message == POST_WARP_MSG {
+            break;
         }
     }
+}
 
-    if suppressed {
-        let (ax, ay) = (
-            ANCHOR_X.load(Ordering::SeqCst),
-            ANCHOR_Y.load(Ordering::SeqCst),
-        );
-        // SAFETY: `SetCursorPos` takes plain integer coordinates; the
-        // resulting synthetic `WM_MOUSEMOVE` is what the `LLMHF_INJECTED`
-        // branch above filters, resyncing `LAST_REAL_POS` to the anchor
-        // for the next sample.
-        let _ = unsafe { SetCursorPos(ax, ay) };
+/// Handles one real mouse move already dequeued from the pump thread's own
+/// queue as [`MOUSE_MOVE_MSG`] — mirrors `MSWindowsScreen::onMouseMove`.
+/// `mouse_proc` never calls this directly: it only posts `MOUSE_MOVE_MSG`
+/// and returns immediately, keeping the hook callback itself fast.
+///
+/// Delta is computed by diffing against [`LAST_REAL_POS`] (`MSLLHOOKSTRUCT`
+/// carries no delta field of its own, unlike macOS's
+/// `CGEventGetIntegerValueField` with `kCGMouseEventDeltaX/Y`). Emits
+/// exactly one event, matching Barrier's `isOnScreen` branch: an absolute
+/// position while local, or (after `warp_cursor_no_flush` and a
+/// `is_bogus_delta` pass) an accumulated delta while suppressed — never
+/// both, and only for genuine motion since the fence in
+/// `discard_until_post_warp` already stripped the warp's own echo before it
+/// could ever reach here.
+fn handle_mouse_move(mx: i32, my: i32) {
+    let previous = LAST_REAL_POS.with(|cell| cell.borrow_mut().replace(POINT { x: mx, y: my }));
+    let Some(previous) = previous else {
+        return;
+    };
+    let (dx, dy) = (mx - previous.x, my - previous.y);
+    if dx == 0 && dy == 0 {
+        return;
     }
 
-    Some(InputEvent::MouseMoveAbs {
-        x: info.pt.x,
-        y: info.pt.y,
-    })
+    if !SUPPRESS.load(Ordering::SeqCst) {
+        forward(InputEvent::MouseMoveAbs { x: mx, y: my });
+        return;
+    }
+
+    // Motion on the secondary (peer) screen: warp back to the anchor so the
+    // cursor never approaches an edge, then examine the motion that led up
+    // to this warp.
+    warp_cursor_no_flush(
+        ANCHOR_X.load(Ordering::SeqCst),
+        ANCHOR_Y.load(Ordering::SeqCst),
+    );
+
+    if is_bogus_delta(dx, dy) {
+        tracing::debug!(dx, dy, "dropped bogus motion");
+        return;
+    }
+    forward(InputEvent::MouseDelta { dx, dy });
 }
 
 /// While suppressed, `dx`/`dy` are measured from the fixed anchor (see
@@ -444,8 +529,9 @@ fn handle_mouse_move(info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
 /// of the distance from the anchor to the primary screen's edge, the
 /// physical motion may have been larger than reported — the OS clamps the
 /// cursor at the real screen edge before our hook ever sees it, so a
-/// single very fast flick can under-report. Barrier's own
-/// `bogusZoneSize` check on the same primary-screen-center technique.
+/// single very fast flick can under-report. Barrier keeps this same
+/// `bogusZoneSize` check as a backup even with its PRE_WARP/POST_WARP fence
+/// in place, and so do we.
 fn is_bogus_delta(dx: i32, dy: i32) -> bool {
     let half_width = HALF_WIDTH.load(Ordering::SeqCst);
     let half_height = HALF_HEIGHT.load(Ordering::SeqCst);
@@ -530,7 +616,18 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         // to fit u32 even though it's widened to usize on 64-bit targets.
         let msg = u32::try_from(wparam.0).unwrap_or(u32::MAX);
         let event = match msg {
-            WM_MOUSEMOVE => handle_mouse_move(info),
+            WM_MOUSEMOVE => {
+                // Deferred to the pump thread as `MOUSE_MOVE_MSG` — the
+                // real work (delta computation, the anchor-warp fence) needs
+                // the pump thread's own message queue and can't happen in
+                // this callback, which must return in well under 1ms.
+                let (wx, wy) = pack_point(info.pt.x, info.pt.y);
+                // SAFETY: low-level hooks always run on the thread that
+                // installed them, so `GetCurrentThreadId` here is the pump
+                // thread; posting a plain integer payload to its own queue.
+                let _ = unsafe { PostThreadMessageW(GetCurrentThreadId(), MOUSE_MOVE_MSG, wx, wy) };
+                None
+            }
             WM_LBUTTONDOWN => Some(InputEvent::MouseDown {
                 button: MouseButton::Left,
             }),
