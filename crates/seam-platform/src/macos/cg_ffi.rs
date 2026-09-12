@@ -91,6 +91,16 @@ pub const K_CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 pub const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: u32 = 11; // vertical
 pub const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: u32 = 12; // horizontal
+/// `kCGEventSourceStateID` — which "source" produced this event. Read via
+/// `CGEventGetIntegerValueField` like any other field; the value is one of
+/// `K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE`/`_COMBINED_SESSION_STATE`/
+/// `_PRIVATE` (`CGEventSourceStateID` in `CGEventTypes.h`).
+pub const K_CG_EVENT_SOURCE_STATE_ID: u32 = 45;
+/// Real hardware input carries this state — anything else (our own
+/// `CGEventCreateKeyboardEvent`/`CGEventCreateMouseEvent` calls, created
+/// with a null source) is synthetic. Windows' equivalent is the
+/// `LLMHF_INJECTED`/`LLKHF_INJECTED` hook-struct flags.
+pub const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i64 = 1;
 
 // ─────────────────────────── CGMouseButton ───────────────────────────
 pub const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;

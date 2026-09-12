@@ -46,7 +46,8 @@ use super::cg_ffi::{
     K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_EVENT_LEFT_MOUSE_UP,
     K_CG_EVENT_MOUSE_MOVED, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_EVENT_OTHER_MOUSE_DRAGGED,
     K_CG_EVENT_OTHER_MOUSE_UP, K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
-    K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
+    K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_EVENT_SCROLL_WHEEL, K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE,
+    K_CG_EVENT_SOURCE_STATE_ID, K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
     K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, K_CG_EVENT_TAP_OPTION_DEFAULT,
     K_CG_HEAD_INSERT_EVENT_TAP, K_CG_HID_EVENT_TAP, K_CG_KEYBOARD_EVENT_AUTOREPEAT,
     K_CG_KEYBOARD_EVENT_KEYCODE, K_CG_MOUSE_EVENT_BUTTON_NUMBER,
@@ -621,73 +622,102 @@ unsafe extern "C" fn tap_callback(
         return event;
     }
 
-    let parsed = match event_type {
-        K_CG_EVENT_MOUSE_MOVED
-        | K_CG_EVENT_LEFT_MOUSE_DRAGGED
-        | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
-        | K_CG_EVENT_OTHER_MOUSE_DRAGGED => handle_mouse_moved(event),
-        K_CG_EVENT_LEFT_MOUSE_DOWN => Some(InputEvent::MouseDown {
-            button: MouseButton::Left,
-        }),
-        K_CG_EVENT_LEFT_MOUSE_UP => Some(InputEvent::MouseUp {
-            button: MouseButton::Left,
-        }),
-        K_CG_EVENT_RIGHT_MOUSE_DOWN => Some(InputEvent::MouseDown {
-            button: MouseButton::Right,
-        }),
-        K_CG_EVENT_RIGHT_MOUSE_UP => Some(InputEvent::MouseUp {
-            button: MouseButton::Right,
-        }),
-        K_CG_EVENT_OTHER_MOUSE_DOWN => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let button =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) };
-            Some(InputEvent::MouseDown {
-                button: other_mouse_button(button),
-            })
+    // SAFETY: `event` is valid for the duration of this callback.
+    let is_real_hardware =
+        unsafe { CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_STATE_ID) }
+            == K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE;
+    // Skip parsing/forwarding entirely for our own synthetic events —
+    // `Sink`'s `CGEventCreateKeyboardEvent`/`CGEventCreateMouseEvent` calls
+    // (created with a null source) always read back as something other than
+    // `kCGEventSourceStateHIDSystemState`. Without this, e.g.
+    // `release_all_modifiers`'s key-up sweep on handoff exit gets
+    // immediately re-captured by this same tap and fed back into
+    // `process_capture_event` as if it were fresh local input — the same
+    // self-feedback bug class fixed for Windows' `keyboard_proc`/
+    // `mouse_proc` (`LLKHF_INJECTED`/`LLMHF_INJECTED`), just discovered here
+    // via a real two-machine log capture: it was silently corrupting
+    // `held_modifiers` (blindly toggling on `resolve_flags_changed`'s
+    // membership-based tracking, with no way to tell a synthetic "up" apart
+    // from a real "down") into reporting Shift+Ctrl+Alt+Meta all held,
+    // which then got relayed and injected on the peer — triggering Windows'
+    // Microsoft 365 launcher. This does NOT affect the driven-side reclaim
+    // mechanism: `Session::driven_cursor` is computed entirely from
+    // received `ControlMessage`s, never by observing this machine's own
+    // injected motion through this tap.
+    let parsed = if is_real_hardware {
+        match event_type {
+            K_CG_EVENT_MOUSE_MOVED
+            | K_CG_EVENT_LEFT_MOUSE_DRAGGED
+            | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+            | K_CG_EVENT_OTHER_MOUSE_DRAGGED => handle_mouse_moved(event),
+            K_CG_EVENT_LEFT_MOUSE_DOWN => Some(InputEvent::MouseDown {
+                button: MouseButton::Left,
+            }),
+            K_CG_EVENT_LEFT_MOUSE_UP => Some(InputEvent::MouseUp {
+                button: MouseButton::Left,
+            }),
+            K_CG_EVENT_RIGHT_MOUSE_DOWN => Some(InputEvent::MouseDown {
+                button: MouseButton::Right,
+            }),
+            K_CG_EVENT_RIGHT_MOUSE_UP => Some(InputEvent::MouseUp {
+                button: MouseButton::Right,
+            }),
+            K_CG_EVENT_OTHER_MOUSE_DOWN => {
+                // SAFETY: `event` is valid for the duration of this callback.
+                let button =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) };
+                Some(InputEvent::MouseDown {
+                    button: other_mouse_button(button),
+                })
+            }
+            K_CG_EVENT_OTHER_MOUSE_UP => {
+                // SAFETY: `event` is valid for the duration of this callback.
+                let button =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) };
+                Some(InputEvent::MouseUp {
+                    button: other_mouse_button(button),
+                })
+            }
+            K_CG_EVENT_SCROLL_WHEEL => {
+                // SAFETY: `event` is valid for the duration of this callback.
+                let dy = unsafe {
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
+                };
+                // SAFETY: same as above.
+                let dx = unsafe {
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
+                };
+                Some(InputEvent::Scroll {
+                    dx: i32::try_from(dx).unwrap_or(0),
+                    dy: i32::try_from(dy).unwrap_or(0),
+                })
+            }
+            K_CG_EVENT_KEY_DOWN => {
+                // SAFETY: `event` is valid for the duration of this callback.
+                let raw_code =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+                // SAFETY: same as above.
+                let repeat =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT) }
+                        != 0;
+                Some(InputEvent::KeyDown {
+                    code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
+                    repeat,
+                })
+            }
+            K_CG_EVENT_KEY_UP => {
+                // SAFETY: `event` is valid for the duration of this callback.
+                let raw_code =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+                Some(InputEvent::KeyUp {
+                    code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
+                })
+            }
+            K_CG_EVENT_FLAGS_CHANGED => resolve_flags_changed(event),
+            _ => None,
         }
-        K_CG_EVENT_OTHER_MOUSE_UP => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let button =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) };
-            Some(InputEvent::MouseUp {
-                button: other_mouse_button(button),
-            })
-        }
-        K_CG_EVENT_SCROLL_WHEEL => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let dy =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1) };
-            // SAFETY: same as above.
-            let dx =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2) };
-            Some(InputEvent::Scroll {
-                dx: i32::try_from(dx).unwrap_or(0),
-                dy: i32::try_from(dy).unwrap_or(0),
-            })
-        }
-        K_CG_EVENT_KEY_DOWN => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let raw_code =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-            // SAFETY: same as above.
-            let repeat =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT) } != 0;
-            Some(InputEvent::KeyDown {
-                code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
-                repeat,
-            })
-        }
-        K_CG_EVENT_KEY_UP => {
-            // SAFETY: `event` is valid for the duration of this callback.
-            let raw_code =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-            Some(InputEvent::KeyUp {
-                code: cgkeycode_to_keycode(u16::try_from(raw_code).unwrap_or(0)),
-            })
-        }
-        K_CG_EVENT_FLAGS_CHANGED => resolve_flags_changed(event),
-        _ => None,
+    } else {
+        None
     };
 
     if let Some(parsed) = parsed {
