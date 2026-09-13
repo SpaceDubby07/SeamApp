@@ -53,7 +53,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER,
-    RID_INPUT, RIDEV_INPUTSINK, RIDEV_NOHOTKEYS, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
+    RID_INPUT, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -102,7 +102,7 @@ static HALF_HEIGHT: AtomicI32 = AtomicI32::new(0);
 /// never succeeded (a soft dependency — see `register_raw_keyboard`'s
 /// docs). Set once on the capture thread; read from `set_suppression`,
 /// which runs on the session thread, not the capture pump thread — see
-/// [`update_raw_keyboard_hotkeys`] for why that's fine.
+/// [`update_raw_keyboard_legacy_block`] for why that's fine.
 static RAW_INPUT_HWND_PTR: AtomicIsize = AtomicIsize::new(0);
 
 /// `GetTickCount()` (ms since boot) when a hook callback last fired.
@@ -231,12 +231,11 @@ impl InputCapture for Capture {
     }
 
     fn stop(&mut self) -> Result<(), PlatformError> {
-        // Never tear down with suppression (or the Windows-key hotkey
-        // override it implies) still latched on — this runs on every
-        // session end, including an `abort()` mid-handoff (via `Session`'s
-        // `Drop`).
+        // Never tear down with suppression (or the legacy-keyboard-message
+        // block it implies) still latched on — this runs on every session
+        // end, including an `abort()` mid-handoff (via `Session`'s `Drop`).
         SUPPRESS.store(false, Ordering::SeqCst);
-        update_raw_keyboard_hotkeys(false);
+        update_raw_keyboard_legacy_block(false);
         if let Some(thread_id) = self.thread_id.take() {
             // SAFETY: posting WM_QUIT to a thread ID we obtained from
             // `GetCurrentThreadId` on that same (still-running) thread is
@@ -256,7 +255,7 @@ impl InputCapture for Capture {
 
     fn set_suppression(&mut self, suppress: bool) -> Result<(), PlatformError> {
         SUPPRESS.store(suppress, Ordering::SeqCst);
-        update_raw_keyboard_hotkeys(suppress);
+        update_raw_keyboard_legacy_block(suppress);
         if suppress {
             // SAFETY: `GetSystemMetrics` takes a plain metric index and has
             // no preconditions. `SM_CXSCREEN`/`SM_CYSCREEN` are the PRIMARY
@@ -539,17 +538,22 @@ fn create_message_window() -> Result<HWND, String> {
 /// Builds the keyboard `RAWINPUTDEVICE` registration. `RIDEV_INPUTSINK` is
 /// what makes delivery work even while our window has no focus and isn't
 /// foreground — the normal case, since we're capturing global input while
-/// some other window is active. `RIDEV_NOHOTKEYS` is added on top of that
-/// when `nohotkeys` is set — see [`update_raw_keyboard_hotkeys`] for why
-/// that needs to be toggleable rather than fixed at registration time.
-fn raw_keyboard_device(hwnd: HWND, nohotkeys: bool) -> RAWINPUTDEVICE {
+/// some other window is active. `RIDEV_NOLEGACY` is added on top of that
+/// when `block_legacy` is set — see [`update_raw_keyboard_legacy_block`]
+/// for why that needs to be toggleable rather than fixed at registration
+/// time, and why `RIDEV_NOLEGACY` rather than the weaker `RIDEV_NOHOTKEYS`.
+fn raw_keyboard_device(hwnd: HWND, block_legacy: bool) -> RAWINPUTDEVICE {
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
     const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
     let mut flags = RIDEV_INPUTSINK;
-    if nohotkeys {
+    if block_legacy {
         // Rebuild the flag set via `.0`, as `inject.rs`'s mouse-flags path
         // does, rather than relying on a `BitOr` impl for the newtype.
-        flags = RAWINPUTDEVICE_FLAGS(flags.0 | RIDEV_NOHOTKEYS.0);
+        // `RIDEV_NOLEGACY` and `RIDEV_NOHOTKEYS` are documented as mutually
+        // exclusive on the same registration — moot here since we only ever
+        // set one of them (never both), but it's why this isn't `|=`-ing
+        // both unconditionally.
+        flags = RAWINPUTDEVICE_FLAGS(flags.0 | RIDEV_NOLEGACY.0);
     }
     RAWINPUTDEVICE {
         usUsagePage: HID_USAGE_PAGE_GENERIC,
@@ -594,26 +598,35 @@ fn register_raw_keyboard(hwnd: HWND) -> Result<(), String> {
 }
 
 /// Re-registers the keyboard Raw Input device with (or without)
-/// `RIDEV_NOHOTKEYS` to match `suppress`. Called from `set_suppression` on
+/// `RIDEV_NOLEGACY` to match `suppress`. Called from `set_suppression` on
 /// the session thread, not the capture pump thread that owns the target
 /// window — safe anyway, since `RegisterRawInputDevices` is a process-wide
 /// registration keyed by `hwndTarget`, not thread-affine the way
 /// `SetWindowsHookExW` is.
 ///
-/// Without this, holding this machine's own Windows key while it's
-/// actively driving a peer (`SUPPRESS` on) lets the local shell process
-/// WIN+&lt;letter&gt; combos (Quick Settings, Task View, lock, ...) as its
-/// own OS hotkey in parallel with our capture. Beyond popping unwanted
-/// local UI, the shell claiming a combo like that is known to eat the
-/// matching key-up before Raw Input ever delivers it to us — leaving that
-/// modifier stuck "held" in our tracking for the rest of the session (the
-/// Tier 7.1 stuck-modifier failure class, just triggered mid-session
-/// instead of at a handoff boundary). `RIDEV_NOHOTKEYS` is Microsoft's
-/// documented mechanism for exactly this: the same one RDP/VM clients use
-/// so the guest, not the host shell, owns the Windows key while input
-/// capture is active. Toggled rather than always-on so this machine's own
-/// Windows-key shortcuts stay normal whenever it isn't actively driving.
-fn update_raw_keyboard_hotkeys(suppress: bool) {
+/// # Why `RIDEV_NOLEGACY`, not `RIDEV_NOHOTKEYS`
+/// An earlier version of this used `RIDEV_NOHOTKEYS`, which stops the shell
+/// from claiming WIN+&lt;letter&gt; combos (Quick Settings, Task View, lock,
+/// ...) as its own OS hotkey. That covers the Windows key specifically, but
+/// a real test showed the same class of leak elsewhere: e.g. ALT+SPACE
+/// still popped the local system menu while this machine was actively
+/// driving a peer. ALT+SPACE isn't a shell hotkey at all — it's the OS
+/// translating a legacy `WM_SYSKEYDOWN` into `WM_SYSCOMMAND`/`SC_KEYMENU`
+/// via `DefWindowProc`, upstream of both `RIDEV_NOHOTKEYS` and our
+/// `WH_KEYBOARD_LL` suppression gate (`keyboard_proc`) — a hook chain any
+/// other globally-installed hook, or a device's own driver-level input
+/// path, can still get ahead of, per `register_raw_keyboard`'s docs.
+/// `RIDEV_NOLEGACY` stops Windows from generating *any* legacy keyboard
+/// messages for this device at all, which subsumes what `RIDEV_NOHOTKEYS`
+/// did (no legacy message means the shell's WIN+&lt;letter&gt; handling
+/// never fires either) while also closing the ALT+SPACE/ALT+TAB/ALT+ESC
+/// class, all at the message-generation layer itself rather than in a hook
+/// chain other software can race. The two flags are documented as mutually
+/// exclusive on one registration, so this replaces rather than adds to the
+/// old flag. Toggled rather than always-on so this machine's own local
+/// keyboard shortcuts (including whatever Seam's own UI needs) stay normal
+/// whenever it isn't actively driving.
+fn update_raw_keyboard_legacy_block(suppress: bool) {
     let ptr = RAW_INPUT_HWND_PTR.load(Ordering::SeqCst);
     if ptr == 0 {
         // Raw Input registration never succeeded — nothing to update.
@@ -634,7 +647,7 @@ fn update_raw_keyboard_hotkeys(suppress: bool) {
         tracing::warn!(
             error = %e,
             suppress,
-            "failed to update RIDEV_NOHOTKEYS for keyboard raw input"
+            "failed to update RIDEV_NOLEGACY for keyboard raw input"
         );
     }
 }
