@@ -5,13 +5,16 @@ interface Props {
   rttMicros: number | null;
   /** The connection dropped and the app is retrying with backoff. */
   reconnecting: boolean;
+  /** Called when the user clicks "Disconnect" (or "Cancel" while
+   * reconnecting). Omitted entirely when there's nothing to disconnect. */
+  onDisconnect: () => void;
 }
 
-/** Lives inline in the titlebar: a connection dot, the peer's name, and
- * latency. Renders nothing while there's no peer and nothing to retry —
- * the connect screen already says "not connected" more prominently than
- * a status strip could. */
-export function StatusBar({ peerName, rttMicros, reconnecting }: Props) {
+/** Lives inline in the titlebar: a connection dot, the peer's name,
+ * latency, and a disconnect action. Renders nothing while there's no peer
+ * and nothing to retry — the connect screen already says "not connected"
+ * more prominently than a status strip could. */
+export function StatusBar({ peerName, rttMicros, reconnecting, onDisconnect }: Props) {
   if (!peerName && !reconnecting) return null;
 
   if (reconnecting) {
@@ -21,6 +24,9 @@ export function StatusBar({ peerName, rttMicros, reconnecting }: Props) {
         <span className="status-peer">
           Reconnecting{peerName ? ` to ${peerName}` : ""}…
         </span>
+        <button className="link-btn" onClick={onDisconnect}>
+          Cancel
+        </button>
       </span>
     );
   }
@@ -38,6 +44,9 @@ export function StatusBar({ peerName, rttMicros, reconnecting }: Props) {
           <span title="Control-channel round-trip">{latency}</span>
         </>
       )}
+      <button className="link-btn" onClick={onDisconnect}>
+        Disconnect
+      </button>
     </span>
   );
 }

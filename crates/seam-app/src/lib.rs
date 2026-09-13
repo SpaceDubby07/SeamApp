@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use directories::ProjectDirs;
-use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use seam_core::config::Config;
@@ -116,6 +118,57 @@ fn start_discovery(app: &tauri::AppHandle, config: &Config) -> Discovery {
     discovery
 }
 
+/// Builds the system tray icon: "Show Seam" restores the main window,
+/// "Quit Seam" actually exits. Everything else that would otherwise close
+/// the app — the window's own close button — just hides it instead (see
+/// `run`'s `on_window_event`), so pairing/discovery/transfers/clipboard
+/// sync keep running with the window out of the way, the same "minimize
+/// to tray" convention most background-y utilities use.
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Seam", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Seam", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    // `tauri_build::build()` (see build.rs) embeds the `bundle.icon` list
+    // from `tauri.conf.json` as a resource at compile time, populating
+    // this in both `cargo tauri dev` and a release bundle — no separate
+    // PNG-decoding dependency needed just to hand the same icon to the
+    // tray. Skip the tray icon image entirely (menu/click handling still
+    // work) rather than panic if it's ever somehow absent.
+    let mut builder = TrayIconBuilder::new().menu(&menu).tooltip("Seam");
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+
+    builder
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "quit" => app.exit(0),
+            "show" => show_main_window(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// Un-hides and focuses the main window — the tray's "Show Seam" item and
+/// left-click both funnel through this.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_logging();
@@ -146,8 +199,22 @@ pub fn run() {
             });
 
             connect::spawn_accept_loop(handle.clone());
+            setup_tray(handle)?;
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // The window's close button hides it instead of exiting the
+            // app — the tray's "Quit Seam" (which calls `app.exit`
+            // directly, bypassing this) is the only way to actually
+            // terminate. Only the "main" window exists, but this handler
+            // runs for any window Tauri manages, hence the name check.
+            if window.label() == "main"
+                && let WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_config,

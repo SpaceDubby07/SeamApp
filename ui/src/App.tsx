@@ -67,6 +67,7 @@ function App() {
           peerName={connected?.peer_display_name ?? null}
           rttMicros={rttMicros}
           reconnecting={reconnecting}
+          onDisconnect={() => ipc.disconnect().catch(console.error)}
         />
         <button
           className="icon-btn"
