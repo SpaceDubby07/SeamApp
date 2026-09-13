@@ -23,6 +23,17 @@ use serde::{Deserialize, Serialize};
 /// granularity. 512 KiB.
 pub const CHUNK_SIZE: u32 = 512 * 1024;
 
+/// Minimum gap between `SessionEvent::Progress` emissions for the same
+/// transfer. At 512 KiB chunks, a fast LAN transfer produces hundreds of
+/// chunks per second — emitting one event per chunk floods the Tauri IPC/
+/// render pipeline badly enough that the progress bar visually stalls and
+/// then jumps to done, rather than animating smoothly. ~10 Hz is plenty
+/// for a human-visible progress bar and cuts event volume by an order of
+/// magnitude or more; [`OutgoingTransfer::should_report_progress`] and
+/// [`IncomingTransfer::should_report_progress`] apply this, but always let
+/// the final chunk through regardless so the bar visibly reaches 100%.
+pub const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Per-peer policy for incoming transfer offers (Tier 7.5). Stored on
 /// [`crate::config::Config`], not globally — v1's single-peer
 /// simplification means "the one peer" is implicit rather than keyed by

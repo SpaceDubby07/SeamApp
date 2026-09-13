@@ -5,11 +5,12 @@
 //! one chunk write. This module only ever touches the local filesystem.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::protocol::{FileManifest, TransferId};
-use crate::transfer::TransferError;
+use crate::transfer::{PROGRESS_EMIT_INTERVAL, TransferError};
 
 /// A file offered for send: open and ready to stream once the peer's
 /// `TransferAccept` arrives (Tier 7.5's flow — chunks never start before
@@ -29,6 +30,9 @@ pub struct OutgoingTransfer {
     /// Set once the peer's `TransferAccept` arrives — `Session` only
     /// starts calling `read_next_chunk` once this is `true`.
     pub accepted: bool,
+    /// When [`Self::should_report_progress`] last returned `true`. `None`
+    /// means "never yet" — always due.
+    last_progress_emit: Option<Instant>,
 }
 
 impl OutgoingTransfer {
@@ -51,7 +55,23 @@ impl OutgoingTransfer {
             file,
             bytes_sent: 0,
             accepted: false,
+            last_progress_emit: None,
         })
+    }
+
+    /// Whether enough time has passed since the last progress report to
+    /// send another one now — see [`PROGRESS_EMIT_INTERVAL`]. Updates the
+    /// internal timestamp when it returns `true`, so repeated calls
+    /// naturally space themselves out.
+    pub fn should_report_progress(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_progress_emit
+            .is_none_or(|t| now.duration_since(t) >= PROGRESS_EMIT_INTERVAL);
+        if due {
+            self.last_progress_emit = Some(now);
+        }
+        due
     }
 
     /// Seeks to `resume_from` on `TransferAccept`, marking this transfer

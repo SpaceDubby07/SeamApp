@@ -838,17 +838,24 @@ impl Session {
                         data,
                     })
                     .await?;
-                let bytes_done = self
-                    .current_outgoing
-                    .as_ref()
-                    .map_or(total, |t| t.bytes_sent);
-                let _ = self.event_tx.send(SessionEvent::Progress {
-                    transfer_id,
-                    name,
-                    incoming: false,
-                    bytes_done,
-                    total,
-                });
+                // Throttled (see `PROGRESS_EMIT_INTERVAL`'s docs) — one
+                // event per 512 KiB chunk floods the IPC/render pipeline
+                // on a fast LAN. Always let the last chunk through
+                // regardless, so the bar visibly reaches 100%.
+                let Some(outgoing) = self.current_outgoing.as_mut() else {
+                    return Ok(());
+                };
+                let bytes_done = outgoing.bytes_sent;
+                let is_last_chunk = bytes_done >= total;
+                if outgoing.should_report_progress() || is_last_chunk {
+                    let _ = self.event_tx.send(SessionEvent::Progress {
+                        transfer_id,
+                        name,
+                        incoming: false,
+                        bytes_done,
+                        total,
+                    });
+                }
             }
             Ok(None) => {
                 let hash = outgoing.manifest.hash;
@@ -1014,14 +1021,22 @@ impl Session {
             });
             return Ok(());
         }
-        let bytes_done = self.incoming_transfers[&transfer_id].bytes_received;
-        let _ = self.event_tx.send(SessionEvent::Progress {
-            transfer_id,
-            name,
-            incoming: true,
-            bytes_done,
-            total,
-        });
+        // Throttled, same as the outgoing side — see
+        // `PROGRESS_EMIT_INTERVAL`'s docs.
+        let Some(incoming) = self.incoming_transfers.get_mut(&transfer_id) else {
+            return Ok(());
+        };
+        let bytes_done = incoming.bytes_received;
+        let is_last_chunk = bytes_done >= total;
+        if incoming.should_report_progress() || is_last_chunk {
+            let _ = self.event_tx.send(SessionEvent::Progress {
+                transfer_id,
+                name,
+                incoming: true,
+                bytes_done,
+                total,
+            });
+        }
         self.maybe_finalize_incoming(transfer_id).await;
         Ok(())
     }

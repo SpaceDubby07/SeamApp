@@ -2,12 +2,13 @@
 //! bookkeeping, and hash verification on completion (Tier 7.5).
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::protocol::{FileManifest, TransferId};
-use crate::transfer::TransferError;
 use crate::transfer::manifest::{ResumeState, hash_file, part_path};
+use crate::transfer::{PROGRESS_EMIT_INTERVAL, TransferError};
 
 /// A file being received: bytes land in `part_path(dest_path)` until
 /// `finalize` verifies the whole thing and renames it into place.
@@ -34,6 +35,9 @@ pub struct IncomingTransfer {
     /// actually runs once BOTH this is set AND `bytes_received` reaches
     /// `manifest.size` (see `is_ready_to_finalize`).
     pub complete_hash: Option<[u8; 32]>,
+    /// When [`Self::should_report_progress`] last returned `true`. `None`
+    /// means "never yet" — always due.
+    last_progress_emit: Option<Instant>,
 }
 
 impl IncomingTransfer {
@@ -94,6 +98,7 @@ impl IncomingTransfer {
                 file,
                 bytes_received: resume_from,
                 complete_hash: None,
+                last_progress_emit: None,
             },
             resume_from,
         ))
@@ -115,6 +120,21 @@ impl IncomingTransfer {
         .save(&self.dest_path)
         .await?;
         Ok(())
+    }
+
+    /// Whether enough time has passed since the last progress report to
+    /// send another one now — see [`PROGRESS_EMIT_INTERVAL`]. Updates the
+    /// internal timestamp when it returns `true`, so repeated calls
+    /// naturally space themselves out.
+    pub fn should_report_progress(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_progress_emit
+            .is_none_or(|t| now.duration_since(t) >= PROGRESS_EMIT_INTERVAL);
+        if due {
+            self.last_progress_emit = Some(now);
+        }
+        due
     }
 
     /// True once every byte has arrived AND the sender's `TransferComplete`
