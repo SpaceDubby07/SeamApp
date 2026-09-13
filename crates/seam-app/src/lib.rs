@@ -233,6 +233,23 @@ pub fn run() {
             commands::clear_logs,
             commands::export_logs,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // macOS-specific: clicking the Dock icon while the window is
+            // hidden (not closed — see `on_window_event` above) fires
+            // this instead of doing anything on its own. Without handling
+            // it, the app visibly stays running (Dock icon still there,
+            // as it should) but clicking that icon does nothing at all —
+            // the window never comes back. A no-op on Windows/Linux,
+            // where the tray icon is the way back either way.
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+                && !has_visible_windows
+            {
+                show_main_window(app_handle);
+            }
+        });
 }
