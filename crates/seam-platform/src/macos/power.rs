@@ -30,13 +30,21 @@ const NO_ASSERTION: IoPmAssertionId = 0;
 /// `kCFStringEncodingUTF8` (`CFString.h`).
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
+/// `kIOPMAssertionTypePreventUserIdleSystemSleep` (`IOPMLib.h`) — blocks idle
+/// system sleep specifically (not display sleep); matches Barrier's
+/// `kSYSTEM`, the critical half of its Windows fix (a slept machine is the
+/// unrecoverable failure mode; a dimmed display is merely annoying).
+///
+/// This is a C preprocessor macro in `IOPMLib.h`
+/// (`#define kIOPMAssertionTypePreventUserIdleSystemSleep
+/// kIOPMAssertPreventUserIdleSystemSleep`, itself `#define`d to
+/// `CFSTR("PreventUserIdleSystemSleep")`) — not an exported symbol, so it
+/// can't be an `extern "C" static` on the Rust side. Build the `CFStringRef`
+/// from the same literal at runtime instead.
+const ASSERTION_TYPE_PREVENT_USER_IDLE_SYSTEM_SLEEP: &str = "PreventUserIdleSystemSleep";
+
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    /// `kIOPMAssertionTypePreventUserIdleSystemSleep` (`IOPMLib.h`) — blocks
-    /// idle system sleep specifically (not display sleep); matches Barrier's
-    /// `kSYSTEM`, the critical half of its Windows fix (a slept machine is
-    /// the unrecoverable failure mode; a dimmed display is merely annoying).
-    static kIOPMAssertionTypePreventUserIdleSystemSleep: CFStringRef;
     fn IOPMAssertionCreateWithName(
         assertion_type: CFStringRef,
         assertion_level: IoPmAssertionLevel,
@@ -78,6 +86,22 @@ pub fn set_being_driven(being_driven: bool) {
 }
 
 fn acquire() {
+    let Ok(assertion_type) = CString::new(ASSERTION_TYPE_PREVENT_USER_IDLE_SYSTEM_SLEEP) else {
+        // Never actually fails for a fixed ASCII literal with no interior
+        // nul, but `set_being_driven` must not panic over this.
+        return;
+    };
+    // SAFETY: `assertion_type` is a valid, nul-terminated C string for the
+    // duration of this call; a null allocator means "use the default
+    // allocator", which `CFStringCreateWithCString` documents as valid.
+    let cf_assertion_type = unsafe {
+        CFStringCreateWithCString(
+            std::ptr::null(),
+            assertion_type.as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        )
+    };
+
     let Ok(name) = CString::new("Seam: being driven remotely") else {
         // Never actually fails for a fixed ASCII literal with no interior
         // nul, but `set_being_driven` must not panic over this.
@@ -91,19 +115,24 @@ fn acquire() {
     };
 
     let mut id: IoPmAssertionId = NO_ASSERTION;
-    // SAFETY: `kIOPMAssertionTypePreventUserIdleSystemSleep` is a static
-    // CFStringRef IOKit owns for the process's lifetime; `cf_name` is valid
-    // (or null, which IOKit accepts as "no name") from just above; `id` is
-    // a valid, exclusively-owned out-parameter.
+    // SAFETY: `cf_assertion_type` and `cf_name` are each either valid (from
+    // just above) or null, which IOKit accepts as "no name" for `cf_name`;
+    // `id` is a valid, exclusively-owned out-parameter.
     let result = unsafe {
         IOPMAssertionCreateWithName(
-            kIOPMAssertionTypePreventUserIdleSystemSleep,
+            cf_assertion_type,
             K_IOPM_ASSERTION_LEVEL_ON,
             cf_name,
             &raw mut id,
         )
     };
 
+    if !cf_assertion_type.is_null() {
+        // SAFETY: balances the successful `CFStringCreateWithCString` above
+        // — `IOPMAssertionCreateWithName` copies what it needs, it doesn't
+        // take ownership of ours.
+        unsafe { CFRelease(cf_assertion_type) };
+    }
     if !cf_name.is_null() {
         // SAFETY: balances the successful `CFStringCreateWithCString`
         // above — `IOPMAssertionCreateWithName` copies what it needs from
