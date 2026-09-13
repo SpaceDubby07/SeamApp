@@ -39,7 +39,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 
@@ -52,8 +52,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
-    RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
+    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER,
+    RID_INPUT, RIDEV_INPUTSINK, RIDEV_NOHOTKEYS, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -96,6 +96,14 @@ static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 /// before we saw it (Barrier's `bogusZoneSize` check).
 static HALF_WIDTH: AtomicI32 = AtomicI32::new(0);
 static HALF_HEIGHT: AtomicI32 = AtomicI32::new(0);
+
+/// Raw pointer value of the message-only window created for keyboard Raw
+/// Input (see `create_message_window`), or 0 if Raw Input registration
+/// never succeeded (a soft dependency — see `register_raw_keyboard`'s
+/// docs). Set once on the capture thread; read from `set_suppression`,
+/// which runs on the session thread, not the capture pump thread — see
+/// [`update_raw_keyboard_hotkeys`] for why that's fine.
+static RAW_INPUT_HWND_PTR: AtomicIsize = AtomicIsize::new(0);
 
 /// `GetTickCount()` (ms since boot) when a hook callback last fired.
 /// Compared by the watchdog against [`GetLastInputInfo`]. Written from the
@@ -223,10 +231,12 @@ impl InputCapture for Capture {
     }
 
     fn stop(&mut self) -> Result<(), PlatformError> {
-        // Never tear down with suppression still latched on — this runs on
-        // every session end, including an `abort()` mid-handoff (via
-        // `Session`'s `Drop`).
+        // Never tear down with suppression (or the Windows-key hotkey
+        // override it implies) still latched on — this runs on every
+        // session end, including an `abort()` mid-handoff (via `Session`'s
+        // `Drop`).
         SUPPRESS.store(false, Ordering::SeqCst);
+        update_raw_keyboard_hotkeys(false);
         if let Some(thread_id) = self.thread_id.take() {
             // SAFETY: posting WM_QUIT to a thread ID we obtained from
             // `GetCurrentThreadId` on that same (still-running) thread is
@@ -246,6 +256,7 @@ impl InputCapture for Capture {
 
     fn set_suppression(&mut self, suppress: bool) -> Result<(), PlatformError> {
         SUPPRESS.store(suppress, Ordering::SeqCst);
+        update_raw_keyboard_hotkeys(suppress);
         if suppress {
             // SAFETY: `GetSystemMetrics` takes a plain metric index and has
             // no preconditions. `SM_CXSCREEN`/`SM_CYSCREEN` are the PRIMARY
@@ -348,6 +359,7 @@ fn capture_thread_main(
                         }
                     } else {
                         RAW_INPUT_HWND.with(|c| *c.borrow_mut() = Some(hwnd));
+                        RAW_INPUT_HWND_PTR.store(hwnd.0 as isize, Ordering::SeqCst);
                     }
                 }
                 Err(reason) => {
@@ -452,6 +464,7 @@ fn capture_thread_main(
             let _ = DestroyWindow(hwnd);
         }
     }
+    RAW_INPUT_HWND_PTR.store(0, Ordering::SeqCst);
     SINK.with(|cell| *cell.borrow_mut() = None);
     HELD_KEYS.with(|cell| cell.borrow_mut().clear());
 }
@@ -523,10 +536,31 @@ fn create_message_window() -> Result<HWND, String> {
     Ok(hwnd)
 }
 
+/// Builds the keyboard `RAWINPUTDEVICE` registration. `RIDEV_INPUTSINK` is
+/// what makes delivery work even while our window has no focus and isn't
+/// foreground — the normal case, since we're capturing global input while
+/// some other window is active. `RIDEV_NOHOTKEYS` is added on top of that
+/// when `nohotkeys` is set — see [`update_raw_keyboard_hotkeys`] for why
+/// that needs to be toggleable rather than fixed at registration time.
+fn raw_keyboard_device(hwnd: HWND, nohotkeys: bool) -> RAWINPUTDEVICE {
+    const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
+    let mut flags = RIDEV_INPUTSINK;
+    if nohotkeys {
+        // Rebuild the flag set via `.0`, as `inject.rs`'s mouse-flags path
+        // does, rather than relying on a `BitOr` impl for the newtype.
+        flags = RAWINPUTDEVICE_FLAGS(flags.0 | RIDEV_NOHOTKEYS.0);
+    }
+    RAWINPUTDEVICE {
+        usUsagePage: HID_USAGE_PAGE_GENERIC,
+        usUsage: HID_USAGE_GENERIC_KEYBOARD,
+        dwFlags: flags,
+        hwndTarget: hwnd,
+    }
+}
+
 /// Registers this process for raw keyboard input, delivered to `hwnd` as
-/// `WM_INPUT`. `RIDEV_INPUTSINK` is what makes delivery work even while our
-/// window has no focus and isn't foreground — the normal case, since we're
-/// capturing global input while some other window is active.
+/// `WM_INPUT`.
 ///
 /// # Why: `WH_KEYBOARD_LL` alone isn't reliable for this
 /// A real two-machine test showed `WH_KEYBOARD_LL` reliably seeing
@@ -546,14 +580,7 @@ fn create_message_window() -> Result<HWND, String> {
 /// for what a hook can do that Raw Input can't: suppressing local delivery
 /// while `SUPPRESS` is set.
 fn register_raw_keyboard(hwnd: HWND) -> Result<(), String> {
-    const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
-    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
-    let device = RAWINPUTDEVICE {
-        usUsagePage: HID_USAGE_PAGE_GENERIC,
-        usUsage: HID_USAGE_GENERIC_KEYBOARD,
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    };
+    let device = raw_keyboard_device(hwnd, false);
     // SAFETY: `device` is a single, fully-initialized `RAWINPUTDEVICE`
     // targeting `hwnd`, which the caller guarantees is valid and owned by
     // this thread.
@@ -564,6 +591,52 @@ fn register_raw_keyboard(hwnd: HWND) -> Result<(), String> {
         )
     }
     .map_err(|e| format!("RegisterRawInputDevices failed: {e}"))
+}
+
+/// Re-registers the keyboard Raw Input device with (or without)
+/// `RIDEV_NOHOTKEYS` to match `suppress`. Called from `set_suppression` on
+/// the session thread, not the capture pump thread that owns the target
+/// window — safe anyway, since `RegisterRawInputDevices` is a process-wide
+/// registration keyed by `hwndTarget`, not thread-affine the way
+/// `SetWindowsHookExW` is.
+///
+/// Without this, holding this machine's own Windows key while it's
+/// actively driving a peer (`SUPPRESS` on) lets the local shell process
+/// WIN+&lt;letter&gt; combos (Quick Settings, Task View, lock, ...) as its
+/// own OS hotkey in parallel with our capture. Beyond popping unwanted
+/// local UI, the shell claiming a combo like that is known to eat the
+/// matching key-up before Raw Input ever delivers it to us — leaving that
+/// modifier stuck "held" in our tracking for the rest of the session (the
+/// Tier 7.1 stuck-modifier failure class, just triggered mid-session
+/// instead of at a handoff boundary). `RIDEV_NOHOTKEYS` is Microsoft's
+/// documented mechanism for exactly this: the same one RDP/VM clients use
+/// so the guest, not the host shell, owns the Windows key while input
+/// capture is active. Toggled rather than always-on so this machine's own
+/// Windows-key shortcuts stay normal whenever it isn't actively driving.
+fn update_raw_keyboard_hotkeys(suppress: bool) {
+    let ptr = RAW_INPUT_HWND_PTR.load(Ordering::SeqCst);
+    if ptr == 0 {
+        // Raw Input registration never succeeded — nothing to update.
+        return;
+    }
+    let hwnd = HWND(ptr as *mut std::ffi::c_void);
+    let device = raw_keyboard_device(hwnd, suppress);
+    // SAFETY: `hwnd` is the live message-only window created by
+    // `create_message_window`; it's only ever destroyed during
+    // `capture_thread_main`'s teardown, after which `RAW_INPUT_HWND_PTR`
+    // is zeroed — so a non-zero read here means the window is still valid.
+    if let Err(e) = unsafe {
+        RegisterRawInputDevices(
+            &[device],
+            u32::try_from(size_of::<RAWINPUTDEVICE>()).unwrap_or_default(),
+        )
+    } {
+        tracing::warn!(
+            error = %e,
+            suppress,
+            "failed to update RIDEV_NOHOTKEYS for keyboard raw input"
+        );
+    }
 }
 
 /// # Safety
