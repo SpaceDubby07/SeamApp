@@ -146,7 +146,14 @@ export function TransfersPanel({ connected }: Props) {
               incoming: event.incoming,
               total: event.total,
               bytesDone: event.bytes_done,
-              status: "active",
+              // Pausing is a request, not instant on both ends — the
+              // sender doesn't stop until the request round-trips over
+              // the network, so a few chunks already in flight still
+              // land (and emit Progress) after this side has already
+              // optimistically shown "Paused". Don't let those trailing
+              // events flip the label back to "active"; only an actual
+              // Resumed should.
+              status: existing?.status === "paused" ? "paused" : "active",
               path: existing?.path,
               reason: existing?.reason,
               samples,
