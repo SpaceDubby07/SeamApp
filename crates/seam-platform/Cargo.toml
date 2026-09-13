@@ -16,6 +16,7 @@ tokio     = { workspace = true }
 windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging", # message pump, message-only window
+    "Win32_Graphics_Gdi",           # RegisterClassExW/WNDCLASSEXW are gated behind this
     "Win32_System_Threading",       # GetCurrentThreadId, for stop()'s WM_QUIT
     "Win32_System_DataExchange",    # OpenClipboard/SetClipboardData/AddClipboardFormatListener
     "Win32_System_Memory",          # GlobalAlloc/GlobalLock for clipboard payloads
