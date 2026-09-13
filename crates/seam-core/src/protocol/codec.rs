@@ -122,25 +122,17 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtocolErro
 #[cfg(test)]
 mod tests {
     use super::{decode_frame, encode_frame};
-    use crate::protocol::{ControlMessage, MouseButton};
+    use crate::protocol::ControlMessage;
 
     #[test]
     fn round_trips_a_control_message() {
-        let msg = ControlMessage::MouseDown {
-            button: MouseButton::Left,
+        let msg = ControlMessage::Ping {
+            seq: 42,
+            sent_at_micros: 123_456,
         };
         let bytes = encode_frame(&msg, super::CONTROL_MAX_FRAME).expect("encode");
         let decoded: ControlMessage = decode_frame(&bytes).expect("decode");
         assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn mouse_move_is_compact() {
-        // Tier 6.2's claim: a MouseMove should encode to well under the
-        // ~40 bytes a JSON equivalent would take.
-        let msg = ControlMessage::MouseMove { x: 0.5, y: 0.5 };
-        let bytes = encode_frame(&msg, super::CONTROL_MAX_FRAME).expect("encode");
-        assert!(bytes.len() < 16, "encoded to {} bytes", bytes.len());
     }
 
     #[test]

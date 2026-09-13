@@ -5,6 +5,7 @@
   --bg: #191919;
   --panel: #242424;
   --panel-inset: #1c1c1c;
+  --panel-raised: #2b2b2b;
   --text: #ededed;
   --text-dim: #9a9a9a;
   --text-faint: #6b6b6b;
@@ -20,6 +21,16 @@
   --err: #ff6b5e;
   --radius: 12px;
   --radius-sm: 8px;
+  --radius-lg: 20px;
+  --shadow-drawer: -12px 0 32px rgba(0, 0, 0, 0.35);
+  --shadow-panel: 0 1px 0 rgba(255, 255, 255, 0.02) inset;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2.25rem;
 
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable",
     "Segoe UI", system-ui, sans-serif;
@@ -41,6 +52,7 @@
     --bg: #f5f5f5;
     --panel: #ffffff;
     --panel-inset: #fafafa;
+    --panel-raised: #ffffff;
     --text: #161616;
     --text-dim: #666666;
     --text-faint: #999999;
@@ -54,6 +66,8 @@
     --ok: #2ea043;
     --warn: #b06a00;
     --err: #c0392b;
+    --shadow-drawer: -12px 0 32px rgba(0, 0, 0, 0.12);
+    --shadow-panel: 0 1px 0 rgba(0, 0, 0, 0.03) inset;
   }
 }
 
@@ -66,22 +80,14 @@ body {
 }
 
 .app {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 2rem 1.5rem 4.5rem;
-}
-
-h1 {
-  text-align: center;
-  font-size: 1.5rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  margin: 0 0 1.75rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
 }
 
 h2 {
   margin-top: 0;
-  font-size: 1.15rem;
+  font-size: 1.05rem;
   font-weight: 600;
 }
 
@@ -98,7 +104,7 @@ h3 {
   background: var(--panel);
   border-radius: var(--radius);
   padding: 1.25rem 1.5rem;
-  margin-bottom: 1.1rem;
+  box-shadow: var(--shadow-panel);
 }
 
 .field {
@@ -175,6 +181,23 @@ button.primary:hover:not(:disabled) {
   background: var(--control);
 }
 
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--control);
+}
+
 .muted {
   color: var(--text-faint);
   font-size: 0.9em;
@@ -185,23 +208,144 @@ button.primary:hover:not(:disabled) {
   font-size: 0.9em;
 }
 
-/* ── Connection ───────────────────────────────────────────────── */
+/* ── Titlebar ─────────────────────────────────────────────────── */
+.titlebar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0.7rem 1.1rem;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text);
+  flex: 0 0 auto;
+}
+
+.brand-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.titlebar-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.titlebar-status .status-peer {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.status-dot.is-connected {
+  background: var(--ok);
+}
+
+.status-dot.is-reconnecting {
+  background: var(--warn);
+  animation: status-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.status-sep {
+  color: var(--text-faint);
+  opacity: 0.6;
+}
+
+/* ── Main content ─────────────────────────────────────────────── */
+.content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: var(--space-6) var(--space-5) var(--space-6);
+}
+
+/* ── Connect (not-yet-connected hero) ────────────────────────── */
+.hero {
+  width: 100%;
+  max-width: 420px;
+  margin: auto 0;
+}
+
+.hero .panel {
+  padding: 1.75rem 1.75rem;
+}
+
+.hero-title {
+  text-align: center;
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0 0 0.25rem;
+}
+
+.hero-subtitle {
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  margin: 0 0 1.5rem;
+}
+
 .peer-list {
   list-style: none;
   padding: 0;
   margin: 0 0 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
 }
 
 .peer-list li {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid var(--border-faint);
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--panel-inset);
+  border: 1px solid var(--border-faint);
+  transition: border-color 0.15s;
 }
 
-.peer-list li:last-child {
-  border-bottom: none;
+.peer-list li:hover {
+  border-color: var(--border);
 }
 
 .pairing-code {
@@ -222,134 +366,53 @@ button.primary:hover:not(:disabled) {
   margin: 0.5rem 0 1rem;
 }
 
-/* ── Layout canvas (the hero) ─────────────────────────────────── */
-.layout-canvas {
-  position: relative;
-  background: var(--panel-inset);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
+.manual-connect {
+  margin-top: 0.5rem;
 }
 
-.tile {
-  position: absolute;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  border-radius: 6px;
+.manual-connect summary {
+  cursor: pointer;
   font-size: 0.8rem;
-  font-weight: 600;
-  color: #fff;
-  text-align: center;
-  padding: 0.25rem;
-  user-select: none;
-  transition: box-shadow 0.15s;
-}
-
-.local-tile {
-  background: #5a5a5a;
-}
-
-.peer-tile {
-  background: var(--accent);
-  cursor: grab;
-  box-shadow: 0 0 0 1px var(--accent), 0 0 20px var(--accent-wash);
-}
-
-.peer-tile:active {
-  cursor: grabbing;
-}
-
-/* The one local monitor + one peer monitor that form the handoff seam. */
-.seam-tile {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-  z-index: 2;
-}
-.local-tile.seam-tile {
-  box-shadow: 0 0 0 1px var(--accent), 0 0 16px var(--accent-wash);
-}
-
-.tile-res {
-  font-size: 0.7rem;
-  font-weight: 400;
-  opacity: 0.85;
-}
-
-.edge-settings {
-  display: flex;
-  gap: 1rem;
-  margin-top: 1rem;
-}
-
-.edge-settings .field {
-  flex: 1;
-  margin-bottom: 0;
-}
-
-.edge-settings input {
-  width: 100%;
-}
-
-/* ── Input panel ──────────────────────────────────────────────── */
-.check {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin: 0.35rem 0;
-  font-size: 0.9rem;
-}
-
-.check input {
-  flex: 0 0 auto;
-  accent-color: var(--accent);
-}
-
-.hotkey-label {
-  flex: 1;
-  padding: 0.4em 0.7em;
-  border-radius: var(--radius-sm);
-  background: var(--panel-inset);
-  border: 1px solid var(--border-faint);
-  font-size: 0.85em;
-}
-
-.remap-list {
+  color: var(--text-faint);
   list-style: none;
-  padding: 0;
-  margin: 0 0 0.75rem;
+}
+
+.manual-connect summary::-webkit-details-marker {
+  display: none;
+}
+
+.manual-connect summary:hover {
+  color: var(--text-dim);
+}
+
+.manual-connect[open] summary {
+  margin-bottom: 0.6rem;
+}
+
+/* ── Connected view ───────────────────────────────────────────── */
+.workspace {
+  width: 100%;
+  max-width: 640px;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: var(--space-5);
 }
 
-.remap-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.remap-row select {
-  padding: 0.4em 0.6em;
-  font-size: 0.9em;
-}
-
-.remap-arrow {
-  color: var(--text-faint);
-  flex: 0 0 auto;
-}
-
-/* ── Transfers ────────────────────────────────────────────────── */
 .drop-zone {
   border: 2px dashed var(--border);
-  border-radius: 10px;
-  padding: 1.75rem 1rem;
+  border-radius: var(--radius-lg);
+  padding: 3rem 1.5rem;
   text-align: center;
   color: var(--text-faint);
-  font-size: 0.9rem;
+  font-size: 0.95rem;
   transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+}
+
+.drop-zone-icon {
+  font-size: 1.8rem;
+  display: block;
+  margin-bottom: 0.5rem;
+  opacity: 0.8;
 }
 
 .drop-zone.is-over {
@@ -361,16 +424,20 @@ button.primary:hover:not(:disabled) {
 .xfer-list {
   list-style: none;
   padding: 0;
-  margin: 1rem 0 0;
+  margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.6rem;
 }
 
 .xfer {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  gap: 0.4rem;
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  box-shadow: var(--shadow-panel);
 }
 
 .xfer-head {
@@ -401,6 +468,12 @@ button.primary:hover:not(:disabled) {
   transition: width 0.2s linear;
 }
 
+.xfer-done {
+  background: transparent;
+  padding: 0.5rem 0.25rem;
+  box-shadow: none;
+}
+
 .xfer-done .xfer-name {
   font-weight: 400;
   color: var(--text-dim);
@@ -423,7 +496,73 @@ button.primary:hover:not(:disabled) {
   color: var(--err);
 }
 
-/* ── Log panel ────────────────────────────────────────────────── */
+.empty-hint {
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  padding: 1rem 0;
+}
+
+/* ── Settings drawer ──────────────────────────────────────────── */
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(0, 0, 0, 0.25);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.settings-overlay.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.settings-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 31;
+  width: min(360px, 100vw);
+  background: var(--panel);
+  box-shadow: var(--shadow-drawer);
+  padding: 1.5rem;
+  overflow-y: auto;
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+}
+
+.settings-overlay.is-open .settings-drawer {
+  transform: translateX(0);
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.25rem;
+}
+
+.settings-head h2 {
+  margin: 0;
+}
+
+.settings-section {
+  margin-bottom: 1.5rem;
+}
+
+.settings-section:last-child {
+  margin-bottom: 0;
+}
+
+/* ── Log panel (inside settings) ─────────────────────────────── */
+.log-panel {
+  background: transparent;
+  padding: 0;
+}
+
 .log-head {
   display: flex;
   align-items: center;
@@ -431,7 +570,7 @@ button.primary:hover:not(:disabled) {
 }
 
 .log-head h2 {
-  font-size: 1.15rem;
+  font-size: 0.95rem;
 }
 
 .log-controls {
@@ -454,7 +593,7 @@ button.primary:hover:not(:disabled) {
 }
 
 .log-scroll {
-  max-height: 260px;
+  max-height: 220px;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -493,63 +632,4 @@ button.primary:hover:not(:disabled) {
 .log-jump {
   margin-top: 0.5rem;
   font-size: 0.85em;
-}
-
-/* ── Status bar ───────────────────────────────────────────────── */
-.status-bar {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.4rem 1rem;
-  font-size: 0.8rem;
-  color: var(--text-dim);
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
-  backdrop-filter: blur(8px);
-  border-top: 1px solid var(--border);
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--text-faint);
-  flex: 0 0 auto;
-}
-
-.status-dot.is-connected {
-  background: var(--ok);
-}
-
-.status-dot.is-reconnecting {
-  background: var(--warn);
-  animation: status-pulse 1.1s ease-in-out infinite;
-}
-
-@keyframes status-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.3;
-  }
-}
-
-.status-peer {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.status-sep {
-  color: var(--text-faint);
-  opacity: 0.6;
-}
-
-.status-lock {
-  color: var(--warn);
 }

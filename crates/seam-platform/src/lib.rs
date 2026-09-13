@@ -1,13 +1,10 @@
 //! Platform implementations, selected at compile time.
 //!
-//! `seam-core` depends only on the traits it defines and never on a concrete
-//! OS API. This crate provides one implementation per supported OS; which
-//! concrete types get used is decided by `cfg` here and nowhere else, so
-//! `seam-app` never needs to write a `#[cfg]` of its own.
-//!
-//! Windows `InputCapture`/`InputSink`/`ScreenInfo` are implemented as of
-//! M1; macOS stays an empty stub until M5. See
-//! `documentation/kvm-app-build-guide.md`.
+//! `seam-core` depends only on the one trait it defines
+//! (`ClipboardProvider`) and never on a concrete OS API. This crate
+//! provides one implementation per supported OS; which concrete type gets
+//! used is decided by `cfg` here and nowhere else, so `seam-app` never
+//! needs to write a `#[cfg]` of its own.
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
@@ -19,4 +16,4 @@ mod platform;
 #[cfg(windows)]
 pub mod windows;
 
-pub use platform::{Platform, current_platform, has_input_permission, request_input_permission};
+pub use platform::{Platform, current_platform};

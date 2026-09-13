@@ -203,16 +203,19 @@ export function TransfersPanel({ connected }: Props) {
   const history = rows.filter((t) => DONE.includes(t.status)).reverse();
 
   return (
-    <section className="panel">
-      <h2>Transfers</h2>
-
+    <>
       <div className={`drop-zone ${dragOver ? "is-over" : ""}`}>
+        <span className="drop-zone-icon">⇣</span>
         {connected
-          ? "Drop files here to send them to the peer"
+          ? "Drop files here to send them"
           : "Connect to a peer to send files"}
       </div>
 
       {error && <p className="error">{error}</p>}
+
+      {active.length === 0 && history.length === 0 && (
+        <p className="empty-hint">No transfers yet.</p>
+      )}
 
       {active.length > 0 && (
         <ul className="xfer-list">
@@ -306,6 +309,6 @@ export function TransfersPanel({ connected }: Props) {
           </ul>
         </>
       )}
-    </section>
+    </>
   );
 }

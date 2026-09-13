@@ -1,8 +1,8 @@
 //! Shared connection bootstrap: pairing, bulk channel setup, `Session`
 //! construction, and — for outbound connections — the reconnect
-//! supervisor (M12). Used by both the `connect_to_peer` command and the
-//! inbound accept loop, since everything past the initial control
-//! handshake is identical either way.
+//! supervisor. Used by both the `connect_to_peer` command and the inbound
+//! accept loop, since everything past the initial control handshake is
+//! identical either way.
 
 use std::time::Duration;
 
@@ -14,9 +14,7 @@ use seam_core::net::bulk::BulkChannel;
 use seam_core::net::control::ControlChannel;
 use seam_core::net::pairing::pairing_code;
 use seam_core::net::tls::Trust;
-use seam_core::session::{Session, SessionEvent, SessionHandle};
-use seam_core::state::StateMachine;
-use seam_core::topology::{Layout, Rect};
+use seam_core::session::{Session, SessionHandle};
 
 use crate::state::{AppState, BULK_PORT, CONTROL_PORT, CURRENT_OS};
 
@@ -142,53 +140,16 @@ async fn bootstrap_session(
     };
 
     let platform = seam_platform::current_platform();
-    let local_bounds = platform.screens.virtual_bounds();
-    let displays = platform.screens.displays();
-    let (local_node, config_snapshot) = {
-        let config = state.config.lock().expect("mutex poisoned");
-        (config.node_id, config.clone())
-    };
+    let config_snapshot = { state.config.lock().expect("mutex poisoned").clone() };
 
-    // Naive initial placement — immediately to the right, non-overlapping
-    // — good enough to start a session; the user drags the layout canvas
-    // (Tier 8.1) into whatever's actually true, and `SessionCommand::
-    // UpdateLayout` takes it from there. On a reconnect this momentarily
-    // resets the canvas until the peer re-sends its `ScreenConfig`.
-    let initial_peer_bounds = Rect {
-        x: local_bounds.x + local_bounds.width.cast_signed(),
-        ..local_bounds
-    };
-    let mut layout = Layout::new();
-    layout.set_placement(local_node, local_bounds);
-    layout.set_placement(peer_node, initial_peer_bounds);
-    let mut state_machine = StateMachine::new(local_node, local_bounds, layout);
-    state_machine.set_edge_settings(
-        config_snapshot.edge_settings.corner_dead_zone_px,
-        config_snapshot.edge_settings.handoff_cooldown_ms,
-    );
-
-    let (mut session, handle) = Session::new(
-        state_machine,
-        control,
-        bulk,
-        platform.capture,
-        platform.sink,
-        platform.clipboard,
-        &config_snapshot,
-    )
-    .map_err(|e| format!("failed to start session: {e}"))?;
-
-    session
-        .send_screen_config(displays, local_bounds)
-        .await
-        .map_err(|e| format!("failed to send screen config: {e}"))?;
+    let (session, handle) = Session::new(control, bulk, platform.clipboard, &config_snapshot)
+        .map_err(|e| format!("failed to start session: {e}"))?;
 
     // One line naming both ends and how this connection was established.
-    // Seam is peer-to-peer with no fixed server/client — input control
-    // starts LOCAL on both machines and moves with each edge handoff (the
-    // session logs "now DRIVING" / "now BEING DRIVEN" on every change) —
-    // but the connection itself is asymmetric: one side dialled, one
-    // accepted, and only the dialling side auto-reconnects.
+    // Seam is peer-to-peer with no fixed server/client — either side can
+    // dial the other, and the connection is asymmetric only in who
+    // initiated it: one side dialled, one accepted, and only the
+    // dialling side auto-reconnects.
     let how = match &role {
         Role::Connector { host } => format!("dialled out to {host}"),
         Role::Listener { .. } => "accepted an inbound connection".to_string(),
@@ -198,7 +159,7 @@ async fn bootstrap_session(
         local_os = ?CURRENT_OS,
         peer = %peer_display_name,
         peer_node = ?peer_node,
-        "session up: this machine ({}) {how}; input control starts LOCAL and moves with edge handoff",
+        "session up: this machine ({}) {how}",
         config_snapshot.display_name,
     );
 
@@ -210,13 +171,6 @@ async fn bootstrap_session(
 
     app.emit("connected", &ConnectedInfo { peer_display_name })
         .map_err(|e| e.to_string())?;
-    app.emit(
-        "session-event",
-        &SessionEvent::LayoutChanged {
-            peer_bounds: initial_peer_bounds,
-        },
-    )
-    .map_err(|e| e.to_string())?;
 
     let events_app = app.clone();
     tokio::spawn(async move {

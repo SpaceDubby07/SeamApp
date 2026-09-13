@@ -11,6 +11,6 @@ pub use codec::{
 };
 pub use messages::{
     BulkMessage, ClipboardContent, ClipboardEvent, ControlMessage, FileManifest, Handshake,
-    InputEvent, KeyCode, Modifiers, MouseButton, OsKind, TransferId,
+    OsKind, TransferId,
 };
 pub use version::PROTOCOL_VERSION;

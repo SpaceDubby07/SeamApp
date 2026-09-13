@@ -9,12 +9,7 @@ import type {
   Config,
   ConnectedInfo,
   DiscoveredPeer,
-  Display,
-  EdgeSettings,
-  Hotkey,
   LogLine,
-  Rect,
-  RemapTable,
   SessionEvent,
 } from "./types";
 
@@ -22,34 +17,14 @@ import type {
 export const getConfig = () => invoke<Config>("get_config");
 export const setDisplayName = (name: string) =>
   invoke<void>("set_display_name", { name });
-/** Persists the remap/scroll table and pushes it into a live session
- * (Tier 7.3) — takes effect on the next injected event, no reconnect. */
-export const setRemap = (remap: RemapTable) =>
-  invoke<void>("set_remap", { remap });
-/** Rebinds the emergency "return control here" combo (Tier 7.7). */
-export const setEscapeHotkey = (hotkey: Hotkey) =>
-  invoke<void>("set_escape_hotkey", { hotkey });
-/** Toggles lock-to-screen (Tier 8.1 panel 3). Needs an active session. */
-export const setLocked = (locked: boolean) =>
-  invoke<void>("set_locked", { locked });
-/** Persists + live-applies the Layout panel's edge-handoff tuning. */
-export const setEdgeSettings = (settings: EdgeSettings) =>
-  invoke<void>("set_edge_settings", { settings });
-/** Drops the pinned pairing so the next connection re-pairs (Tier 8.1). */
+/** Drops the pinned pairing so the next connection re-pairs. */
 export const forgetPeer = () => invoke<void>("forget_peer");
 export const listDiscoveredPeers = () =>
   invoke<DiscoveredPeer[]>("list_discovered_peers");
-export const getLocalScreens = () =>
-  invoke<[Display[], Rect]>("get_local_screens");
-export const hasInputPermission = () => invoke<boolean>("has_input_permission");
-export const requestInputPermission = () =>
-  invoke<void>("request_input_permission");
 export const connectToPeer = (addr: string) =>
   invoke<void>("connect_to_peer", { addr });
 export const confirmPairing = (accept: boolean) =>
   invoke<void>("confirm_pairing", { accept });
-export const updateLayout = (peerBounds: Rect) =>
-  invoke<void>("update_layout", { peerBounds });
 export const sendFile = (path: string) => invoke<void>("send_file", { path });
 export const respondToOffer = (transferId: string, accept: boolean) =>
   invoke<void>("respond_to_offer", { transferId, accept });
@@ -85,7 +60,7 @@ export const onConnected = (
 export const onDisconnected = (handler: () => void): Promise<UnlistenFn> =>
   listen<void>("disconnected", () => handler());
 
-/** The connection dropped and the app is retrying with backoff (M12). A
+/** The connection dropped and the app is retrying with backoff. A
  * following `connected` means it succeeded; `disconnected` means it gave
  * up / the user cancelled. */
 export const onReconnecting = (handler: () => void): Promise<UnlistenFn> =>

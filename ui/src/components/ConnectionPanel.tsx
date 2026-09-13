@@ -1,23 +1,24 @@
 import { useState } from "react";
-import type { Config, ConnectedInfo, DiscoveredPeer } from "../lib/types";
+import type { ConnectedInfo, DiscoveredPeer } from "../lib/types";
 import * as ipc from "../lib/ipc";
 
 interface Props {
-  config: Config | null;
   peers: DiscoveredPeer[];
   connected: ConnectedInfo | null;
   pairingCode: string | null;
   reconnecting: boolean;
-  onConfigChanged: (config: Config) => void;
 }
 
+/** The full-bleed "not connected yet" screen: discovered devices, a
+ * fallback manual-IP connect, and the pairing-code confirmation step. Once
+ * a session is live this is replaced by the transfer workspace — see
+ * `App.tsx`'s `showWorkspace`. Paired-device info and "Forget" live in
+ * Settings instead, since those stay relevant while connected too. */
 export function ConnectionPanel({
-  config,
   peers,
   connected,
   pairingCode,
   reconnecting,
-  onConfigChanged,
 }: Props) {
   const [manualAddr, setManualAddr] = useState("");
   const [connecting, setConnecting] = useState<string | null>(null);
@@ -35,43 +36,13 @@ export function ConnectionPanel({
     }
   }
 
-  async function handleNameChange(name: string) {
-    if (!config) return;
-    onConfigChanged({ ...config, display_name: name });
-    try {
-      await ipc.setDisplayName(name);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function handleForget() {
-    if (!config) return;
-    onConfigChanged({ ...config, paired_peer: null });
-    try {
-      await ipc.forgetPeer();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  const pairedPeer = config?.paired_peer ?? null;
-  const pairedBlock = pairedPeer && (
-    <div className="paired-row">
-      <span className="muted">
-        Paired · <code>{pairedPeer.fingerprint.slice(0, 12)}…</code>
-      </span>
-      <button className="link-btn" onClick={handleForget}>
-        Forget
-      </button>
-    </div>
-  );
-
   if (pairingCode) {
     return (
       <section className="panel">
-        <h2>Confirm pairing</h2>
-        <p>Confirm this EXACT code is shown on the other machine:</p>
+        <h2 className="hero-title">Confirm pairing</h2>
+        <p className="hero-subtitle">
+          Make sure this EXACT code is shown on the other machine
+        </p>
         <div className="pairing-code">{pairingCode}</div>
         <div className="row">
           <button
@@ -88,46 +59,28 @@ export function ConnectionPanel({
     );
   }
 
-  if (connected || reconnecting) {
+  if (reconnecting) {
     const name = connected?.peer_display_name;
     return (
       <section className="panel">
-        <h2>{reconnecting ? "Reconnecting" : "Connected"}</h2>
-        <p>
-          {reconnecting ? (
-            <>
-              Connection lost — retrying{name ? <> to <strong>{name}</strong></> : null}…
-            </>
-          ) : (
-            <>
-              Connected to <strong>{name}</strong>
-            </>
-          )}
+        <h2 className="hero-title">Reconnecting…</h2>
+        <p className="hero-subtitle">
+          Connection lost{name ? ` to ${name}` : ""} — retrying
         </p>
-        <button onClick={() => ipc.disconnect()}>
-          {reconnecting ? "Cancel" : "Disconnect"}
-        </button>
-        {pairedBlock}
+        <button onClick={() => ipc.disconnect()}>Cancel</button>
       </section>
     );
   }
 
   return (
     <section className="panel">
-      <h2>Connection</h2>
-      <label className="field">
-        This device's name
-        <input
-          value={config?.display_name ?? ""}
-          onChange={(e) => handleNameChange(e.target.value)}
-        />
-      </label>
+      <h2 className="hero-title">Connect a device</h2>
+      <p className="hero-subtitle">
+        Open Seam on your other machine — it'll show up here automatically
+      </p>
 
-      {pairedBlock}
-
-      <h3>Discovered devices</h3>
       {peers.length === 0 ? (
-        <p className="muted">Looking for devices on your network...</p>
+        <p className="muted">Looking for devices on your network…</p>
       ) : (
         <ul className="peer-list">
           {peers.map((peer) => (
@@ -139,29 +92,31 @@ export function ConnectionPanel({
                 disabled={connecting === peer.addr}
                 onClick={() => handleConnect(peer.addr)}
               >
-                {connecting === peer.addr ? "Connecting..." : "Connect"}
+                {connecting === peer.addr ? "Connecting…" : "Connect"}
               </button>
             </li>
           ))}
         </ul>
       )}
 
-      <h3>Manual IP</h3>
-      <div className="row">
-        <input
-          placeholder="192.168.1.50"
-          value={manualAddr}
-          onChange={(e) => setManualAddr(e.target.value)}
-        />
-        <button
-          disabled={!manualAddr || connecting === manualAddr}
-          onClick={() => handleConnect(manualAddr)}
-        >
-          {connecting === manualAddr ? "Connecting..." : "Connect"}
-        </button>
-      </div>
-
       {error && <p className="error">{error}</p>}
+
+      <details className="manual-connect">
+        <summary>Connect by IP address instead</summary>
+        <div className="row">
+          <input
+            placeholder="192.168.1.50"
+            value={manualAddr}
+            onChange={(e) => setManualAddr(e.target.value)}
+          />
+          <button
+            disabled={!manualAddr || connecting === manualAddr}
+            onClick={() => handleConnect(manualAddr)}
+          >
+            {connecting === manualAddr ? "Connecting…" : "Connect"}
+          </button>
+        </div>
+      </details>
     </section>
   );
 }

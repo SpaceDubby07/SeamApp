@@ -1,40 +1,23 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 import { ConnectionPanel } from "./components/ConnectionPanel";
-import { InputPanel } from "./components/InputPanel";
-import { LayoutCanvas } from "./components/LayoutCanvas";
-import { LogPanel } from "./components/LogPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { StatusBar } from "./components/StatusBar";
 import { TransfersPanel } from "./components/TransfersPanel";
 import * as ipc from "./lib/ipc";
-import type {
-  Config,
-  ConnectedInfo,
-  DiscoveredPeer,
-  Display,
-  EdgeSettings,
-  LinkStatus,
-  Rect,
-} from "./lib/types";
+import type { Config, ConnectedInfo, DiscoveredPeer } from "./lib/types";
 
 function App() {
   const [config, setConfig] = useState<Config | null>(null);
-  const [localScreens, setLocalScreens] = useState<[Display[], Rect] | null>(
-    null,
-  );
   const [peers, setPeers] = useState<DiscoveredPeer[]>([]);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [connected, setConnected] = useState<ConnectedInfo | null>(null);
-  const [peerBounds, setPeerBounds] = useState<Rect | null>(null);
-  const [peerScreens, setPeerScreens] = useState<[Display[], Rect] | null>(null);
-  const [link, setLink] = useState<LinkStatus | null>(null);
   const [rttMicros, setRttMicros] = useState<number | null>(null);
-  const [locked, setLocked] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     ipc.getConfig().then(setConfig).catch(console.error);
-    ipc.getLocalScreens().then(setLocalScreens).catch(console.error);
     ipc.listDiscoveredPeers().then(setPeers).catch(console.error);
 
     const unlisten = Promise.all([
@@ -47,31 +30,16 @@ function App() {
       }),
       ipc.onReconnecting(() => {
         setReconnecting(true);
-        setLink(null);
         setRttMicros(null);
       }),
       ipc.onDisconnected(() => {
         setConnected(null);
         setReconnecting(false);
-        setPeerBounds(null);
-        setPeerScreens(null);
-        setLink(null);
         setRttMicros(null);
-        setLocked(false);
       }),
       ipc.onSessionEvent((event) => {
-        // `LayoutChanged` always carries our own naive initial placement
-        // first, then the peer's real size once `PeerScreenConfig`
-        // arrives (see Session::handle_peer_screen_config) — so this is
-        // the one event the canvas needs for both position and size.
-        if (event.type === "LayoutChanged") {
-          setPeerBounds(event.peer_bounds);
-        } else if (event.type === "PeerScreenConfig") {
-          setPeerScreens([event.displays, event.virtual_bounds]);
-        } else if (event.type === "Status") {
-          setLink(event.link);
-          setLocked(event.locked);
-          if (event.rtt_micros !== null) setRttMicros(event.rtt_micros);
+        if (event.type === "Status" && event.rtt_micros !== null) {
+          setRttMicros(event.rtt_micros);
         }
       }),
     ]);
@@ -81,62 +49,59 @@ function App() {
     };
   }, []);
 
-  function handleLayoutDrag(bounds: Rect) {
-    setPeerBounds(bounds);
-    ipc.updateLayout(bounds).catch(console.error);
-  }
-
-  function handleEdgeSettingsChange(settings: EdgeSettings) {
-    if (!config) return;
-    setConfig({ ...config, edge_settings: settings });
-    ipc.setEdgeSettings(settings).catch(console.error);
-  }
-
-  const [localDisplays, localBounds] = localScreens ?? [[], null];
-  const [peerDisplays, peerVirtualBounds] = peerScreens ?? [null, null];
+  // A session, once established, is connected for its whole lifetime —
+  // reconnect-with-backoff lives one layer up. So the workspace (transfer
+  // drop zone + history) stays up across a reconnect blip instead of
+  // bouncing back to the connect screen; only a deliberate disconnect (or
+  // never having connected yet) shows the connect screen.
+  const showWorkspace = connected !== null || reconnecting;
 
   return (
-    <main className="app">
-      <h1>Seam</h1>
-      {localBounds && (
-        <LayoutCanvas
-          localName={config?.display_name ?? "This device"}
-          localDisplays={localDisplays}
-          localBounds={localBounds}
+    <div className="app">
+      <header className="titlebar">
+        <span className="brand">
+          <span className="brand-mark" />
+          Seam
+        </span>
+        <StatusBar
           peerName={connected?.peer_display_name ?? null}
-          peerDisplays={peerDisplays}
-          peerVirtualBounds={peerVirtualBounds}
-          peerBounds={peerBounds}
-          onPeerBoundsChange={handleLayoutDrag}
-          edgeSettings={config?.edge_settings ?? null}
-          onEdgeSettingsChange={handleEdgeSettingsChange}
+          rttMicros={rttMicros}
+          reconnecting={reconnecting}
         />
-      )}
-      <ConnectionPanel
+        <button
+          className="icon-btn"
+          onClick={() => setSettingsOpen(true)}
+          title="Settings"
+          aria-label="Settings"
+        >
+          ⚙
+        </button>
+      </header>
+
+      <main className="content">
+        {showWorkspace ? (
+          <div className="workspace">
+            <TransfersPanel connected={connected !== null && !reconnecting} />
+          </div>
+        ) : (
+          <div className="hero">
+            <ConnectionPanel
+              peers={peers}
+              connected={connected}
+              pairingCode={pairingCode}
+              reconnecting={reconnecting}
+            />
+          </div>
+        )}
+      </main>
+
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
         config={config}
-        peers={peers}
-        connected={connected}
-        pairingCode={pairingCode}
-        reconnecting={reconnecting}
         onConfigChanged={setConfig}
       />
-      <InputPanel
-        config={config}
-        onConfigChanged={setConfig}
-        connected={connected !== null}
-        locked={locked}
-      />
-      <TransfersPanel connected={connected !== null} />
-      <LogPanel />
-      <StatusBar
-        localName={config?.display_name ?? "This device"}
-        peerName={connected?.peer_display_name ?? null}
-        link={link}
-        rttMicros={rttMicros}
-        locked={locked}
-        reconnecting={reconnecting}
-      />
-    </main>
+    </div>
   );
 }
 

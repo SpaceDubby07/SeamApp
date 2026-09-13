@@ -2,12 +2,10 @@
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use seam_core::config::{Config, EdgeSettings, Hotkey};
+use seam_core::config::Config;
 use seam_core::net::control::ControlChannel;
 use seam_core::net::discovery::DiscoveredPeer;
-use seam_core::remap::RemapTable;
 use seam_core::session::SessionCommand;
-use seam_core::topology::{Display, Rect};
 
 use crate::connect::{Role, finish_connection};
 use crate::logbuf::{self, LogLine};
@@ -29,78 +27,6 @@ pub fn set_display_name(name: String, state: State<'_, AppState>) -> Result<(), 
     let mut config = state.config.lock().expect("mutex poisoned");
     config.display_name = name;
     config.save(&state.config_path).map_err(|e| e.to_string())
-}
-
-/// Replaces the modifier-remap / scroll-inversion table (Tier 7.3, the
-/// Input panel). Persisted immediately, and — if a session is live —
-/// pushed into it via [`SessionCommand::UpdateRemap`] so the change takes
-/// effect on the next injected event without a reconnect. A missing
-/// session is not an error: the new table is saved and picked up by the
-/// next connection.
-///
-/// # Errors
-/// Returns an error only if the config file can't be written.
-#[tauri::command]
-pub fn set_remap(remap: RemapTable, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let mut config = state.config.lock().expect("mutex poisoned");
-        config.remap = remap.clone();
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
-    }
-    // Best-effort live apply; "not connected" just means there's nothing
-    // to update right now.
-    let _ = send_session_command(&state, SessionCommand::UpdateRemap(remap));
-    Ok(())
-}
-
-/// Rebinds the emergency escape hotkey (Tier 7.7, the Input panel's
-/// click-to-record field). Persisted, and pushed into a live session so
-/// the new combo works immediately.
-///
-/// # Errors
-/// Returns an error only if the config file can't be written.
-#[tauri::command]
-pub fn set_escape_hotkey(hotkey: Hotkey, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let mut config = state.config.lock().expect("mutex poisoned");
-        config.escape_hotkey = hotkey;
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
-    }
-    let _ = send_session_command(&state, SessionCommand::UpdateEscapeHotkey(hotkey));
-    Ok(())
-}
-
-/// Toggles lock-to-screen (Tier 8.1 panel 3). Session-only — there's
-/// nothing to lock without an active handoff, and it's a transient state,
-/// not persisted. A no-op if not connected.
-///
-/// # Errors
-/// Returns an error if there's no active session.
-#[tauri::command]
-pub fn set_locked(locked: bool, state: State<'_, AppState>) -> Result<(), String> {
-    send_session_command(&state, SessionCommand::SetLocked(locked))
-}
-
-/// Applies the Layout panel's edge-handoff tuning (corner dead zone,
-/// post-handoff cooldown). Persisted, and pushed into a live session.
-///
-/// # Errors
-/// Returns an error only if the config file can't be written.
-#[tauri::command]
-pub fn set_edge_settings(settings: EdgeSettings, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let mut config = state.config.lock().expect("mutex poisoned");
-        config.edge_settings = settings;
-        config.save(&state.config_path).map_err(|e| e.to_string())?;
-    }
-    let _ = send_session_command(
-        &state,
-        SessionCommand::UpdateEdgeSettings {
-            corner_dead_zone_px: settings.corner_dead_zone_px,
-            handoff_cooldown_ms: settings.handoff_cooldown_ms,
-        },
-    );
-    Ok(())
 }
 
 /// Drops the pinned pairing (Tier 8.1's "Forget" option). The next
@@ -129,34 +55,6 @@ pub fn list_discovered_peers(state: State<'_, AppState>) -> Vec<DiscoveredPeer> 
         .values()
         .cloned()
         .collect()
-}
-
-/// This machine's own displays and virtual desktop bounds, for the layout
-/// canvas's local tile.
-#[tauri::command]
-pub fn get_local_screens() -> (Vec<Display>, Rect) {
-    let platform = seam_platform::current_platform();
-    (
-        platform.screens.displays(),
-        platform.screens.virtual_bounds(),
-    )
-}
-
-/// Whether this OS's input-capture permission (Accessibility, on macOS)
-/// has been granted.
-#[tauri::command]
-pub fn has_input_permission() -> bool {
-    seam_platform::has_input_permission()
-}
-
-/// Opens the OS's permission-request UI (System Settings > Accessibility
-/// on macOS; a no-op on Windows).
-///
-/// # Errors
-/// Returns an error if the OS-level request call itself fails.
-#[tauri::command]
-pub fn request_input_permission() -> Result<(), String> {
-    seam_platform::request_input_permission().map_err(|e| e.to_string())
 }
 
 /// Connects to `addr` (a bare host or IP — the control port is always
@@ -211,9 +109,9 @@ pub fn confirm_pairing(accept: bool, state: State<'_, AppState>) -> Result<(), S
     }
 }
 
-/// Sends a command into the active session. Every layout/transfer command
-/// below is a thin wrapper over this — there's only ever one active
-/// session (v1's single-peer simplification).
+/// Sends a command into the active session. Every transfer command below
+/// is a thin wrapper over this — there's only ever one active session
+/// (v1's single-peer simplification).
 fn send_session_command(state: &State<'_, AppState>, cmd: SessionCommand) -> Result<(), String> {
     let sender = state.session_command_tx.lock().expect("mutex poisoned");
     match sender.as_ref() {
@@ -222,18 +120,7 @@ fn send_session_command(state: &State<'_, AppState>, cmd: SessionCommand) -> Res
     }
 }
 
-/// Rearranges the layout canvas (Tier 8.1): places the peer at
-/// `peer_bounds`, in this machine's own coordinate space, and tells the
-/// peer about it.
-///
-/// # Errors
-/// Returns an error if there's no active session.
-#[tauri::command]
-pub fn update_layout(peer_bounds: Rect, state: State<'_, AppState>) -> Result<(), String> {
-    send_session_command(&state, SessionCommand::UpdateLayout { peer_bounds })
-}
-
-/// Offers `path` to the connected peer (Tier 7.5).
+/// Offers `path` to the connected peer.
 ///
 /// # Errors
 /// Returns an error if there's no active session.
@@ -277,17 +164,15 @@ pub fn respond_to_offer(
     )
 }
 
-/// Ends the active session cleanly (M12): sends
-/// [`SessionCommand::Shutdown`], which makes `run` send the peer a
-/// `Goodbye`, release modifiers/suppression, and return `Ok(())` — then
+/// Ends the active session cleanly: sends [`SessionCommand::Shutdown`],
+/// which makes `run` send the peer a `Goodbye` and return `Ok(())` — then
 /// `finish_connection`'s wrapper task clears state and emits
 /// `disconnected`. A no-op if nothing's connected.
 ///
 /// If the command can't be delivered (no session, or its channel is
 /// already gone), this falls back to aborting the task and emitting
 /// `disconnected` here, so the UI never gets stuck in the connected
-/// state. `Session`'s `Drop` still runs on abort, so suppression/
-/// modifiers/capture are torn down either way.
+/// state.
 #[tauri::command]
 pub fn disconnect(state: State<'_, AppState>, app: AppHandle) {
     let requested = state

@@ -1,8 +1,8 @@
 //! Windows clipboard watching/setting.
 //!
 //! `AddClipboardFormatListener` + `WM_CLIPBOARDUPDATE` on a dedicated
-//! message-only window, mirroring `capture.rs`'s dedicated-pump-thread
-//! pattern: event-driven, no polling. A message-only window is required
+//! message-only window, on its own dedicated pump thread: event-driven,
+//! no polling. A message-only window is required
 //! here because `AddClipboardFormatListener` attaches to an `HWND` and
 //! Windows delivers `WM_CLIPBOARDUPDATE` to that window's procedure — there
 //! is no listener API that isn't backed by a window.
@@ -151,7 +151,7 @@ impl ClipboardProvider for Clipboard {
                 let mut msg = MSG::default();
                 // SAFETY: `msg` is a valid, exclusively-owned MSG the OS
                 // fills in; `None, 0, 0` means "any message for this
-                // thread", matching `capture.rs`'s pump loop.
+                // thread".
                 while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.as_bool() {
                     // SAFETY: `msg` was just populated by GetMessageW above.
                     unsafe {

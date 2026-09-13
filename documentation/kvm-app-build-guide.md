@@ -1,3 +1,13 @@
+> **Superseded.** Seam dropped the KVM (shared keyboard/mouse) half of this
+> guide — that's Barrier's job now — and kept only peer discovery, pairing,
+> TLS, file transfer, and clipboard sync. This document is kept as
+> historical reference for the wire-protocol/pairing/TLS design (still
+> accurate for the parts that survived) and for anyone curious why certain
+> things are shaped the way they are, but **CLAUDE.md is the current source
+> of truth for scope and conventions, not this file.** Anything below about
+> input capture/injection, the handoff state machine, edge/layout
+> configuration, or remapping no longer applies.
+
 # Cross-Platform KVM + File Transfer App — Complete Build Guide
 
 **Project codename:** `Seam` (rename freely — used throughout as the crate/app name)

@@ -28,8 +28,8 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::Context;
 
 /// Most recent lines kept. ~5k lines is enough to span a full connect →
-/// handoff → reclaim → disconnect cycle at `debug`, and small enough to
-/// hand to the webview in one poll.
+/// transfer → disconnect cycle at `debug`, and small enough to hand to
+/// the webview in one poll.
 const CAPACITY: usize = 5000;
 
 /// One captured log record, as the frontend consumes it.
