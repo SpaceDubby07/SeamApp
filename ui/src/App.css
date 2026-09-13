@@ -468,6 +468,27 @@ button.primary:hover:not(:disabled) {
   transition: width 0.2s linear;
 }
 
+.xfer-bar.is-paused .xfer-bar-fill {
+  background: var(--text-faint);
+}
+
+.xfer-history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.xfer-history-head h3 {
+  margin: 1.1rem 0 0.4rem;
+}
+
+.xfer-dismiss {
+  width: 1.5rem;
+  height: 1.5rem;
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
 .xfer-done {
   background: transparent;
   padding: 0.5rem 0.25rem;
@@ -494,6 +515,10 @@ button.primary:hover:not(:disabled) {
 .xfer-status-failed,
 .xfer-status-rejected {
   color: var(--err);
+}
+
+.xfer-status-cancelled {
+  color: var(--text-dim);
 }
 
 .empty-hint {

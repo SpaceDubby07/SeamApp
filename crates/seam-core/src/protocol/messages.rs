@@ -170,6 +170,19 @@ pub enum ControlMessage {
         /// Which transfer to cancel.
         transfer_id: TransferId,
     },
+    /// Requests the sender pause an in-progress transfer — sent by
+    /// whichever side clicked Pause. The sender pauses itself locally
+    /// too when it's the one who clicked; the receiver has no other way
+    /// to stop bytes arriving except asking the sender to stop.
+    TransferPause {
+        /// Which transfer to pause.
+        transfer_id: TransferId,
+    },
+    /// Reverses a `TransferPause`.
+    TransferResume {
+        /// Which transfer to resume.
+        transfer_id: TransferId,
+    },
     /// Announces that every chunk has been sent, with the sender's hash
     /// for the receiver to verify against.
     TransferComplete {

@@ -226,6 +226,8 @@ pub fn run() {
             commands::send_file,
             commands::respond_to_offer,
             commands::cancel_transfer,
+            commands::pause_transfer,
+            commands::resume_transfer,
             commands::disconnect,
             commands::get_logs,
             commands::clear_logs,

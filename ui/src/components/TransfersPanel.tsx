@@ -8,7 +8,14 @@ interface Props {
   connected: boolean;
 }
 
-type Status = "pending" | "active" | "completed" | "failed" | "rejected";
+type Status =
+  | "pending"
+  | "active"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "rejected"
+  | "cancelled";
 
 interface Transfer {
   id: string;
@@ -24,7 +31,7 @@ interface Transfer {
 }
 
 const SPEED_WINDOW_MS = 1500;
-const DONE: Status[] = ["completed", "failed", "rejected"];
+const DONE: Status[] = ["completed", "failed", "rejected", "cancelled"];
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -57,8 +64,8 @@ function fmtEta(seconds: number): string {
   return `${m}m ${s.toString().padStart(2, "0")}s`;
 }
 
-/** Tier 8.1 panel 4: drop zone, active transfers with progress/speed/ETA/
- * cancel, incoming-offer prompts, and a completed-transfer history. */
+/** Drop zone, active transfers with progress/speed/ETA/pause/cancel,
+ * incoming-offer prompts, and a dismissable completed-transfer history. */
 export function TransfersPanel({ connected }: Props) {
   const [transfers, setTransfers] = useState<Map<string, Transfer>>(new Map());
   const [dragOver, setDragOver] = useState(false);
@@ -89,6 +96,24 @@ export function TransfersPanel({ connected }: Props) {
     },
     [],
   );
+
+  const dismiss = useCallback((id: string) => {
+    setTransfers((prev) => {
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const clearHistory = useCallback(() => {
+    setTransfers((prev) => {
+      const next = new Map<string, Transfer>();
+      for (const [id, t] of prev) {
+        if (!DONE.includes(t.status)) next.set(id, t);
+      }
+      return next;
+    });
+  }, []);
 
   // Session events → transfer rows.
   useEffect(() => {
@@ -150,6 +175,15 @@ export function TransfersPanel({ connected }: Props) {
             reason: event.reason,
             samples: [],
           });
+          break;
+        case "Cancelled":
+          upsert(event.transfer_id, { status: "cancelled", samples: [] });
+          break;
+        case "Paused":
+          upsert(event.transfer_id, { status: "paused", samples: [] });
+          break;
+        case "Resumed":
+          upsert(event.transfer_id, { status: "active", samples: [] });
           break;
         default:
           break;
@@ -243,13 +277,36 @@ export function TransfersPanel({ connected }: Props) {
                       </button>
                     </span>
                   ) : (
-                    <button
-                      onClick={() =>
-                        ipc.cancelTransfer(t.id).catch((e) => setError(String(e)))
-                      }
-                    >
-                      Cancel
-                    </button>
+                    <span className="row">
+                      {t.status === "paused" ? (
+                        <button
+                          onClick={() =>
+                            ipc
+                              .resumeTransfer(t.id)
+                              .catch((e) => setError(String(e)))
+                          }
+                        >
+                          Resume
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() =>
+                            ipc
+                              .pauseTransfer(t.id)
+                              .catch((e) => setError(String(e)))
+                          }
+                        >
+                          Pause
+                        </button>
+                      )}
+                      <button
+                        onClick={() =>
+                          ipc.cancelTransfer(t.id).catch((e) => setError(String(e)))
+                        }
+                      >
+                        Cancel
+                      </button>
+                    </span>
                   )}
                 </div>
                 {t.status === "pending" ? (
@@ -258,7 +315,7 @@ export function TransfersPanel({ connected }: Props) {
                   </span>
                 ) : (
                   <>
-                    <div className="xfer-bar">
+                    <div className={`xfer-bar ${t.status === "paused" ? "is-paused" : ""}`}>
                       <div
                         className="xfer-bar-fill"
                         style={{ width: `${pct}%` }}
@@ -266,8 +323,14 @@ export function TransfersPanel({ connected }: Props) {
                     </div>
                     <span className="muted">
                       {fmtBytes(t.bytesDone)} / {fmtBytes(t.total)}
-                      {speed !== null && ` · ${fmtBytes(speed)}/s`}
-                      {speed !== null && ` · ${fmtEta(eta)} left`}
+                      {t.status === "paused" ? (
+                        " · Paused"
+                      ) : (
+                        <>
+                          {speed !== null && ` · ${fmtBytes(speed)}/s`}
+                          {speed !== null && ` · ${fmtEta(eta)} left`}
+                        </>
+                      )}
                     </span>
                   </>
                 )}
@@ -279,7 +342,12 @@ export function TransfersPanel({ connected }: Props) {
 
       {history.length > 0 && (
         <>
-          <h3>History</h3>
+          <div className="xfer-history-head">
+            <h3>History</h3>
+            <button className="link-btn" onClick={clearHistory}>
+              Clear
+            </button>
+          </div>
           <ul className="xfer-list">
             {history.map((t) => (
               <li key={t.id} className="xfer xfer-done">
@@ -287,21 +355,31 @@ export function TransfersPanel({ connected }: Props) {
                   <span className="xfer-name">
                     {t.incoming ? "↓" : "↑"} {t.name}
                   </span>
-                  <span
-                    className={`xfer-status xfer-status-${t.status}`}
-                    title={t.reason ?? ""}
-                  >
-                    {t.status}
-                    {t.status === "completed" && t.path && (
-                      <button
-                        className="link-btn"
-                        onClick={() =>
-                          ipc.revealPath(t.path!).catch(() => undefined)
-                        }
-                      >
-                        Reveal
-                      </button>
-                    )}
+                  <span className="row">
+                    <span
+                      className={`xfer-status xfer-status-${t.status}`}
+                      title={t.reason ?? ""}
+                    >
+                      {t.status}
+                      {t.status === "completed" && t.path && (
+                        <button
+                          className="link-btn"
+                          onClick={() =>
+                            ipc.revealPath(t.path!).catch(() => undefined)
+                          }
+                        >
+                          Reveal
+                        </button>
+                      )}
+                    </span>
+                    <button
+                      className="icon-btn xfer-dismiss"
+                      onClick={() => dismiss(t.id)}
+                      title="Dismiss"
+                      aria-label="Dismiss"
+                    >
+                      ✕
+                    </button>
                   </span>
                 </div>
               </li>

@@ -196,13 +196,32 @@ pub enum SessionEvent {
         /// Where the file ended up (incoming) or was read from (outgoing).
         path: PathBuf,
     },
-    /// A transfer failed: a local I/O error, a hash mismatch on receive,
-    /// or a peer-initiated cancel.
+    /// A transfer failed: a local I/O error, or a hash mismatch on
+    /// receive. A deliberate cancel is [`Self::Cancelled`], not this.
     Failed {
         /// Which transfer failed.
         transfer_id: TransferId,
         /// Human-readable reason, for logging/display.
         reason: String,
+    },
+    /// A transfer was cancelled — by whichever side clicked Cancel, sent
+    /// to BOTH ends (the canceller's own UI needs this exactly as much as
+    /// the peer's does, otherwise the row it was watching never resolves).
+    Cancelled {
+        /// Which transfer was cancelled.
+        transfer_id: TransferId,
+    },
+    /// A transfer was paused — by whichever side clicked Pause, sent to
+    /// both ends. Only the sender's [`crate::transfer::OutgoingTransfer`]
+    /// actually stops the byte flow; a paused receiver just requested it.
+    Paused {
+        /// Which transfer was paused.
+        transfer_id: TransferId,
+    },
+    /// Reverses a [`Self::Paused`].
+    Resumed {
+        /// Which transfer was resumed.
+        transfer_id: TransferId,
     },
     /// Connection health for the status bar. Sent on every pong (~every
     /// 2s, so the latency reading stays fresh).
@@ -234,6 +253,10 @@ pub enum SessionCommand {
     },
     /// Cancels a transfer, sent or received.
     CancelTransfer(TransferId),
+    /// Pauses a transfer, sent or received — see [`SessionEvent::Paused`].
+    PauseTransfer(TransferId),
+    /// Reverses a [`Self::PauseTransfer`].
+    ResumeTransfer(TransferId),
     /// Ends the session cleanly (the user hit Disconnect): tells the peer
     /// with a `Goodbye` and lets [`Session::run`] return `Ok(())`.
     Shutdown,
@@ -504,6 +527,12 @@ impl Session {
             ControlMessage::TransferCancel { transfer_id } => {
                 self.handle_transfer_cancel(transfer_id).await?;
             }
+            ControlMessage::TransferPause { transfer_id } => {
+                self.handle_transfer_pause(transfer_id);
+            }
+            ControlMessage::TransferResume { transfer_id } => {
+                self.handle_transfer_resume(transfer_id);
+            }
             ControlMessage::TransferComplete { transfer_id, hash } => {
                 self.handle_transfer_complete(transfer_id, hash).await?;
             }
@@ -767,13 +796,16 @@ impl Session {
     }
 
     /// Handles the peer cancelling a transfer, sent or received: drops
-    /// whichever side we're tracking it on and, if it was our own send,
-    /// starts the next queued one.
+    /// whichever side we're tracking it on — an accepted send/receive, or
+    /// (the sender withdrawing an offer before we've answered it under
+    /// `AcceptPolicy::Ask`) one still sitting in `pending_offers` — and,
+    /// if it was our own send, starts the next queued one.
     async fn handle_transfer_cancel(
         &mut self,
         transfer_id: TransferId,
     ) -> Result<(), SessionError> {
         let was_incoming = self.incoming_transfers.remove(&transfer_id).is_some();
+        let was_pending = self.pending_offers.remove(&transfer_id).is_some();
         let was_outgoing = self
             .current_outgoing
             .as_ref()
@@ -781,16 +813,45 @@ impl Session {
         if was_outgoing {
             self.current_outgoing = None;
         }
-        if was_incoming || was_outgoing {
-            let _ = self.event_tx.send(SessionEvent::Failed {
-                transfer_id,
-                reason: "cancelled by peer".to_string(),
-            });
+        if was_incoming || was_pending || was_outgoing {
+            let _ = self.event_tx.send(SessionEvent::Cancelled { transfer_id });
         }
         if was_outgoing {
             self.start_next_pending_send().await?;
         }
         Ok(())
+    }
+
+    /// Handles the peer pausing a transfer, sent or received: if it's our
+    /// own outgoing send, actually stops the chunk loop (see
+    /// [`Self::ready_to_send_chunk`]); either way, tells our own UI via
+    /// [`SessionEvent::Paused`] so whichever side we are for this transfer
+    /// reflects it. Silently ignored if `transfer_id` matches neither.
+    fn handle_transfer_pause(&mut self, transfer_id: TransferId) {
+        let mut matched = self.incoming_transfers.contains_key(&transfer_id);
+        if let Some(outgoing) = self.current_outgoing.as_mut()
+            && outgoing.transfer_id == transfer_id
+        {
+            outgoing.paused = true;
+            matched = true;
+        }
+        if matched {
+            let _ = self.event_tx.send(SessionEvent::Paused { transfer_id });
+        }
+    }
+
+    /// Reverses [`Self::handle_transfer_pause`].
+    fn handle_transfer_resume(&mut self, transfer_id: TransferId) {
+        let mut matched = self.incoming_transfers.contains_key(&transfer_id);
+        if let Some(outgoing) = self.current_outgoing.as_mut()
+            && outgoing.transfer_id == transfer_id
+        {
+            outgoing.paused = false;
+            matched = true;
+        }
+        if matched {
+            let _ = self.event_tx.send(SessionEvent::Resumed { transfer_id });
+        }
     }
 
     /// Marks the matching outgoing transfer ready to send, seeking to
@@ -815,7 +876,9 @@ impl Session {
 
     /// Whether `run`'s select loop should send another chunk this tick.
     fn ready_to_send_chunk(&self) -> bool {
-        self.current_outgoing.as_ref().is_some_and(|t| t.accepted)
+        self.current_outgoing
+            .as_ref()
+            .is_some_and(|t| t.accepted && !t.paused)
     }
 
     /// Sends exactly one chunk of `current_outgoing`, or — once the file is
@@ -962,9 +1025,51 @@ impl Session {
                     self.control
                         .send(&ControlMessage::TransferCancel { transfer_id })
                         .await?;
+                    // The bug this fixes: without this, only the PEER's
+                    // side ever learned the transfer ended (via the
+                    // `ControlMessage::TransferCancel` handler above) —
+                    // our own UI, which is the one that actually clicked
+                    // Cancel, never heard back and the row just sat there
+                    // forever showing stale progress.
+                    let _ = self.event_tx.send(SessionEvent::Cancelled { transfer_id });
                 }
                 if was_outgoing {
                     self.start_next_pending_send().await?;
+                }
+            }
+            SessionCommand::PauseTransfer(transfer_id) => {
+                let is_outgoing = self
+                    .current_outgoing
+                    .as_ref()
+                    .is_some_and(|t| t.transfer_id == transfer_id);
+                let is_incoming = self.incoming_transfers.contains_key(&transfer_id);
+                if is_outgoing || is_incoming {
+                    if let Some(outgoing) = self.current_outgoing.as_mut() {
+                        outgoing.paused = true;
+                    }
+                    self.control
+                        .send(&ControlMessage::TransferPause { transfer_id })
+                        .await?;
+                    // Emitted locally regardless of which side we are:
+                    // the sender's own UI needs it exactly as much as the
+                    // (optimistic, no-ack) receiver's does.
+                    let _ = self.event_tx.send(SessionEvent::Paused { transfer_id });
+                }
+            }
+            SessionCommand::ResumeTransfer(transfer_id) => {
+                let is_outgoing = self
+                    .current_outgoing
+                    .as_ref()
+                    .is_some_and(|t| t.transfer_id == transfer_id);
+                let is_incoming = self.incoming_transfers.contains_key(&transfer_id);
+                if is_outgoing || is_incoming {
+                    if let Some(outgoing) = self.current_outgoing.as_mut() {
+                        outgoing.paused = false;
+                    }
+                    self.control
+                        .send(&ControlMessage::TransferResume { transfer_id })
+                        .await?;
+                    let _ = self.event_tx.send(SessionEvent::Resumed { transfer_id });
                 }
             }
             SessionCommand::Shutdown => self.begin_shutdown().await?,
@@ -1672,7 +1777,10 @@ mod tests {
                             }
                             SessionEvent::Progress { .. }
                             | SessionEvent::Status { .. }
-                            | SessionEvent::OfferReceived { .. } => {}
+                            | SessionEvent::OfferReceived { .. }
+                            | SessionEvent::Cancelled { .. }
+                            | SessionEvent::Paused { .. }
+                            | SessionEvent::Resumed { .. } => {}
                         }
                     }
                 }
@@ -1686,5 +1794,97 @@ mod tests {
             .expect("read received file");
         assert_eq!(received, payload);
         assert_eq!(received_path, dest_dir.path().join("payload.bin"));
+    }
+
+    /// Regression test: cancelling a transfer used to only ever notify the
+    /// PEER (`ControlMessage::TransferCancel`'s receive handler emitted
+    /// `SessionEvent::Failed`) — the canceller's own UI never learned the
+    /// transfer had ended, so the row it was watching just sat there
+    /// forever. Both sides must see `SessionEvent::Cancelled` for the same
+    /// `transfer_id` now, not just the peer.
+    ///
+    /// Cancels right after the offer lands rather than mid-chunk-transfer
+    /// on purpose: racing a cancel command against a live chunk-send loop
+    /// over real (if loopback) sockets is inherently flaky — a small
+    /// payload can finish before the cancel is even processed. `b` uses
+    /// the default `Ask` policy so the offer sits in `pending_offers`
+    /// until answered, giving a deterministic window with no chunks
+    /// in flight at all — exactly the case `handle_transfer_cancel`'s
+    /// `pending_offers` check above exists for.
+    #[tokio::test]
+    async fn cancelling_a_pending_offer_notifies_both_ends() {
+        let (a_control, b_control) = loopback_pair().await;
+        let (a_bulk, b_bulk) = bulk_loopback_pair().await;
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_path = src_dir.path().join("payload.bin");
+        tokio::fs::write(&src_path, b"hello")
+            .await
+            .expect("write payload");
+
+        let a_config = Config::new_default();
+        let b_config = Config::new_default(); // default AcceptPolicy::Ask
+
+        let (a_session, mut a_handle) = Session::new(
+            a_control,
+            a_bulk,
+            Box::new(KeepAliveClipboard::default()),
+            &a_config,
+        )
+        .expect("a session construction");
+        let (b_session, mut b_handle) = Session::new(
+            b_control,
+            b_bulk,
+            Box::new(KeepAliveClipboard::default()),
+            &b_config,
+        )
+        .expect("b session construction");
+
+        let mut a_join = tokio::spawn(a_session.run());
+        let mut b_join = tokio::spawn(b_session.run());
+
+        a_handle
+            .command_tx
+            .send(SessionCommand::SendFile(src_path))
+            .expect("a's command channel still open");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut transfer_id = None;
+            let mut cancelled_a = false;
+            let mut cancelled_b = false;
+            while !(cancelled_a && cancelled_b) {
+                tokio::select! {
+                    result = &mut a_join => panic!("a_session.run() ended early: {result:?}"),
+                    result = &mut b_join => panic!("b_session.run() ended early: {result:?}"),
+                    event = a_handle.event_rx.recv() => {
+                        match event.expect("a's event channel closed unexpectedly") {
+                            SessionEvent::Cancelled { transfer_id: id } => {
+                                assert_eq!(Some(id), transfer_id, "a's Cancelled named an unexpected transfer");
+                                cancelled_a = true;
+                            }
+                            other => panic!("unexpected event on a: {other:?}"),
+                        }
+                    }
+                    event = b_handle.event_rx.recv() => {
+                        match event.expect("b's event channel closed unexpectedly") {
+                            SessionEvent::OfferReceived { transfer_id: id, .. } => {
+                                transfer_id = Some(id);
+                                a_handle
+                                    .command_tx
+                                    .send(SessionCommand::CancelTransfer(id))
+                                    .expect("a's command channel still open");
+                            }
+                            SessionEvent::Cancelled { transfer_id: id } => {
+                                assert_eq!(Some(id), transfer_id, "b's Cancelled named an unexpected transfer");
+                                cancelled_b = true;
+                            }
+                            other => panic!("unexpected event on b: {other:?}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for both sides to report Cancelled");
     }
 }

@@ -145,6 +145,32 @@ pub fn cancel_transfer(
     send_session_command(&state, SessionCommand::CancelTransfer(transfer_id))
 }
 
+/// Pauses an in-flight transfer, sent or received — the peer is told so
+/// its side reflects it too, and (if we're the sender) actually stops
+/// sending chunks.
+///
+/// # Errors
+/// Returns an error if there's no active session.
+#[tauri::command]
+pub fn pause_transfer(
+    transfer_id: seam_core::protocol::TransferId,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_session_command(&state, SessionCommand::PauseTransfer(transfer_id))
+}
+
+/// Reverses a `pause_transfer`.
+///
+/// # Errors
+/// Returns an error if there's no active session.
+#[tauri::command]
+pub fn resume_transfer(
+    transfer_id: seam_core::protocol::TransferId,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_session_command(&state, SessionCommand::ResumeTransfer(transfer_id))
+}
+
 /// Answers a `session-event` of type `OfferReceived`.
 ///
 /// # Errors

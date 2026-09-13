@@ -57,6 +57,9 @@ export type SessionEvent =
   | { type: "Rejected"; transfer_id: TransferId; reason: string }
   | { type: "Completed"; transfer_id: TransferId; path: string }
   | { type: "Failed"; transfer_id: TransferId; reason: string }
+  | { type: "Cancelled"; transfer_id: TransferId }
+  | { type: "Paused"; transfer_id: TransferId }
+  | { type: "Resumed"; transfer_id: TransferId }
   | { type: "Status"; rtt_micros: number | null };
 
 export interface ConnectedInfo {

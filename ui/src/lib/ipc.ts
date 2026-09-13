@@ -30,6 +30,10 @@ export const respondToOffer = (transferId: string, accept: boolean) =>
   invoke<void>("respond_to_offer", { transferId, accept });
 export const cancelTransfer = (transferId: string) =>
   invoke<void>("cancel_transfer", { transferId });
+export const pauseTransfer = (transferId: string) =>
+  invoke<void>("pause_transfer", { transferId });
+export const resumeTransfer = (transferId: string) =>
+  invoke<void>("resume_transfer", { transferId });
 export const disconnect = () => invoke<void>("disconnect");
 
 // ── Logs ──

@@ -30,6 +30,11 @@ pub struct OutgoingTransfer {
     /// Set once the peer's `TransferAccept` arrives — `Session` only
     /// starts calling `read_next_chunk` once this is `true`.
     pub accepted: bool,
+    /// Set by a `SessionCommand::PauseTransfer`/`ControlMessage::
+    /// TransferPause` (from either side) — `Session::ready_to_send_chunk`
+    /// requires `accepted && !paused`, so this actually halts the chunk
+    /// loop rather than just being a status label.
+    pub paused: bool,
     /// When [`Self::should_report_progress`] last returned `true`. `None`
     /// means "never yet" — always due.
     last_progress_emit: Option<Instant>,
@@ -55,6 +60,7 @@ impl OutgoingTransfer {
             file,
             bytes_sent: 0,
             accepted: false,
+            paused: false,
             last_progress_emit: None,
         })
     }
