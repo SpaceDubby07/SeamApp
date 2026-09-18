@@ -235,21 +235,34 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            // macOS-specific: clicking the Dock icon while the window is
-            // hidden (not closed — see `on_window_event` above) fires
-            // this instead of doing anything on its own. Without handling
-            // it, the app visibly stays running (Dock icon still there,
-            // as it should) but clicking that icon does nothing at all —
-            // the window never comes back. A no-op on Windows/Linux,
-            // where the tray icon is the way back either way.
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } = event
-                && !has_visible_windows
-            {
-                show_main_window(app_handle);
-            }
-        });
+        .run(handle_run_event);
+}
+
+/// Handles Tauri's top-level run loop events.
+///
+/// `RunEvent::Reopen` only exists in the `tauri` crate on macOS (it's the
+/// `NSApplicationDelegate` "reopen" callback), so this whole handler is a
+/// no-op on Windows/Linux — the tray icon is the way back to the window
+/// there either way.
+fn handle_run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
+    #[cfg(target_os = "macos")]
+    {
+        // Clicking the Dock icon while the window is hidden (not closed —
+        // see `on_window_event` above) fires this instead of doing
+        // anything on its own. Without handling it, the app visibly stays
+        // running (Dock icon still there, as it should) but clicking that
+        // icon does nothing at all — the window never comes back.
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } = event
+            && !has_visible_windows
+        {
+            show_main_window(app_handle);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app_handle, event);
+    }
 }
