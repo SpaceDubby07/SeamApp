@@ -79,7 +79,7 @@ export function SettingsPanel({ open, onClose, config, onConfigChanged }: Props)
         </div>
 
         <div className="settings-section">
-          <LogPanel />
+          <LogPanel open={open} />
         </div>
       </aside>
     </div>

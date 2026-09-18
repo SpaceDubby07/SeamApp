@@ -25,7 +25,15 @@ function formatLine(l: LogLine): string {
   return `${t}.${ms}  ${l.level.padEnd(5)}  ${l.target}  ${l.message}`;
 }
 
-export function LogPanel() {
+interface Props {
+  /** Only poll for fresh log lines while the panel is actually visible —
+   * `SettingsPanel` stays mounted the whole app lifetime (for its slide
+   * animation) and just toggles a CSS class, so without this the 1s poll
+   * would run forever in the background even with Settings closed. */
+  open: boolean;
+}
+
+export function LogPanel({ open }: Props) {
   const [lines, setLines] = useState<LogLine[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const [levelFilter, setLevelFilter] = useState<LevelFilter>("DEBUG");
@@ -37,8 +45,10 @@ export function LogPanel() {
   const lastSeq = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Live tail.
+  // Live tail — only while the panel is actually visible; see the `open`
+  // prop's doc comment for why this can't just run unconditionally.
   useEffect(() => {
+    if (!open) return;
     let stopped = false;
     async function poll() {
       try {
@@ -59,7 +69,7 @@ export function LogPanel() {
       stopped = true;
       clearInterval(id);
     };
-  }, []);
+  }, [open]);
 
   const shown = useMemo(() => {
     const min = LEVEL_ORDER[levelFilter];
